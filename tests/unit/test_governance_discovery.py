@@ -319,6 +319,34 @@ class TestListForeignCatalogs:
         assert foreign[0]["catalog_name"] == "snow_foreign"
         assert foreign[0]["connection_name"] == "snowflake_conn"
 
+    def test_list_foreign_catalog_names_returns_names_only(self):
+        """``list_foreign_catalog_names`` returns a set of FOREIGN catalog
+        names — used by discovery to exclude them from schema/table
+        iteration where ``information_schema.tables`` would be JDBC-routed
+        and fail on the ``data_source_format`` column."""
+        auth = MagicMock()
+
+        def _cat(name, ctype):
+            c = MagicMock()
+            c.name = name
+            c.catalog_type = ctype
+            c.connection_name = None
+            c.options = {}
+            c.comment = None
+            return c
+
+        auth.source_client.catalogs.list.return_value = [
+            _cat("managed_a", "MANAGED_CATALOG"),
+            _cat("foreign_sqlsrv", "FOREIGN_CATALOG"),
+            _cat("managed_b", "MANAGED_CATALOG"),
+            _cat("foreign_snowflake", "FOREIGN_CATALOG"),
+        ]
+        explorer = _explorer(MagicMock(), auth)
+        names = explorer.list_foreign_catalog_names()
+
+        assert names == {"foreign_sqlsrv", "foreign_snowflake"}
+        assert isinstance(names, set)
+
 
 class TestListOnlineTables:
     def test_returns_online_tables_via_rest(self):

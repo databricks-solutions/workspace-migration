@@ -71,6 +71,15 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
     catalogs = explorer.list_catalogs(filter_list=config.catalog_filter or None)
     tool_catalogs = _tool_owned_catalogs(config)
     catalogs = [c for c in catalogs if c not in tool_catalogs]
+    # Foreign catalogs are captured separately as governance metadata via
+    # list_foreign_catalogs(); iterating their information_schema here would
+    # route through JDBC to the remote source and fail on UC-only columns.
+    foreign_catalog_names = explorer.list_foreign_catalog_names()
+    if foreign_catalog_names:
+        excluded = [c for c in catalogs if c in foreign_catalog_names]
+        catalogs = [c for c in catalogs if c not in foreign_catalog_names]
+        if excluded:
+            print(f"[uc] Excluding foreign catalog(s) from schema/table discovery: {sorted(excluded)}")
     print(f"[uc] Discovered {len(catalogs)} catalog(s) (excluding tool-owned {sorted(tool_catalogs)}): {catalogs}")
 
     for catalog in catalogs:

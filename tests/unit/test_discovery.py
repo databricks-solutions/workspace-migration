@@ -246,6 +246,83 @@ class TestFilterSemantics:
         assert inventory == []
 
 
+class TestForeignCatalogExclusion:
+    """Foreign catalogs must be excluded from the UC schema/table iteration
+    because ``classify_tables`` queries ``<catalog>.information_schema.tables``
+    which — on a FOREIGN_CATALOG — is routed via JDBC to the remote source
+    and fails on UC-only columns (``data_source_format``). The foreign
+    catalog is still captured as governance metadata via
+    ``list_foreign_catalogs`` in the same discovery run.
+    """
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_foreign_catalog_skipped_from_schema_iteration(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=[])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["managed_cat", "foreign_cat"]
+        explorer.list_foreign_catalog_names.return_value = {"foreign_cat"}
+        explorer.list_schemas.return_value = ["schema_a"]
+        explorer.classify_tables.return_value = []
+        explorer.list_functions.return_value = []
+        explorer.list_volumes.return_value = []
+        explorer.list_foreign_catalogs.return_value = [
+            {"catalog_name": "foreign_cat", "connection_name": "sqlsrv_conn", "options": {}, "comment": None},
+        ]
+
+        inventory = run(dbutils, spark)
+
+        # The managed catalog should be iterated; the foreign one must not.
+        list_schemas_catalogs = [c.args[0] for c in explorer.list_schemas.call_args_list]
+        assert list_schemas_catalogs == ["managed_cat"]
+        classify_catalogs = [c.args[0] for c in explorer.classify_tables.call_args_list]
+        assert "foreign_cat" not in classify_catalogs
+
+        # The foreign catalog is still emitted as a governance row.
+        foreign_rows = [r for r in inventory if r["object_type"] == "foreign_catalog"]
+        assert len(foreign_rows) == 1
+        assert foreign_rows[0]["object_name"] == "foreign_cat"
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_no_foreign_catalogs_is_noop(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        """Empty foreign-catalog set must not change the iteration — the
+        exclusion branch is purely additive."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=[])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["managed_a", "managed_b"]
+        explorer.list_foreign_catalog_names.return_value = set()
+        explorer.list_schemas.return_value = []
+        explorer.list_foreign_catalogs.return_value = []
+
+        run(dbutils, spark)
+
+        list_schemas_catalogs = [c.args[0] for c in explorer.list_schemas.call_args_list]
+        assert list_schemas_catalogs == ["managed_a", "managed_b"]
+
+
 class TestToolOwnedCatalogs:
     """_tool_owned_catalogs ensures the migration tool never tries to
     migrate its own tracking / share-consumer state."""

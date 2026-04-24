@@ -591,7 +591,7 @@ class CatalogExplorer:
             for p in resp.get("policies", []):
                 # Policy names are unique per securable; across securables
                 # a (securable_fullname, name) tuple is the real key.
-                key = f"{p.get('on_securable_fullname','')}::{p.get('name','')}"
+                key = f"{p.get('on_securable_fullname', '')}::{p.get('name', '')}"
                 if key in seen:
                     continue
                 seen.add(key)
@@ -708,6 +708,16 @@ class CatalogExplorer:
         except Exception:  # noqa: BLE001
             return []
         return results
+
+    def list_foreign_catalog_names(self) -> set[str]:
+        """Names of FOREIGN_CATALOG entries — used by discovery to exclude
+        them from schema/table iteration. They are captured separately via
+        ``list_foreign_catalogs`` as governance metadata; iterating their
+        schemas via ``information_schema.tables`` fails because the query
+        is routed to the remote JDBC source which lacks UC columns like
+        ``data_source_format``.
+        """
+        return {fc["catalog_name"] for fc in self.list_foreign_catalogs()}
 
     def list_online_tables(self) -> list[dict]:
         """Online tables via REST ``/api/2.0/online-tables``.
