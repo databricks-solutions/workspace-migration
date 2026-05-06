@@ -463,3 +463,15 @@ class TestWarnRlsCmTables:
         _warn_rls_cm_tables(rows, config)
         out = capsys.readouterr().out
         assert "`c`.`s`.`other`" in out
+
+    def test_warning_mentions_staging_copy_strategy(self, capsys):
+        """Path A: operator-facing warning must mention staging_copy as the
+        recommended option, not just drop_and_restore."""
+        from discovery.discovery import _warn_rls_cm_tables
+
+        config = MagicMock()
+        config.rls_cm_strategy = ""
+        rows = [{"object_type": "row_filter", "object_name": "`c`.`s`.`t`"}]
+        _warn_rls_cm_tables(rows, config)
+        out = capsys.readouterr().out
+        assert "staging_copy" in out

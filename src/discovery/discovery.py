@@ -423,8 +423,12 @@ def _warn_rls_cm_tables(rows: list[dict], config) -> None:
             "Delta Sharing supports sharing tables protected by ABAC."
         )
         print(
-            "  2. (Planned) Set rls_cm_strategy='drop_and_restore' to opt into "
-            "a drop-share-restore flow — brief exposure window on source."
+            "  2. Set rls_cm_strategy='staging_copy' (recommended — no source "
+            "mutation; clones table into a staging schema and shares the copy)."
+        )
+        print(
+            "  3. Set rls_cm_strategy='drop_and_restore' (legacy — strips "
+            "source RLS/CM during migration; brief exposure window on source)."
         )
     print("=" * 78)
     print()
