@@ -243,11 +243,31 @@ def clone_table(
                 "duration_seconds": duration,
             }
 
-    # --- Delta (default) — DEEP CLONE, CTAS fallback for RLS/CM-stripped tables ---
+    # --- Delta (default) — DEEP CLONE from staging consumer path if staging
+    #     exists (Path A staging_copy), else from the original consumer path.
+    #     CTAS fallback retained for backwards compatibility with the
+    #     drop_and_restore path until that path is removed (Task 14).
     consumer_fqn = f"`{consumer_catalog}`.`{schema}`.`{table}`"
-    if obj_name in rls_cm_stripped:
+    staging_fqn = tracker.get_staging_for_original(obj_name) if tracker is not None else None
+    if staging_fqn:
+        # Path A: the staging table was CTAS'd from the source into the source
+        # workspace's `cp_migration_staging` schema, so it's a regular Delta
+        # table with full schema and properties preserved — DEEP CLONE works
+        # without a CTAS fallback. Build the consumer-side path:
+        #   `<consumer>.cp_migration_staging.<staging_table_name>`.
+        # `staging_fqn` looks like `tcat`.`cp_migration_staging`.`stg_abc...`;
+        # extract just the trailing identifier.
+        staging_table_name = staging_fqn.rstrip("`").split("`")[-1]
+        staging_consumer_fqn = (
+            f"`{consumer_catalog}`.`cp_migration_staging`.`{staging_table_name}`"
+        )
+        sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {staging_consumer_fqn}"
+        logger.info(
+            "Executing DEEP CLONE from staging for %s (staging=%s)", obj_name, staging_fqn
+        )
+    elif obj_name in rls_cm_stripped:
         sql = f"CREATE OR REPLACE TABLE {target_fqn} AS SELECT * FROM {consumer_fqn}"
-        logger.info("Executing CTAS (RLS/CM-stripped) for %s", obj_name)
+        logger.info("Executing CTAS (RLS/CM-stripped, drop_and_restore) for %s", obj_name)
     else:
         sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {consumer_fqn}"
         logger.info("Executing DEEP CLONE for %s", obj_name)

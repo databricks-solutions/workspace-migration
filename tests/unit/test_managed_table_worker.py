@@ -11,6 +11,9 @@ class TestCloneTable:
         config.dry_run = dry_run
         auth = MagicMock()
         tracker = MagicMock()
+        # No staging by default → exercise the original-consumer DEEP CLONE
+        # / CTAS branches the rest of the suite asserts on.
+        tracker.get_staging_for_original.return_value = None
         validator = MagicMock()
         return {
             "config": config,
@@ -125,6 +128,7 @@ class TestIcebergManagedTable:
         config.iceberg_strategy = iceberg_strategy
         auth = MagicMock()
         tracker = MagicMock()
+        tracker.get_staging_for_original.return_value = None
         validator = MagicMock()
         return {
             "config": config,
@@ -348,10 +352,13 @@ class TestRlsCmStrippedCtasBranch:
     def _make_deps(self) -> dict:
         config = MagicMock()
         config.dry_run = False
+        tracker = MagicMock()
+        # drop_and_restore branch: no staging entries.
+        tracker.get_staging_for_original.return_value = None
         return {
             "config": config,
             "auth": MagicMock(),
-            "tracker": MagicMock(),
+            "tracker": tracker,
             "validator": MagicMock(),
             "wh_id": "wh-1",
             "share_name": "cp_migration_share",
@@ -439,3 +446,88 @@ class TestRlsCmStrippedCtasBranch:
         assert result["status"] == "validated"
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         assert any("DEEP CLONE" in s for s in sqls)
+
+
+class TestStagingCopyDeepClone:
+    """Path A — staging_copy. When tracker.get_staging_for_original returns a
+    staging FQN, clone_table must DEEP CLONE from the consumer-side staging
+    path (`<consumer>.cp_migration_staging.<staging_table>`), NOT from the
+    original consumer path. Staging tables preserve full schema/properties so
+    DEEP CLONE works without the CTAS fallback used for drop_and_restore.
+    """
+
+    def _make_deps(self, *, staging_fqn: str | None) -> dict:
+        config = MagicMock()
+        config.dry_run = False
+        config.rls_cm_strategy = "staging_copy"
+        tracker = MagicMock()
+        tracker.get_staging_for_original.return_value = staging_fqn
+        validator = MagicMock()
+        validator.validate_row_count.return_value = {
+            "match": True,
+            "source_count": 5,
+            "target_count": 5,
+        }
+        return {
+            "config": config,
+            "auth": MagicMock(),
+            "tracker": tracker,
+            "validator": validator,
+            "wh_id": "wh-id",
+            "share_name": "cp_migration_share",
+        }
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_deep_clones_from_staging_consumer_path_when_staging_exists(
+        self, mock_execute, mock_time
+    ):
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 110.0, 115.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps(
+            staging_fqn="`tcat`.`cp_migration_staging`.`stg_abcdef123456`"
+        )
+        table_info = {"object_name": "`c`.`s`.`rls_table`"}
+        result = clone_table(table_info, **deps)
+
+        assert result["status"] == "validated"
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        # DEEP CLONE fires, sourced from consumer-side staging path.
+        assert any("DEEP CLONE" in s for s in sqls), sqls
+        assert any("cp_migration_staging" in s for s in sqls), sqls
+        assert any("stg_abcdef123456" in s for s in sqls), sqls
+        # Consumer catalog is `<share_name>_consumer`. Source must be
+        # `<consumer>.cp_migration_staging.<staging_table>`, NOT the original.
+        assert any(
+            "`cp_migration_share_consumer`.`cp_migration_staging`.`stg_abcdef123456`" in s
+            for s in sqls
+        ), sqls
+        # Must NOT be a CTAS, must NOT clone from the original consumer path.
+        assert not any("AS SELECT * FROM" in s for s in sqls), sqls
+        assert not any("`cp_migration_share_consumer`.`s`.`rls_table`" in s for s in sqls), sqls
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_no_staging_falls_through_to_original_consumer_deep_clone(
+        self, mock_execute, mock_time
+    ):
+        """When tracker has no staging entry for the table, clone_table must
+        fall through to DEEP CLONE from the original consumer path."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 110.0, 115.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps(staging_fqn=None)
+        table_info = {"object_name": "`c`.`s`.`plain_table`"}
+        result = clone_table(table_info, **deps)
+
+        assert result["status"] == "validated"
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        assert any("DEEP CLONE" in s for s in sqls), sqls
+        # Original consumer path, not staging.
+        assert any("`cp_migration_share_consumer`.`s`.`plain_table`" in s for s in sqls), sqls
+        assert not any("cp_migration_staging" in s for s in sqls), sqls
