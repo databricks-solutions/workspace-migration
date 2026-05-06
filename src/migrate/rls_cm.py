@@ -11,6 +11,7 @@ runtime.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -40,6 +41,23 @@ def _dotted(fqn: str) -> str:
 def _backticked(fqn: str) -> str:
     cat, sch, name = _split_fqn(fqn)
     return f"`{cat}`.`{sch}`.`{name}`"
+
+
+def make_staging_table_fqn(original_fqn: str, run_id: str, tracking_catalog: str) -> str:
+    r"""Generate the deterministic staging-table FQN for an original table.
+
+    Format: `<tracking_catalog>`.`cp_migration_staging`.`stg_<sha12>`
+    where sha12 is the first 12 hex chars of SHA-256 over
+    ``<canonical_original_fqn>|<run_id>``. Same (original, run, tracking_catalog)
+    triple always hashes the same name; different runs produce different
+    names so a re-run after a partial cleanup never collides.
+
+    Canonicalization strips backticks so ``\`c\`.\`s\`.\`t\``` and ``c.s.t``
+    produce the same staging name.
+    """
+    canonical = _dotted(original_fqn)
+    digest = hashlib.sha256(f"{canonical}|{run_id}".encode()).hexdigest()[:12]
+    return f"`{tracking_catalog}`.`cp_migration_staging`.`stg_{digest}`"
 
 
 def capture_rls_cm(auth: AuthManager, table_fqn: str) -> dict:

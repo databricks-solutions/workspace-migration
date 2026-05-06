@@ -169,3 +169,42 @@ class TestRestoreRlsCm:
         calls = [c.args[0] for c in spark.sql.call_args_list]
         assert len(calls) == 1
         assert "`valid` SET MASK" in calls[0]
+
+
+class TestMakeStagingTableFqn:
+    def test_deterministic_and_short(self):
+        from migrate.rls_cm import make_staging_table_fqn
+        a = make_staging_table_fqn("c.s.t", "run-1", "tcat")
+        b = make_staging_table_fqn("c.s.t", "run-1", "tcat")
+        assert a == b
+        # FQN: `tcat`.`cp_migration_staging`.`stg_<hash>`
+        assert a.startswith("`tcat`.`cp_migration_staging`.`stg_")
+        assert a.endswith("`")
+        # 12-char hash → "stg_xxxxxxxxxxxx" inside backticks
+        last_part = a.split("`")[-2]
+        assert last_part.startswith("stg_")
+        assert len(last_part) == len("stg_") + 12
+
+    def test_different_runs_different_staging_names(self):
+        from migrate.rls_cm import make_staging_table_fqn
+        a = make_staging_table_fqn("c.s.t", "run-1", "tcat")
+        b = make_staging_table_fqn("c.s.t", "run-2", "tcat")
+        assert a != b
+
+    def test_different_originals_different_staging_names(self):
+        from migrate.rls_cm import make_staging_table_fqn
+        a = make_staging_table_fqn("c.s.t1", "run-1", "tcat")
+        b = make_staging_table_fqn("c.s.t2", "run-1", "tcat")
+        assert a != b
+
+    def test_handles_backticked_input(self):
+        from migrate.rls_cm import make_staging_table_fqn
+        a = make_staging_table_fqn("`c`.`s`.`t`", "run-1", "tcat")
+        b = make_staging_table_fqn("c.s.t", "run-1", "tcat")
+        # Backticked vs unbacked must hash to same value (canonicalized).
+        assert a == b
+
+    def test_uses_provided_tracking_catalog(self):
+        from migrate.rls_cm import make_staging_table_fqn
+        a = make_staging_table_fqn("c.s.t", "run-1", "main_tracking")
+        assert "`main_tracking`.`cp_migration_staging`" in a
