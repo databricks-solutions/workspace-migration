@@ -442,11 +442,11 @@ class TrackingManager:
         for r in rows:
             try:
                 filter_columns = _json.loads(r.filter_columns or "[]")
-            except json.JSONDecodeError:
+            except _json.JSONDecodeError:
                 filter_columns = []
             try:
                 masks = _json.loads(r.masks_json or "[]")
-            except json.JSONDecodeError:
+            except _json.JSONDecodeError:
                 masks = []
             result.append(
                 {

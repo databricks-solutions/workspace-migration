@@ -330,3 +330,37 @@ class TestDiscoveryRowHelpers:
         # Real schema-field coverage is exercised by the DDL assertion in
         # test_init_tracking_tables_creates_schema above.
         assert discovery_schema() is not None
+
+
+def test_get_unrestored_rls_cm_manifest_handles_malformed_filter_columns_json(monkeypatch, tmp_path):
+    """Regression: malformed JSON in filter_columns must NOT raise NameError.
+
+    Bug C1: tracking.py imports json as _json but except clauses reference
+    `json.JSONDecodeError`. One bad row → NameError → restore poisoned.
+    """
+    from common.tracking import TrackingManager
+    from unittest.mock import MagicMock
+
+    config = MagicMock()
+    config.tracking_catalog = "main"
+    config.tracking_schema = "cp_migration_tracking"
+
+    spark = MagicMock()
+    bad_row = MagicMock()
+    bad_row.table_fqn = "c.s.t"
+    bad_row.filter_fn_fqn = None
+    bad_row.filter_columns = "{not json"
+    bad_row.masks_json = "[]"
+    bad_row.stripped_at = None
+    bad_row.restore_failed_at = None
+    bad_row.restore_error = None
+    bad_row.run_id = "r1"
+    spark.sql.return_value.collect.return_value = [bad_row]
+
+    tm = TrackingManager(spark, config)
+    result = tm.get_unrestored_rls_cm_manifest()
+
+    assert result == [{"table_fqn": "c.s.t", "filter_fn_fqn": None,
+                       "filter_columns": [], "masks": [],
+                       "stripped_at": None, "restore_failed_at": None,
+                       "restore_error": None, "run_id": "r1"}]
