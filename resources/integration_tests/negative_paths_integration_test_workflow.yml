@@ -110,7 +110,7 @@ resources:
           depends_on:
             - task_key: setup_X33_config
           run_job_task:
-            job_id: ${resources.jobs.migrate.id}
+            job_id: ${resources.jobs.migrate_uc.id}
 
         - task_key: assert_X33
           depends_on:

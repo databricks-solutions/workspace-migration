@@ -55,12 +55,21 @@ class TestOrchestratorToWorkerKeyAlignment:
     the orchestrator writes. Source-level audit of both sides."""
 
     def test_migrate_workflow_inputs_match_orchestrator_keys(self):
-        """Every for_each input in migrate_workflow.yml must reference a
-        task value that orchestrator.py / hive_orchestrator.py emits.
-        Loss of alignment means empty input → silent no-op."""
+        """Every for_each input in the split production workflows
+        (migrate_uc + migrate_hive) must reference a task value that
+        orchestrator.py / hive_orchestrator.py emits. Loss of alignment
+        means empty input → silent no-op."""
         import re
 
-        workflow = _src("resources/migrate_workflow.yml")
+        # Post-WS-21 the monolithic migrate_workflow.yml is gone; the
+        # for_each inputs now live in the two split data-plane workflows.
+        # migrate_governance has no for_each over orchestrator output, so
+        # it's not part of this audit.
+        workflow_files = [
+            "resources/production/migrate_uc_workflow.yml",
+            "resources/production/migrate_hive_workflow.yml",
+        ]
+        workflow = "\n".join(_src(p) for p in workflow_files)
         uc_orch = _src("src/migrate/orchestrator.py")
         hive_orch = _src("src/migrate/hive_orchestrator.py")
 
@@ -69,7 +78,7 @@ class TestOrchestratorToWorkerKeyAlignment:
             r'inputs:\s*"\{\{tasks\.(\w+)\.values\.([\w_]+)\}\}"',
             workflow,
         )
-        assert inputs, "No for_each inputs found in migrate_workflow.yml"
+        assert inputs, "No for_each inputs found in split migrate_*_workflow.yml files"
 
         for orch_task, key in inputs:
             # The orchestrator source for that task must emit this key.
