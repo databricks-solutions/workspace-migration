@@ -185,9 +185,6 @@ def _process_show_grants_rows(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_hive:
-        logger.info("Skipping hive_grants_worker: scope.include_hive=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
     wh_id = find_warehouse(auth)

@@ -202,7 +202,6 @@ class TestWorkerScopeGating:
     HIVE_WORKERS_WITH_SCOPE_GATE = (
         "hive_views_worker.py",
         "hive_functions_worker.py",
-        "hive_grants_worker.py",
     )
 
     def test_uc_workers_check_include_uc_in_run(self):
