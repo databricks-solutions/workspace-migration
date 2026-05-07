@@ -19,6 +19,7 @@ except NameError:
 # COMMAND ----------
 # Summary: aggregates migration tracking data and prints a final report.
 
+import contextlib
 import logging
 from typing import TYPE_CHECKING
 
@@ -35,10 +36,8 @@ logger = logging.getLogger("summary")
 # COMMAND ----------
 # Widgets — declared at notebook top so per-workflow summary tasks can pass
 # their object-type slice. Empty / missing = summarise everything (back-compat).
-try:
+with contextlib.suppress(NameError):
     dbutils.widgets.text("object_types", "")  # type: ignore[name-defined]  # noqa: F821
-except NameError:
-    pass
 
 
 # COMMAND ----------
@@ -175,10 +174,8 @@ if _is_notebook():
 
     # Per-workflow filter (workflow split): empty / missing → summarise everything.
     object_types_param = ""
-    try:
+    with contextlib.suppress(Exception):
         object_types_param = dbutils.widgets.get("object_types")  # type: ignore[name-defined] # noqa: F821
-    except Exception:  # noqa: BLE001
-        pass
     object_types = [t.strip() for t in object_types_param.split(",") if t.strip()]
 
     logger.info("Fetching latest migration status...")
