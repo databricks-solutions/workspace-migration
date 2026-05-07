@@ -130,6 +130,123 @@ else:
     print("3.17 volume comment: not seeded; skipping.")
 
 # COMMAND ----------
+# --- Phase 3 T28: tag rows in migration_status ---
+# Moved from test_uc_end_to_end.py per WS-17 cleanup. tags_worker runs in
+# migrate_governance, so this validation belongs here.
+
+# Task 28 — tags: expect at least one 'tag' row with status='validated'
+has_tag = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_uc", key="has_tag", debugValue="false"
+)
+if str(has_tag).lower() == "true":
+    tag_rows = full_status.filter("object_type = 'tag' AND status = 'validated'").collect()
+    if not tag_rows:
+        error_messages.append("Phase 3 T28: no validated tag rows in migration_status.")
+    else:
+        print(f"Phase 3 T28 validated: {len(tag_rows)} tag row(s) on target.")
+else:
+    print("Phase 3 T28: tag fixture not seeded; skipping.")
+
+# COMMAND ----------
+# --- Phase 3 T29: row filter replayed on target ---
+# Moved from test_uc_end_to_end.py per WS-17 cleanup. row_filters_worker
+# runs in migrate_governance, and the DDL sanitizer reapply leg is also a
+# governance concern (strip happens in migrate_uc views/external workers,
+# reapply happens in migrate_governance).
+
+# Task 29 — row filter
+has_rf = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_uc", key="has_row_filter", debugValue="false"
+)
+if str(has_rf).lower() == "true":
+    rf_rows = full_status.filter("object_type = 'row_filter' AND status = 'validated'").collect()
+    if not rf_rows:
+        error_messages.append("Phase 3 T29: row filter not replayed on target.")
+    else:
+        print(f"Phase 3 T29 validated: row filter applied on {rf_rows[0]['object_name']}.")
+
+    # --- DDL sanitizer end-to-end (S.12) ---
+    # Not just "migration_status says validated" — fetch the external_customers
+    # table from TARGET and verify its row_filter is actually populated.
+    # Proves the strip-filter-from-DDL path in external_table_worker + the
+    # later row_filters_worker re-application on target both work.
+    try:
+        from common.auth import AuthManager  # noqa: E402
+
+        _auth = AuthManager(config, dbutils)  # noqa: F821
+        _tgt_info = _auth.target_client.tables.get("integration_test_src.test_schema.external_customers")
+        if getattr(_tgt_info, "row_filter", None) is None:
+            error_messages.append(
+                "DDL sanitizer E2E: external_customers on target has no "
+                "row_filter — strip-then-reapply chain broke. Sanitizer "
+                "stripped the filter from CREATE TABLE but row_filters_worker "
+                "didn't reapply it."
+            )
+        else:
+            print(
+                f"DDL sanitizer E2E validated: external_customers on target "
+                f"carries row_filter "
+                f"'{getattr(_tgt_info.row_filter, 'function_name', '?')}'"
+            )
+    except Exception as _exc:  # noqa: BLE001
+        error_messages.append(f"DDL sanitizer E2E: target lookup failed: {_exc}")
+else:
+    print("Phase 3 T29: row filter fixture not seeded; skipping.")
+
+# COMMAND ----------
+# --- Phase 3 T30: column mask replayed on target ---
+# Moved from test_uc_end_to_end.py per WS-17 cleanup. column_masks_worker
+# runs in migrate_governance, and the DDL sanitizer reapply leg for masks
+# is a governance concern just like the row_filter reapply above.
+
+# Task 30 — column mask
+has_cm = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_uc", key="has_column_mask", debugValue="false"
+)
+if str(has_cm).lower() == "true":
+    cm_rows = full_status.filter("object_type = 'column_mask' AND status = 'validated'").collect()
+    if not cm_rows:
+        error_messages.append("Phase 3 T30: column mask not replayed on target.")
+    else:
+        print(f"Phase 3 T30 validated: column mask applied on {cm_rows[0]['object_name']}.")
+
+    # --- DDL sanitizer end-to-end: column mask on target (S.12) ---
+    # external_customers.customer_id should carry the mask on target
+    # even though external_table_worker stripped the MASK clause from
+    # the replayed CREATE TABLE (because mask_customer function hadn't
+    # been migrated yet at that stage).
+    try:
+        from common.auth import AuthManager  # noqa: E402
+
+        _auth = AuthManager(config, dbutils)  # noqa: F821
+        _tgt_info = _auth.target_client.tables.get("integration_test_src.test_schema.external_customers")
+        _masked_cols = [c for c in (getattr(_tgt_info, "columns", None) or []) if getattr(c, "mask", None) is not None]
+        if not _masked_cols:
+            error_messages.append(
+                "DDL sanitizer E2E: external_customers on target has no "
+                "column masks — strip-then-reapply chain broke for masks."
+            )
+        else:
+            print(f"DDL sanitizer E2E validated: {len(_masked_cols)} column mask(s) on external_customers on target.")
+    except Exception as _exc:  # noqa: BLE001
+        error_messages.append(f"DDL sanitizer E2E (mask): target lookup failed: {_exc}")
+else:
+    print("Phase 3 T30: column mask fixture not seeded; skipping.")
+
+# COMMAND ----------
+# --- Phase 3 T32: comments replayed on target ---
+# Moved from test_uc_end_to_end.py per WS-17 cleanup. comments_worker runs
+# in migrate_governance.
+
+# Task 32 — comments: expect at least CATALOG + SCHEMA + TABLE comment rows
+comment_rows = full_status.filter("object_type = 'comment' AND status = 'validated'").collect()
+if len(comment_rows) < 2:
+    # 2 minimum since TABLE comments on Delta may skip via DEEP CLONE path
+    error_messages.append(f"Phase 3 T32: expected >= 2 comment rows (catalog + schema), got {len(comment_rows)}.")
+else:
+    print(f"Phase 3 T32 validated: {len(comment_rows)} comment row(s) replayed.")
+
+# COMMAND ----------
 # --- 3.24: Customer-defined Delta share ---
 # sharing_worker recreates the share shell + recipient on target. The
 # tool's internal ``cp_migration_share`` is excluded at discovery time
