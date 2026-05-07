@@ -25,8 +25,6 @@ except NameError:
 #   X.3.2  unreachable target_workspace_url    -> pre_check fails (target error)
 #   X.3.3  include_uc=false AND include_hive=false
 #                                             -> discovery / migrate succeed as no-op
-#   X.3.4  rls_cm_strategy='drop_and_restore' without maintenance window confirmed
-#                                             -> setup_sharing fails (ValueError)
 #
 # This single assertion notebook is run once per scenario (``run_if:
 # ALL_DONE`` so it runs even when the preceding task fails). The
@@ -153,15 +151,5 @@ elif scenario == "X.3.3":
     # The trigger task here is the migrate run_job_task — it should
     # SUCCEED.
     _assert_succeeded_as_noop()
-elif scenario == "X.3.4":
-    # drop_and_restore without consent: setup_sharing._validate_rls_cm_strategy
-    # raises ValueError BEFORE share/recipient creation. Message mentions
-    # both the strategy and the consent flag.
-    _assert_failed_with(
-        (
-            "rls_cm_maintenance_window_confirmed",
-            "drop_and_restore",
-        )
-    )
 else:
     raise ValueError(f"Unknown scenario: {scenario!r}")

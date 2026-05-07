@@ -370,7 +370,7 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
 def _warn_rls_cm_tables(rows: list[dict], config) -> None:
     """Surface a prominent warning listing tables with row filter / column
     mask — Delta Sharing refuses to share these, and the tool skips them by
-    default. Operators can opt into the planned drop_and_restore path via
+    default. Operators can opt into the staging_copy path via
     ``config.rls_cm_strategy``.
     """
     import json as _json
@@ -403,12 +403,13 @@ def _warn_rls_cm_tables(rows: list[dict], config) -> None:
     print()
     print("Delta Sharing providers cannot share tables with legacy RLS/CM (ALTER TABLE ... SET ROW FILTER / SET MASK).")
     print()
-    if strategy == "drop_and_restore":
+    if strategy == "staging_copy":
         print(
-            "config.rls_cm_strategy = 'drop_and_restore' — NOT YET IMPLEMENTED. "
-            "setup_sharing will fail with NotImplementedError when it runs. "
-            "Either wait for the drop+restore implementation or unset the flag "
-            "to accept the skip path."
+            "config.rls_cm_strategy = 'staging_copy' — setup_sharing will CTAS "
+            "each affected table into the migration tracking catalog's "
+            "cp_migration_staging schema, share the staging copy, and the "
+            "migrate workers will DEEP CLONE that copy. Source RLS/CM "
+            "untouched."
         )
     else:
         print(
@@ -423,8 +424,9 @@ def _warn_rls_cm_tables(rows: list[dict], config) -> None:
             "Delta Sharing supports sharing tables protected by ABAC."
         )
         print(
-            "  2. (Planned) Set rls_cm_strategy='drop_and_restore' to opt into "
-            "a drop-share-restore flow — brief exposure window on source."
+            "  2. Set rls_cm_strategy='staging_copy' — clones each affected "
+            "table into a staging schema and shares the copy. Source RLS/CM "
+            "untouched. Requires the migration SPN to be a workspace admin."
         )
     print("=" * 78)
     print()

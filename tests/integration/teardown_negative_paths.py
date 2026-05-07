@@ -18,18 +18,16 @@ except NameError:
 
 # Negative-path integration teardown.
 #
-# The negative-path workflow's four scenarios each rewrite ``config.yaml``
+# The negative-path workflow's scenarios each rewrite ``config.yaml``
 # with intentionally broken values. They DON'T seed fixtures on source or
-# target (X.3.1 / X.3.2 fail pre_check before any side effect; X.3.4 fails
-# inside setup_sharing's validator before share/recipient creation; X.3.3
-# is a proper no-op). So the teardown's only responsibility is to restore
+# target (X.3.1 / X.3.2 fail pre_check before any side effect; X.3.3 is a
+# proper no-op). So the teardown's only responsibility is to restore
 # ``config.yaml`` from the backup the first ``setup_test_config`` run
 # saved at the very start.
 #
 # Belt-and-braces: also best-effort drop any delta share / recipient that
 # a mis-behaving setup_sharing somehow created — shouldn't happen given
-# X.3.4's validator runs before side effects, but harmless if nothing
-# matches.
+# the scenarios fail before side effects, but harmless if nothing matches.
 
 import os  # noqa: E402
 import shutil  # noqa: E402
@@ -46,9 +44,9 @@ else:
 
 # COMMAND ----------
 
-# Best-effort share / recipient cleanup. X.3.4's validator should fail
-# BEFORE ``get_or_create_share`` runs, but if that gate ever regresses we
-# don't want a stray ``cp_migration_share`` to poison subsequent runs.
+# Best-effort share / recipient cleanup. The injected scenarios should
+# all fail BEFORE ``get_or_create_share`` runs, but if that ever regresses
+# we don't want a stray ``cp_migration_share`` to poison subsequent runs.
 try:
     from databricks.sdk import WorkspaceClient
 

@@ -49,21 +49,6 @@ try:
            OR (catalog_name IN ('integration_test_src', 'integration_test_src_b'))
         """
     )
-    # Also clear the P.1 fixture's rls_cm_manifest entry so re-running
-    # the integration test starts from a clean slate. Without this,
-    # setup_sharing's crash-recovery scan sees the old row, tries to
-    # re-apply the policy, and either double-applies (error) or
-    # stamps the new run with stale manifest metadata.
-    try:
-        spark.sql(  # noqa: F821
-            """
-            DELETE FROM migration_tracking.cp_migration.rls_cm_manifest
-            WHERE table_fqn LIKE '%integration_test_src%'
-            """
-        )
-    except Exception as _exc_manifest:  # noqa: BLE001
-        # Table may not exist if no prior drop_and_restore run happened.
-        print(f"rls_cm_manifest cleanup skipped: {_exc_manifest}")
     print("Cleared integration_test fixture rows from tracking tables.")
 except Exception as _exc:  # noqa: BLE001
     # First-ever run: tracking tables don't exist yet — safe to skip.

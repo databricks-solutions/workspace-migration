@@ -330,3 +330,137 @@ class TestDiscoveryRowHelpers:
         # Real schema-field coverage is exercised by the DDL assertion in
         # test_init_tracking_tables_creates_schema above.
         assert discovery_schema() is not None
+
+
+def test_init_creates_rls_cm_staging_manifest_table(mock_spark, mock_config):
+    """Path A: init_tracking_tables must create rls_cm_staging_manifest
+    table in tracking_catalog.tracking_schema with the expected schema."""
+    mgr = TrackingManager(mock_spark, mock_config)
+    mgr.init_tracking_tables()
+
+    sql_calls = [c.args[0] for c in mock_spark.sql.call_args_list]
+    staging_create = next(
+        (s for s in sql_calls if "rls_cm_staging_manifest" in s and "CREATE TABLE IF NOT EXISTS" in s),
+        None,
+    )
+    assert staging_create is not None, "rls_cm_staging_manifest CREATE missing"
+    assert "original_fqn STRING NOT NULL" in staging_create
+    assert "staging_fqn STRING NOT NULL" in staging_create
+    assert "created_at TIMESTAMP" in staging_create
+    assert "dropped_at TIMESTAMP" in staging_create
+    assert "drop_failed_at TIMESTAMP" in staging_create
+    assert "drop_error STRING" in staging_create
+    assert "run_id STRING" in staging_create
+
+
+def test_init_creates_cp_migration_staging_schema(mock_spark, mock_config):
+    """Path A: staging tables live in tracking_catalog.cp_migration_staging,
+    not tracking_schema. Must create the schema."""
+    mgr = TrackingManager(mock_spark, mock_config)
+    mgr.init_tracking_tables()
+
+    sql_calls = [c.args[0] for c in mock_spark.sql.call_args_list]
+    staging_schema_create = next(
+        (s for s in sql_calls if "cp_migration_staging" in s and "CREATE SCHEMA IF NOT EXISTS" in s),
+        None,
+    )
+    assert staging_schema_create is not None, "cp_migration_staging schema CREATE missing"
+    # Positive: schema is created at tracking_catalog.cp_migration_staging
+    # (with or without backticks).
+    assert (
+        "migration_tracking.cp_migration_staging" in staging_schema_create
+        or "`migration_tracking`.`cp_migration_staging`" in staging_schema_create
+    )
+    # Negative: schema must NOT be nested inside tracking_schema. Catches
+    # the bug where the implementation accidentally uses ``self._fqn``
+    # (catalog.schema) instead of ``self._catalog`` as the parent.
+    assert "migration_tracking.cp_migration.cp_migration_staging" not in staging_schema_create
+    assert (
+        "`migration_tracking`.`cp_migration`.`cp_migration_staging`"
+        not in staging_schema_create
+    )
+
+
+class TestStagingManifest:
+    """Tests for the Path A staging-manifest helpers on TrackingManager."""
+
+    def test_record_staging_created_inserts_row(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()  # ignore CREATE statements from init
+
+        tm.record_staging_created(
+            original_fqn="`c`.`s`.`t`",
+            staging_fqn="`tcat`.`cp_migration_staging`.`stg_abc123`",
+            run_id="r-1",
+        )
+        sql = mock_spark.sql.call_args_list[-1].args[0]
+        assert "INSERT INTO" in sql
+        assert "rls_cm_staging_manifest" in sql
+        assert "`c`.`s`.`t`" in sql
+        assert "stg_abc123" in sql
+        assert "r-1" in sql
+
+    def test_record_staging_created_escapes_quotes(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        tm.record_staging_created(
+            original_fqn="o'reilly",
+            staging_fqn="stg_xyz",
+            run_id="r'1",
+        )
+        sql = mock_spark.sql.call_args_list[-1].args[0]
+        assert "o''reilly" in sql
+        assert "r''1" in sql
+
+    def test_mark_staging_dropped_updates_dropped_at(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        tm.mark_staging_dropped(staging_fqn="`tcat`.`cp_migration_staging`.`stg_abc`")
+        sql = mock_spark.sql.call_args_list[-1].args[0]
+        assert "UPDATE" in sql
+        assert "rls_cm_staging_manifest" in sql
+        assert "dropped_at = current_timestamp()" in sql
+        assert "stg_abc" in sql
+        assert "dropped_at IS NULL" in sql
+
+    def test_mark_staging_drop_failed_updates_error(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        tm.mark_staging_drop_failed(staging_fqn="stg_abc", error_message="boom")
+        sql = mock_spark.sql.call_args_list[-1].args[0]
+        assert "drop_failed_at = current_timestamp()" in sql
+        assert "drop_error = 'boom'" in sql
+        assert "stg_abc" in sql
+
+    def test_get_active_stagings_returns_undropped_rows(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        row = MagicMock()
+        row.original_fqn = "`c`.`s`.`t`"
+        row.staging_fqn = "stg_abc"
+        row.created_at = None
+        row.run_id = "r-1"
+        mock_spark.sql.return_value.collect.return_value = [row]
+        result = tm.get_active_stagings()
+        assert result == [
+            {"original_fqn": "`c`.`s`.`t`", "staging_fqn": "stg_abc",
+             "created_at": None, "run_id": "r-1"},
+        ]
+        sql = mock_spark.sql.call_args_list[-1].args[0]
+        assert "WHERE dropped_at IS NULL" in sql
+
+    def test_get_staging_for_original_returns_staging_fqn(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        row = MagicMock()
+        row.staging_fqn = "stg_abc"
+        mock_spark.sql.return_value.collect.return_value = [row]
+        result = tm.get_staging_for_original("`c`.`s`.`t`")
+        assert result == "stg_abc"
+
+    def test_get_staging_for_original_returns_none_when_absent(self, mock_spark, mock_config):
+        tm = TrackingManager(mock_spark, mock_config)
+        mock_spark.sql.reset_mock()
+        mock_spark.sql.return_value.collect.return_value = []
+        result = tm.get_staging_for_original("`c`.`s`.`missing`")
+        assert result is None

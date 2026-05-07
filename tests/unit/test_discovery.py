@@ -434,17 +434,18 @@ class TestWarnRlsCmTables:
         # Table should appear exactly once in the listed bullets.
         assert out.count("- `c`.`s`.`t`") == 1
 
-    def test_calls_out_drop_and_restore_when_flagged(self, capsys):
-        """If operator set rls_cm_strategy=drop_and_restore, surface the
-        ``NOT YET IMPLEMENTED`` warning so they know setup_sharing will fail."""
+    def test_calls_out_staging_copy_when_flagged(self, capsys):
+        """If operator set rls_cm_strategy=staging_copy, surface a notice
+        explaining what setup_sharing will do (CTAS into staging)."""
         from discovery.discovery import _warn_rls_cm_tables
 
         config = MagicMock()
-        config.rls_cm_strategy = "drop_and_restore"
+        config.rls_cm_strategy = "staging_copy"
         rows = [{"object_type": "row_filter", "object_name": "`c`.`s`.`t`"}]
         _warn_rls_cm_tables(rows, config)
         out = capsys.readouterr().out
-        assert "NOT YET IMPLEMENTED" in out
+        assert "staging_copy" in out
+        assert "cp_migration_staging" in out
 
     def test_tolerates_malformed_metadata_json(self, capsys):
         from discovery.discovery import _warn_rls_cm_tables
@@ -463,3 +464,15 @@ class TestWarnRlsCmTables:
         _warn_rls_cm_tables(rows, config)
         out = capsys.readouterr().out
         assert "`c`.`s`.`other`" in out
+
+    def test_warning_mentions_staging_copy_strategy(self, capsys):
+        """Path A: operator-facing warning must mention staging_copy as the
+        recommended option."""
+        from discovery.discovery import _warn_rls_cm_tables
+
+        config = MagicMock()
+        config.rls_cm_strategy = ""
+        rows = [{"object_type": "row_filter", "object_name": "`c`.`s`.`t`"}]
+        _warn_rls_cm_tables(rows, config)
+        out = capsys.readouterr().out
+        assert "staging_copy" in out

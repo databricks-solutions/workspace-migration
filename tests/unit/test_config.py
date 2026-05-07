@@ -92,7 +92,7 @@ migrate_hive_dbfs_root: true
 hive_dbfs_target_path: abfss://hive@acct.dfs.core.windows.net/upgraded/
 hive_target_catalog: legacy_hive
 iceberg_strategy: ddl_replay
-rls_cm_strategy: drop_and_restore
+rls_cm_strategy: staging_copy
 """,
         )
         config = MigrationConfig.from_workspace_file(str(path))
@@ -104,7 +104,7 @@ rls_cm_strategy: drop_and_restore
         assert config.hive_dbfs_target_path.startswith("abfss://")
         assert config.hive_target_catalog == "legacy_hive"
         assert config.iceberg_strategy == "ddl_replay"
-        assert config.rls_cm_strategy == "drop_and_restore"
+        assert config.rls_cm_strategy == "staging_copy"
 
     def test_rls_cm_strategy_defaults_to_empty(self, tmp_path):
         """rls_cm_strategy defaults to "" (skip) when unset in config."""
@@ -189,9 +189,11 @@ iceberg_strategy: ddl_replay
         config = MigrationConfig.from_workspace_file(str(path))
         assert config.iceberg_strategy == "ddl_replay"
 
-    def test_rls_cm_strategy_drop_and_restore_is_accepted(self, tmp_path):
-        """rls_cm_strategy='drop_and_restore' must round-trip for Phase 2.5.B
-        so the dispatch check in managed_table_worker can branch on it."""
+    def test_rls_cm_strategy_staging_copy_is_accepted(self, tmp_path):
+        """Path A: rls_cm_strategy='staging_copy' must round-trip so the
+        dispatch check in setup_sharing / managed_table_worker can branch
+        on it. Strategy validation lives in setup_sharing — config.py is a
+        passthrough — but we pin the contract here."""
         path = _write(
             tmp_path,
             """
@@ -200,11 +202,11 @@ target_workspace_url: https://tgt.azuredatabricks.net
 spn_client_id: client-id
 spn_secret_scope: migration
 spn_secret_key: spn-secret
-rls_cm_strategy: drop_and_restore
+rls_cm_strategy: staging_copy
 """,
         )
         config = MigrationConfig.from_workspace_file(str(path))
-        assert config.rls_cm_strategy == "drop_and_restore"
+        assert config.rls_cm_strategy == "staging_copy"
 
     def test_scope_missing_defaults_uc_only(self, tmp_path):
         """When scope block is missing, include_uc defaults True, include_hive False —

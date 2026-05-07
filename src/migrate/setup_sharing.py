@@ -39,7 +39,7 @@ except ImportError:
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
-from migrate.rls_cm import capture_rls_cm, has_rls_cm, restore_rls_cm, strip_rls_cm
+from migrate.rls_cm import capture_rls_cm, has_rls_cm, make_staging_table_fqn
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("setup_sharing")
@@ -283,84 +283,24 @@ def _add_rls_cm_from_tables_api(auth_mgr: AuthManager, pending_tables: list[dict
                 break
 
 
-def _recover_unrestored_rls_cm(auth: AuthManager, tracker: TrackingManager, spark) -> None:
-    """Crash-recovery: re-apply RLS/CM policies for any manifest row that's
-    still ``restored_at IS NULL`` from a previous (crashed) run.
-
-    Runs BEFORE any new strip happens so a crashed run's tables heal on
-    the very next invocation. Continue-on-failure: a table whose restore
-    fails gets ``restore_failed_at`` set, and the loop continues. The
-    operator can then diagnose and re-run.
-    """
-    pending = tracker.get_unrestored_rls_cm_manifest()
-    if not pending:
-        return
-    logger.warning(
-        "Crash recovery: found %d RLS/CM manifest row(s) still unrestored "
-        "from a prior run. Re-applying policies on source before proceeding.",
-        len(pending),
-    )
-    for row in pending:
-        table_fqn = row["table_fqn"]
-        captured = {
-            "filter_fn_fqn": row.get("filter_fn_fqn"),
-            "filter_columns": row.get("filter_columns") or [],
-            "masks": row.get("masks") or [],
-        }
-        try:
-            # Remove from share first — UC refuses SET ROW FILTER / SET
-            # MASK while the table is in an active Delta Share. "Not in
-            # share" swallowed so a second recovery attempt still works.
-            remove_sql = f"ALTER SHARE {SHARE_NAME} REMOVE TABLE {table_fqn}"
-            try:
-                spark.sql(remove_sql)
-            except Exception as share_exc:  # noqa: BLE001
-                msg = str(share_exc).lower()
-                if not ("not" in msg and ("shared" in msg or "in share" in msg or "exist" in msg)):
-                    raise
-            restore_rls_cm(spark, table_fqn, captured)
-            tracker.mark_rls_cm_restored(table_fqn)
-            logger.warning("Recovered RLS/CM on %s.", table_fqn)
-        except Exception as exc:  # noqa: BLE001
-            tracker.mark_rls_cm_restore_failed(table_fqn, str(exc))
-            logger.error(
-                "Recovery failed for %s: %s. Manual intervention required — "
-                "see rls_cm_manifest.restore_error.",
-                table_fqn,
-                exc,
-                exc_info=True,
-            )
-
-
 def _validate_rls_cm_strategy(config: MigrationConfig) -> str:
     """Validate ``config.rls_cm_strategy`` and return the normalized value.
 
     Runs BEFORE any side-effecting setup (share creation, API calls) so
     misconfiguration fails loud without leaving orphan state on source.
 
-    Supported: ``""`` (skip affected tables) or ``"drop_and_restore"``.
-    The ``drop_and_restore`` path requires
-    ``rls_cm_maintenance_window_confirmed = true`` — a deliberate
-    informed-consent gate because during each table's DEEP CLONE the
-    source is briefly unprotected.
+    Supported: ``""`` (skip affected tables) or ``"staging_copy"``. The
+    ``staging_copy`` path CTAS-clones each affected table into the
+    migration tracking schema while the migration SPN bypasses the
+    source-side filter (as a workspace admin), shares the unprotected
+    staging copy, and re-applies RLS/CM on the target after migrate.
+    Source RLS/CM is never altered.
     """
     strategy = (config.rls_cm_strategy or "").strip().lower()
-    if strategy not in ("", "drop_and_restore"):
+    if strategy not in ("", "staging_copy"):
         msg = (
             f"Unknown rls_cm_strategy {config.rls_cm_strategy!r}. "
-            f"Supported values: '' (skip) or 'drop_and_restore'."
-        )
-        raise ValueError(msg)
-    if strategy == "drop_and_restore" and not config.rls_cm_maintenance_window_confirmed:
-        msg = (
-            "rls_cm_strategy='drop_and_restore' requires "
-            "rls_cm_maintenance_window_confirmed=true. This path temporarily "
-            "DROPs row filter / column mask on the source table during "
-            "each table's DEEP CLONE, briefly exposing unfiltered, "
-            "unmasked data to any concurrent reader on source. Only "
-            "appropriate for maintenance-window migrations. Set the flag "
-            "to true in config.yaml to confirm you've scheduled a "
-            "maintenance window, then re-run."
+            f"Supported values: '' (skip) or 'staging_copy'."
         )
         raise ValueError(msg)
     return strategy
@@ -378,13 +318,6 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
-
-    # 0. Crash recovery: if a previous drop_and_restore run left any
-    #    tables stripped without re-applying, heal them BEFORE we strip
-    #    anything new. Always safe to run — if the manifest is empty
-    #    (normal case) this is a no-op.
-    if strategy == "drop_and_restore":
-        _recover_unrestored_rls_cm(auth, tracker, spark_session)
 
     # 1. Create or get the delta share on source
     share = get_or_create_share(auth, SHARE_NAME, dry_run=config.dry_run)
@@ -418,56 +351,68 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
     logger.info("RLS/CM set after live probe: %s", sorted(rls_cm_fqns))
     tables_to_share: list[dict] = []
     skipped_rls_cm: list[dict] = []
-    stripped_rls_cm: list[dict] = []
+    staged_rls_cm: list[dict] = []  # Path A staging_copy counter
     run_id = getattr(config, "current_run_id", "") or "unknown"
     for t in pending_tables:
         if t["object_name"] not in rls_cm_fqns:
             tables_to_share.append(t)
             continue
-        if strategy != "drop_and_restore":
-            skipped_rls_cm.append(t)
-            continue
-        # drop_and_restore: capture + record manifest + strip on source,
-        # THEN add the table to the share like any normal table. The
-        # post-migrate restore_rls_cm task re-applies the policy after
-        # managed_table_worker finishes the DEEP CLONE.
-        try:
-            captured = capture_rls_cm(auth, t["object_name"])
-            if not has_rls_cm(captured):
-                # Live probe flagged it but the policy is already gone
-                # (discovery caught a race). Safe to share as-is.
-                tables_to_share.append(t)
-                continue
-            if not config.dry_run:
-                tracker.record_rls_cm_strip(
-                    table_fqn=t["object_name"],
-                    filter_fn_fqn=captured["filter_fn_fqn"],
-                    filter_columns=captured["filter_columns"],
-                    masks=captured["masks"],
-                    run_id=run_id,
+        if strategy == "staging_copy":
+            # Path A: copy the table into cp_migration_staging via CTAS,
+            # then add the STAGING fqn to the share. Source RLS/CM is
+            # never touched. Migration SPN must be a workspace admin so
+            # the filter function's is_account_group_member('admins')
+            # bypass returns true and the CTAS reads unfiltered rows.
+            try:
+                captured = capture_rls_cm(auth, t["object_name"])
+                if not has_rls_cm(captured):
+                    # Live probe flagged it but the policy is already gone
+                    # (discovery caught a race). Safe to share as-is.
+                    tables_to_share.append(t)
+                    continue
+                staging_fqn = make_staging_table_fqn(
+                    t["object_name"], run_id, config.tracking_catalog
                 )
-                strip_rls_cm(spark_session, t["object_name"], captured)
-            stripped_rls_cm.append(t)
-            tables_to_share.append(t)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "Failed to strip RLS/CM from %s; table will NOT be shared. "
-                "Source state unchanged. Error: %s",
-                t["object_name"],
-                exc,
-                exc_info=True,
-            )
-            skipped_rls_cm.append(t)
+                if not config.dry_run:
+                    spark_session.sql(
+                        f"CREATE OR REPLACE TABLE {staging_fqn} AS "
+                        f"SELECT * FROM {t['object_name']}"
+                    )
+                    tracker.record_staging_created(
+                        original_fqn=t["object_name"],
+                        staging_fqn=staging_fqn,
+                        run_id=run_id,
+                    )
+                # Share the staging FQN, not the original.
+                staging_share_entry = dict(t)
+                staging_share_entry["object_name"] = staging_fqn
+                tables_to_share.append(staging_share_entry)
+                staged_rls_cm.append(t)
+                continue
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "Failed to create staging copy for %s; table will NOT be shared. "
+                    "Source state unchanged. Error: %s",
+                    t["object_name"],
+                    exc,
+                    exc_info=True,
+                )
+                skipped_rls_cm.append(t)
+                continue
+        # strategy == "" (skip): record the table as skipped_by_rls_cm_policy
+        # and don't add to the share. Source untouched.
+        skipped_rls_cm.append(t)
 
-    if stripped_rls_cm:
-        logger.warning(
-            "drop_and_restore: stripped row filter / column mask from %d "
-            "table(s). Source is unprotected until the post-migrate "
-            "restore_rls_cm task re-applies the policies.",
-            len(stripped_rls_cm),
+    if staged_rls_cm:
+        logger.info(
+            "staging_copy: copied %d table(s) with RLS/CM into "
+            "%s.cp_migration_staging. Source RLS/CM untouched. "
+            "cleanup_staging will drop staging tables after migrate completes.",
+            len(staged_rls_cm),
+            config.tracking_catalog,
         )
-        for t in stripped_rls_cm:
-            logger.warning("  stripped: %s", t["object_name"])
+        for t in staged_rls_cm:
+            logger.info("  staged: %s", t["object_name"])
 
     if skipped_rls_cm:
         logger.warning(
@@ -487,8 +432,8 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
                     "error_message": (
                         "Table has row filter or column mask; Delta Sharing "
                         "refuses to share it. Data was not migrated to target. "
-                        "See README.md for options (migrate to ABAC, or use "
-                        "rls_cm_strategy='drop_and_restore' in a maintenance window)."
+                        "See README.md for options (migrate to ABAC, or set "
+                        "rls_cm_strategy='staging_copy')."
                     ),
                     "job_run_id": None,
                     "task_run_id": None,

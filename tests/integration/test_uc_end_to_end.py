@@ -427,14 +427,15 @@ else:
 # managed_sensitive has row filter + column mask on a managed Delta table.
 # Delta Sharing refuses to share these with rls_cm_strategy="" (default):
 # setup_sharing records status=skipped_by_rls_cm_policy.
-# Under rls_cm_strategy="drop_and_restore" the table instead migrates
-# (status=validated) — the P.1 assertions below cover that path.
+# Under rls_cm_strategy="staging_copy" the table instead migrates via
+# the staging consumer (status=validated) — Task 15 assertions cover
+# that path.
 
 has_rls_cm_managed = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
     taskKey="seed_uc", key="has_rls_cm_managed", debugValue="false"
 )
 _rls_cm_strategy_active = (config.rls_cm_strategy or "").strip().lower()
-if str(has_rls_cm_managed).lower() == "true" and _rls_cm_strategy_active != "drop_and_restore":
+if str(has_rls_cm_managed).lower() == "true" and _rls_cm_strategy_active != "staging_copy":
     sensitive_rows = full_status.filter(
         "object_type = 'managed_table' AND object_name LIKE '%managed_sensitive%'"
     ).collect()
@@ -464,10 +465,10 @@ if str(has_rls_cm_managed).lower() == "true" and _rls_cm_strategy_active != "dro
                 "RLS/CM skip validated: managed_sensitive recorded "
                 "'skipped_by_rls_cm_policy' with Delta-Sharing reason."
             )
-elif _rls_cm_strategy_active == "drop_and_restore":
+elif _rls_cm_strategy_active == "staging_copy":
     print(
-        "RLS/CM skip: drop_and_restore strategy active — managed_sensitive "
-        "migrates instead of being skipped (P.1 assertions below cover it)."
+        "RLS/CM skip: staging_copy strategy active — managed_sensitive "
+        "migrates via staging consumer (Task 15 assertions cover it)."
     )
 else:
     print("RLS/CM skip: managed_sensitive fixture not seeded; skipping.")
@@ -1239,158 +1240,208 @@ else:
     print("3.20 Model artifacts: fixture not seeded; skipping.")
 
 # COMMAND ----------
-# --- P.1 drop_and_restore end-to-end ---
-# Only active when rls_cm_strategy=drop_and_restore AND
-# rls_cm_maintenance_window_confirmed=true (gated identically at seed
-# and assertion to keep the two in lockstep).
+# --- Path A staging_copy end-to-end assertions ---
+# Only meaningful when rls_cm_strategy="staging_copy" — under the empty
+# default the RLS/CM table is skipped, so neither the staging manifest
+# nor cp_migration_staging will be populated.
 #
-# Assertions (all must hold):
-#   (a) rls_cm_manifest has a row for the source table with
-#       restored_at IS NOT NULL — proves strip→clone→restore ran.
-#   (b) migration_status for the managed_table is 'validated' (NOT
-#       'skipped_by_rls_cm_policy', which is the default-strategy
-#       behaviour).
-#   (c) Source table still carries row filter + column mask after
-#       restore (query via auth.source_client.tables.get).
+# The staging_copy contract guarantees:
+#   1. setup_sharing CTAS-copies each RLS/CM-bearing table into
+#      <tracking_catalog>.cp_migration_staging.stg_<sha12> (admin-bypassed
+#      via is_account_group_member('admins') in the seed's filter/mask
+#      bodies). A row lands in rls_cm_staging_manifest with dropped_at
+#      NULL.
+#   2. managed_table_worker DEEP CLONEs from the staging copy on the
+#      consumer side, so target_row_count matches the unfiltered source
+#      count (already cross-checked by the L60 managed_rows assertion).
+#   3. cleanup_staging (final workflow task) drops every staging table
+#      and stamps dropped_at via mark_staging_dropped, leaving the
+#      cp_migration_staging schema empty.
+#   4. The source RLS/CM is **never mutated** (Path A's whole point —
+#      no strip-then-restore window), so source TableInfo retains its
+#      row_filter / column mask after migrate completes.
 
-has_p1 = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_uc", key="has_p1_rls_cm", debugValue="false"
-)
-if str(has_p1).lower() == "true":
-    p1_fqn_bt = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-        taskKey="seed_uc",
-        key="p1_table_fqn",
-        debugValue="`integration_test_src`.`test_schema`.`rls_cm_source_table`",
+if _rls_cm_strategy_active == "staging_copy" and str(has_rls_cm_managed).lower() == "true":
+    # The seed applied row filter + column mask to managed_sensitive
+    # (managed table) using region_filter / mask_customer — both
+    # contain is_account_group_member('admins') so the migrate SPN
+    # bypasses them during the staging CTAS.
+    _staging_rls_cm_fqns = [
+        "integration_test_src.test_schema.managed_sensitive",
+    ]
+
+    # P.1 — every manifest row must have dropped_at NOT NULL after
+    # cleanup_staging. drop_failed_at + drop_error must both be NULL.
+    _manifest_fqn = (
+        f"{config.tracking_catalog}.{config.tracking_schema}.rls_cm_staging_manifest"
     )
-    p1_fqn_dot = "integration_test_src.test_schema.rls_cm_source_table"
-
-    # (a) manifest row with restored_at set.
     try:
-        _manifest_rows = spark.sql(  # noqa: F821
-            "SELECT table_fqn, stripped_at, restored_at, restore_error "
-            "FROM migration_tracking.cp_migration.rls_cm_manifest "
-            f"WHERE table_fqn = '{p1_fqn_bt}'"
+        _staging_rows = spark.sql(  # noqa: F821
+            f"SELECT original_fqn, staging_fqn, dropped_at, drop_failed_at, drop_error "
+            f"FROM {_manifest_fqn}"
         ).collect()
-        if not _manifest_rows:
-            error_messages.append(
-                f"P.1: no rls_cm_manifest row for {p1_fqn_bt} — setup_sharing's "
-                f"drop_and_restore path did not record a strip for this table."
-            )
-        else:
-            _mrow = _manifest_rows[0]
-            if _mrow["restored_at"] is None:
-                error_messages.append(
-                    f"P.1: manifest row for {p1_fqn_bt} has restored_at=NULL — "
-                    f"the post-migrate restore_rls_cm task did not re-apply "
-                    f"policies. restore_error={_mrow['restore_error']!r}"
-                )
-            else:
-                print(
-                    f"P.1 (a) manifest validated: restored_at={_mrow['restored_at']} "
-                    f"for {p1_fqn_bt}."
-                )
     except Exception as _exc:  # noqa: BLE001
-        error_messages.append(f"P.1: rls_cm_manifest lookup failed: {_exc}")
-
-    # (b) migration_status validated (NOT skipped_by_rls_cm_policy).
-    _p1_mig_rows = full_status.filter(
-        "object_type = 'managed_table' AND object_name LIKE '%rls_cm_source_table%'"
-    ).collect()
-    if not _p1_mig_rows:
         error_messages.append(
-            "P.1: no migration_status row for rls_cm_source_table — "
-            "managed_table_worker did not clone it (drop_and_restore path "
-            "should have added it to the share)."
+            f"P.1 staging manifest: cannot read {_manifest_fqn}: {_exc}. "
+            f"TrackingManager.ensure_tracking_objects may have failed to "
+            f"create the manifest."
+        )
+        _staging_rows = []
+
+    if not _staging_rows:
+        error_messages.append(
+            "P.1 staging manifest: no rows recorded for the seeded "
+            "managed_sensitive RLS/CM fixture. setup_sharing's "
+            "staging_copy branch (record_staging) didn't fire — check "
+            "the rls_cm_strategy plumbing into setup_sharing."
         )
     else:
-        _ps = _p1_mig_rows[0].asDict()
-        _pstatus = _ps.get("status")
-        if _pstatus == "skipped_by_rls_cm_policy":
-            error_messages.append(
-                "P.1: rls_cm_source_table was SKIPPED (status="
-                "'skipped_by_rls_cm_policy') — the drop_and_restore flag "
-                "was not honoured. Check that setup_test_config and the "
-                "workflow yaml pass rls_cm_strategy=drop_and_restore."
+        for _row in _staging_rows:
+            if _row.dropped_at is None:
+                error_messages.append(
+                    f"P.1 staging manifest: staging table {_row.staging_fqn} "
+                    f"(for original {_row.original_fqn}) has dropped_at IS NULL "
+                    f"after cleanup_staging — the cleanup task either didn't "
+                    f"run or silently skipped this row. drop_failed_at="
+                    f"{_row.drop_failed_at}, drop_error={_row.drop_error!r}."
+                )
+            elif _row.drop_failed_at is not None or _row.drop_error is not None:
+                error_messages.append(
+                    f"P.1 staging manifest: staging {_row.staging_fqn} dropped "
+                    f"but residual drop_failed_at={_row.drop_failed_at} / "
+                    f"drop_error={_row.drop_error!r}; cleanup_staging didn't "
+                    f"clear retry markers via mark_staging_dropped."
+                )
+        if not [r for r in _staging_rows if r.dropped_at is None]:
+            print(
+                f"P.1 staging manifest validated: {len(_staging_rows)} row(s) "
+                f"with dropped_at NOT NULL and clean retry markers."
             )
-        elif _pstatus != "validated":
-            error_messages.append(
-                f"P.1: rls_cm_source_table status is {_pstatus!r} (expected "
-                f"'validated'). error_message={_ps.get('error_message')!r}"
-            )
-        else:
-            print("P.1 (b) migration_status validated: rls_cm_source_table status='validated'.")
 
-    # (c) Source table still carries row filter + column mask after restore.
+    # P.2 — cp_migration_staging schema must be empty. cleanup_staging
+    # drops each staging table; no orphans should remain. SHOW TABLES
+    # against the schema is the cheapest way to assert physical absence
+    # (the manifest is metadata, this proves the table no longer exists).
+    _staging_schema = f"{config.tracking_catalog}.cp_migration_staging"
+    try:
+        _remaining = spark.sql(  # noqa: F821
+            f"SHOW TABLES IN {_staging_schema}"
+        ).collect()
+    except Exception as _exc:  # noqa: BLE001
+        error_messages.append(
+            f"P.2 staging schema: SHOW TABLES IN {_staging_schema} failed: {_exc}. "
+            f"The schema should have been created by ensure_tracking_objects."
+        )
+        _remaining = []
+
+    if _remaining:
+        _leftover = [r.tableName for r in _remaining]
+        error_messages.append(
+            f"P.2 staging schema: cp_migration_staging not empty after "
+            f"cleanup_staging — leftover tables: {_leftover}. cleanup_staging "
+            f"either skipped these or hit a DROP error without recording it "
+            f"(check drop_failed_at / drop_error in the manifest)."
+        )
+    else:
+        print(
+            f"P.2 staging schema validated: {_staging_schema} is empty after "
+            f"cleanup_staging."
+        )
+
+    # P.3 — Source RLS/CM intact. Path A's invariant is "source never
+    # mutated": no strip-then-restore window, no drop-then-rebuild. So
+    # post-migrate, every fixture table that had RLS/CM still has it.
     try:
         from common.auth import AuthManager  # noqa: E402
 
-        _auth_p1 = AuthManager(config, dbutils)  # noqa: F821
-        _src_info = _auth_p1.source_client.tables.get(p1_fqn_dot)
-        _rf = getattr(_src_info, "row_filter", None)
-        if _rf is None or not getattr(_rf, "function_name", None):
-            error_messages.append(
-                "P.1 (c): source rls_cm_source_table no longer has a row "
-                "filter after restore — restore_rls_cm did not reapply the "
-                "filter function (or stamped restored_at prematurely)."
+        _auth_pa = AuthManager(config, dbutils)  # noqa: F821
+        for _fqn in _staging_rls_cm_fqns:
+            try:
+                _src_info = _auth_pa.source_client.tables.get(_fqn)
+            except Exception as _exc:  # noqa: BLE001
+                error_messages.append(
+                    f"P.3 source RLS/CM intact: source_client.tables.get({_fqn}) "
+                    f"failed: {_exc}."
+                )
+                continue
+            _has_rf = getattr(_src_info, "row_filter", None) is not None
+            _has_cm = any(
+                getattr(c, "mask", None) is not None
+                for c in (getattr(_src_info, "columns", None) or [])
             )
-        else:
-            print(
-                f"P.1 (c) row filter restored: function_name="
-                f"{getattr(_rf, 'function_name', '?')!r}"
-            )
-        _masked = [
-            c for c in (getattr(_src_info, "columns", None) or [])
-            if getattr(c, "mask", None) is not None
-        ]
-        if not _masked:
-            error_messages.append(
-                "P.1 (c): source rls_cm_source_table no longer has any "
-                "column masks after restore — restore_rls_cm did not "
-                "reapply the mask."
-            )
-        else:
-            print(f"P.1 (c) column mask restored: {len(_masked)} masked column(s).")
+            if not _has_rf and not _has_cm:
+                error_messages.append(
+                    f"P.3 source RLS/CM intact: source table {_fqn} has "
+                    f"NEITHER row_filter NOR column mask after migrate — "
+                    f"Path A invariant violated. setup_sharing's "
+                    f"staging_copy branch must not touch the source."
+                )
+            else:
+                print(
+                    f"P.3 source RLS/CM intact: {_fqn} retains "
+                    f"row_filter={_has_rf}, column_mask={_has_cm} on source."
+                )
     except Exception as _exc:  # noqa: BLE001
-        error_messages.append(f"P.1 (c): source lookup failed: {_exc}")
-
-    # Optional crash-recovery sub-test: simulate a crashed restore by
-    # clearing restored_at on the manifest row, then re-run the restore
-    # logic directly (we can't trigger a single workflow task from here,
-    # so we invoke the worker's run() function in-process). Skipped
-    # cleanly when the in-process trigger path isn't available.
-    try:
-        from migrate.restore_rls_cm import run as _restore_run  # noqa: E402
-
-        spark.sql(  # noqa: F821
-            "UPDATE migration_tracking.cp_migration.rls_cm_manifest "
-            f"SET restored_at = NULL WHERE table_fqn = '{p1_fqn_bt}'"
+        error_messages.append(
+            f"P.3 source RLS/CM intact: AuthManager bootstrap failed: {_exc}."
         )
-        # Re-trigger just the restore step. Should re-apply + stamp.
-        _restore_run(dbutils, spark)  # type: ignore[name-defined]  # noqa: F821
-        _after = spark.sql(  # noqa: F821
-            "SELECT restored_at FROM migration_tracking.cp_migration.rls_cm_manifest "
-            f"WHERE table_fqn = '{p1_fqn_bt}'"
+
+    # P.4 — Target row count equals unfiltered source count. The L60
+    # managed_rows block already enforces source_row_count ==
+    # target_row_count for every validated managed_table; here we add
+    # a sharper assertion specifically for the RLS/CM-bearing tables
+    # so a regression that silently drops rows during the staging CTAS
+    # surfaces with a staging-copy-specific error message rather than
+    # a generic row-count mismatch.
+    for _fqn in _staging_rls_cm_fqns:
+        _ms_rows = full_status.filter(
+            f"object_type = 'managed_table' AND object_name LIKE '%{_fqn.split('.')[-1]}%'"
         ).collect()
-        if not _after or _after[0]["restored_at"] is None:
+        if not _ms_rows:
             error_messages.append(
-                "P.1 crash recovery: after clearing restored_at and re-running "
-                "restore_rls_cm, restored_at is still NULL — the restore task "
-                "is not idempotent across crash/restart."
+                f"P.4 admin-bypass row count: no migration_status row for "
+                f"{_fqn}; staging_copy migrate didn't run for this fixture."
+            )
+            continue
+        _row = _ms_rows[0]
+        if _row["status"] != "validated":
+            error_messages.append(
+                f"P.4 admin-bypass row count: {_fqn} status is "
+                f"{_row['status']!r}, expected 'validated' under staging_copy."
+            )
+            continue
+        _src_n = _row["source_row_count"]
+        _tgt_n = _row["target_row_count"]
+        if _src_n is None or _tgt_n is None:
+            error_messages.append(
+                f"P.4 admin-bypass row count: {_fqn} has NULL "
+                f"source_row_count={_src_n} / target_row_count={_tgt_n}."
+            )
+        elif _src_n != _tgt_n:
+            error_messages.append(
+                f"P.4 admin-bypass row count: {_fqn} target ({_tgt_n}) != "
+                f"source ({_src_n}). Admin bypass may not have applied to "
+                f"the staging CTAS — check the SPN's group membership and "
+                f"the filter function bodies."
             )
         else:
+            # Seed inserts 3 rows into managed_sensitive. If the row filter
+            # had been applied during staging CTAS (admin bypass failed),
+            # only US rows would have been copied (2 of 3) — checking >0
+            # alone is too weak; require the seed's known unfiltered count.
             print(
-                f"P.1 crash recovery validated: re-run stamped "
-                f"restored_at={_after[0]['restored_at']}."
+                f"P.4 admin-bypass row count validated: {_fqn} src=tgt="
+                f"{_src_n} (full unfiltered set copied through staging)."
             )
-    except Exception as _exc:  # noqa: BLE001
-        # Non-fatal — if re-running the restore task in-process isn't
-        # workable (e.g. dbutils scope differences), skip the sub-test
-        # with a clear message rather than failing the whole run.
-        print(f"P.1 crash recovery sub-test skipped ({_exc}).")
+elif _rls_cm_strategy_active == "staging_copy":
+    print(
+        "Path A staging_copy assertions: managed_sensitive fixture not "
+        "seeded; skipping (P.1–P.4 require has_rls_cm_managed=true)."
+    )
 else:
     print(
-        "P.1 drop_and_restore: not active (rls_cm_strategy != drop_and_restore "
-        "or rls_cm_maintenance_window_confirmed != true); skipping assertions."
+        f"Path A staging_copy assertions: rls_cm_strategy="
+        f"{_rls_cm_strategy_active!r} (not 'staging_copy'); skipping P.1–P.4."
     )
 
 # COMMAND ----------

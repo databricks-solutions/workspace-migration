@@ -57,16 +57,15 @@ def _baseline_config() -> dict:
 
 
 # ---------------------------------------------------------------
-# Overrides that mirror the three integration workflow YAMLs. If
-# these drift from ``resources/*_integration_test_workflow.yml`` the
+# Overrides that mirror the integration workflow YAMLs. If these
+# drift from ``resources/*_integration_test_workflow.yml`` the
 # ``TestWorkflowOverrideContractsMatchYaml`` suite will fail loudly.
 # ---------------------------------------------------------------
 UC_OVERRIDES = dict(
     include_uc=True,
     include_hive=False,
     iceberg_strategy="ddl_replay",
-    rls_cm_strategy="drop_and_restore",
-    rls_cm_maintenance_window_confirmed=True,
+    rls_cm_strategy="staging_copy",
     migrate_hive_dbfs_root=False,
     hive_dbfs_target_path="",
     batch_size_raw="",
@@ -78,7 +77,6 @@ HIVE_OVERRIDES = dict(
     include_hive=True,
     iceberg_strategy="",
     rls_cm_strategy="",
-    rls_cm_maintenance_window_confirmed=False,
     migrate_hive_dbfs_root=True,
     hive_dbfs_target_path="",
     batch_size_raw="10",
@@ -90,7 +88,6 @@ NEG_X31_OVERRIDES = dict(
     include_hive=False,
     iceberg_strategy="",
     rls_cm_strategy="",
-    rls_cm_maintenance_window_confirmed=False,
     migrate_hive_dbfs_root=False,
     hive_dbfs_target_path="",
     batch_size_raw="",
@@ -152,23 +149,7 @@ class TestSetupTestConfigSourceGuards:
 
 
 class TestSetupTestConfigHelperSourceGuards:
-    """Source-level checks on the extracted helper. Kept so the
-    consent gate + injection behavior can't silently drift."""
-
-    def test_gates_drop_and_restore_on_maintenance_window_flag(self):
-        """drop_and_restore briefly strips RLS/CM on source during each
-        DEEP CLONE, so setup_sharing already refuses it unless
-        ``rls_cm_maintenance_window_confirmed=true``. We mirror that
-        gate in the helper so misconfiguration fails fast at config-
-        setup time (before we do any side-effecting I/O)."""
-        src = _helper_source_text()
-        assert "drop_and_restore" in src
-        assert "rls_cm_maintenance_window_confirmed" in src
-        assert "raise ValueError" in src, (
-            "Helper must raise when drop_and_restore is set without "
-            "maintenance-window confirmation — logging alone lets the "
-            "run continue and strip RLS/CM without operator consent."
-        )
+    """Source-level checks on the extracted helper."""
 
     def test_preserves_existing_hive_dbfs_target_path_when_empty_param(self):
         """Env-specific fields like hive_dbfs_target_path are operator-
@@ -179,33 +160,38 @@ class TestSetupTestConfigHelperSourceGuards:
         src = _helper_source_text()
         assert "if hive_dbfs_target_path:" in src
 
+    def test_no_legacy_drop_and_restore_residue(self):
+        """Path A removed drop_and_restore + the maintenance-window
+        consent flag — guard against accidental re-introduction."""
+        src = _helper_source_text()
+        assert "drop_and_restore" not in src
+        assert "rls_cm_maintenance_window_confirmed" not in src
+
 
 class TestNegativePathInjectionsSource:
     """Integration X.3: source-level checks for the negative-path
     injection widgets. They must:
 
-    - Declare all three injection widgets (bad_spn_id /
-      unreachable_target / bad_rls_cm) with default "false" so normal
-      UC / Hive integration workflows are unaffected.
+    - Declare both injection widgets (bad_spn_id / unreachable_target)
+      with default "false" so normal UC / Hive integration workflows
+      are unaffected.
     - Apply each injection AFTER the scope overrides so the corrupted
       config is what downstream tasks read.
-    - Force ``rls_cm_maintenance_window_confirmed = False`` when the
-      bad rls_cm strategy is injected — the whole point of the
-      scenario is the missing consent, so we can't trust whatever
-      value happened to be in config.yaml.
-    - Bypass the top-of-helper ``drop_and_restore`` consent gate ONLY
-      for the bad_rls_cm injection — other callers hitting
-      drop_and_restore without the confirmation flag must still trip
-      the ValueError guard so operators don't accidentally set it.
     """
 
-    def test_declares_three_injection_widgets(self):
+    def test_declares_two_injection_widgets(self):
         src = _source_text()
-        for name in ("inject_bad_spn_id", "inject_unreachable_target", "inject_bad_rls_cm"):
+        for name in ("inject_bad_spn_id", "inject_unreachable_target"):
             assert f'dbutils.widgets.text("{name}", "false")' in src, (
                 f"Must declare injection widget {name!r} with default 'false' "
                 "so the widget is optional and normal workflows are unaffected."
             )
+
+    def test_no_legacy_bad_rls_cm_widget(self):
+        """Path A removed the X.3.4 (bad_rls_cm) scenario; the widget
+        must be gone."""
+        src = _source_text()
+        assert "inject_bad_rls_cm" not in src
 
     def test_bad_spn_injection_overwrites_spn_client_id(self):
         src = _helper_source_text()
@@ -221,30 +207,6 @@ class TestNegativePathInjectionsSource:
             "unreachable_target injection must overwrite target_workspace_url."
         )
 
-    def test_bad_rls_cm_forces_maintenance_window_false(self):
-        """The scenario's whole premise is the missing consent — we must
-        NOT trust whatever value config.yaml happened to have."""
-        src = _helper_source_text()
-        assert 'cfg["rls_cm_maintenance_window_confirmed"] = False' in src
-        assert 'cfg["rls_cm_strategy"] = "drop_and_restore"' in src
-
-    def test_bad_rls_cm_bypasses_consent_gate(self):
-        """The normal drop_and_restore gate raises ValueError when
-        ``rls_cm_maintenance_window_confirmed`` is false. For
-        bad_rls_cm the failure must land in setup_sharing's validator
-        (deeper in the workflow), not here — so the gate must be an
-        elif under ``inject_bad_rls_cm``."""
-        src = _helper_source_text()
-        assert "if inject_bad_rls_cm:" in src
-        assert "elif (" in src
-        assert 'rls_cm_strategy.lower() == "drop_and_restore"' in src
-        assert "not rls_cm_maintenance_window_confirmed" in src
-        assert "raise ValueError" in src
-        assert "raise NotImplementedError" not in src, (
-            "drop_and_restore is now implemented (PR #22); the old "
-            "NotImplementedError stub must be gone."
-        )
-
 
 class TestApplyIntegrationOverridesBehavior:
     """Behavioral tests on the pure helper."""
@@ -253,8 +215,7 @@ class TestApplyIntegrationOverridesBehavior:
         cfg = apply_integration_overrides(_baseline_config(), **UC_OVERRIDES)
         assert cfg["scope"] == {"include_uc": True, "include_hive": False}
         assert cfg["iceberg_strategy"] == "ddl_replay"
-        assert cfg["rls_cm_strategy"] == "drop_and_restore"
-        assert cfg["rls_cm_maintenance_window_confirmed"] is True
+        assert cfg["rls_cm_strategy"] == "staging_copy"
         assert cfg["migrate_hive_dbfs_root"] is False
         # batch_size + catalog_filter unset in UC workflow → baseline preserved.
         assert cfg["batch_size"] == 50
@@ -267,7 +228,6 @@ class TestApplyIntegrationOverridesBehavior:
         assert cfg["scope"] == {"include_uc": True, "include_hive": True}
         assert cfg["iceberg_strategy"] == ""
         assert cfg["rls_cm_strategy"] == ""
-        assert cfg["rls_cm_maintenance_window_confirmed"] is False
         assert cfg["migrate_hive_dbfs_root"] is True
         assert cfg["batch_size"] == 10
         assert cfg["catalog_filter"] == ["integration_test_src"]
@@ -288,30 +248,6 @@ class TestApplyIntegrationOverridesBehavior:
         assert baseline["batch_size"] == snapshot["batch_size"]
         assert baseline["catalog_filter"] == snapshot["catalog_filter"]
         assert baseline["rls_cm_strategy"] == snapshot["rls_cm_strategy"]
-
-    def test_drop_and_restore_without_consent_raises(self):
-        bad = dict(UC_OVERRIDES, rls_cm_maintenance_window_confirmed=False)
-        with pytest.raises(ValueError, match="rls_cm_maintenance_window_confirmed=true"):
-            apply_integration_overrides(_baseline_config(), **bad)
-
-    def test_inject_bad_rls_cm_bypasses_consent_gate(self):
-        """Injection scenario must produce the intended corrupted
-        config, NOT raise — the failure must land in setup_sharing."""
-        cfg = apply_integration_overrides(
-            _baseline_config(),
-            include_uc=True,
-            include_hive=False,
-            iceberg_strategy="",
-            rls_cm_strategy="",
-            rls_cm_maintenance_window_confirmed=False,
-            migrate_hive_dbfs_root=False,
-            hive_dbfs_target_path="",
-            batch_size_raw="",
-            catalog_filter_raw="",
-            inject_bad_rls_cm=True,
-        )
-        assert cfg["rls_cm_strategy"] == "drop_and_restore"
-        assert cfg["rls_cm_maintenance_window_confirmed"] is False
 
     def test_inject_bad_spn_overwrites_client_id(self):
         cfg = apply_integration_overrides(
@@ -351,8 +287,7 @@ class TestOverrideCycleCleanSlate:
     the Hive run's override must start from the pristine baseline
     — NEVER from the UC run's post-override config. Otherwise UC-only
     keys leak:
-      - ``rls_cm_strategy=drop_and_restore``
-      - ``rls_cm_maintenance_window_confirmed=true``
+      - ``rls_cm_strategy=staging_copy``
       - ``iceberg_strategy=ddl_replay``
 
     And similarly for the negative-paths workflow whose chained
@@ -371,14 +306,12 @@ class TestOverrideCycleCleanSlate:
         baseline = _baseline_config()
         uc_cfg = apply_integration_overrides(baseline, **UC_OVERRIDES)
         # Sanity: UC run set the UC-specific keys.
-        assert uc_cfg["rls_cm_strategy"] == "drop_and_restore"
-        assert uc_cfg["rls_cm_maintenance_window_confirmed"] is True
+        assert uc_cfg["rls_cm_strategy"] == "staging_copy"
         assert uc_cfg["iceberg_strategy"] == "ddl_replay"
 
         hive_cfg = apply_integration_overrides(baseline, **HIVE_OVERRIDES)
         # UC-only keys must NOT persist into the Hive run.
         assert hive_cfg["rls_cm_strategy"] == ""
-        assert hive_cfg["rls_cm_maintenance_window_confirmed"] is False
         assert hive_cfg["iceberg_strategy"] == ""
         # Hive-specific keys must be set.
         assert hive_cfg["batch_size"] == 10
@@ -415,11 +348,10 @@ class TestOverrideCycleCleanSlate:
         baseline = _baseline_config()
 
         uc = apply_integration_overrides(baseline, **UC_OVERRIDES)
-        assert uc["rls_cm_strategy"] == "drop_and_restore"
+        assert uc["rls_cm_strategy"] == "staging_copy"
 
         hive = apply_integration_overrides(baseline, **HIVE_OVERRIDES)
         assert hive["rls_cm_strategy"] == ""
-        assert hive["rls_cm_maintenance_window_confirmed"] is False
 
         # X.3.1 — bad SPN.
         x31 = apply_integration_overrides(
@@ -428,7 +360,6 @@ class TestOverrideCycleCleanSlate:
             include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
-            rls_cm_maintenance_window_confirmed=False,
             migrate_hive_dbfs_root=False,
             hive_dbfs_target_path="",
             batch_size_raw="",
@@ -439,8 +370,6 @@ class TestOverrideCycleCleanSlate:
         # Must not carry Hive's batch_size / catalog_filter.
         assert x31["batch_size"] == 50
         assert x31["catalog_filter"] == ""
-        # Must not carry UC's rls_cm consent flag.
-        assert x31["rls_cm_maintenance_window_confirmed"] is False
         # Non-SPN fields stay pristine.
         assert x31["target_workspace_url"] == "https://adb-TARGET.azuredatabricks.net"
 
@@ -451,7 +380,6 @@ class TestOverrideCycleCleanSlate:
             include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
-            rls_cm_maintenance_window_confirmed=False,
             migrate_hive_dbfs_root=False,
             hive_dbfs_target_path="",
             batch_size_raw="",
@@ -474,7 +402,6 @@ class TestOverrideCycleCleanSlate:
             include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
-            rls_cm_maintenance_window_confirmed=False,
             migrate_hive_dbfs_root=False,
             hive_dbfs_target_path="",
             batch_size_raw="",
@@ -484,26 +411,6 @@ class TestOverrideCycleCleanSlate:
         # Must not carry prior scenarios' corruptions.
         assert x33["spn_client_id"] == "REPLACE_WITH_APPLICATION_ID"
         assert x33["target_workspace_url"] == "https://adb-TARGET.azuredatabricks.net"
-
-        # X.3.4 — bad rls_cm (consent bypass).
-        x34 = apply_integration_overrides(
-            baseline,
-            include_uc=True,
-            include_hive=False,
-            iceberg_strategy="",
-            rls_cm_strategy="",
-            rls_cm_maintenance_window_confirmed=False,
-            migrate_hive_dbfs_root=False,
-            hive_dbfs_target_path="",
-            batch_size_raw="",
-            catalog_filter_raw="",
-            inject_bad_rls_cm=True,
-        )
-        assert x34["rls_cm_strategy"] == "drop_and_restore"
-        assert x34["rls_cm_maintenance_window_confirmed"] is False
-        # Must not carry prior scenarios' corruptions.
-        assert x34["spn_client_id"] == "REPLACE_WITH_APPLICATION_ID"
-        assert x34["target_workspace_url"] == "https://adb-TARGET.azuredatabricks.net"
 
     def test_chained_additive_apply_would_leak(self):
         """Negative control: demonstrate that feeding the PREVIOUS
@@ -521,16 +428,6 @@ class TestOverrideCycleCleanSlate:
         # for Hive. The helper's authoritative overrides cover some
         # keys but not all — UC's ``catalog_filter`` carryover would
         # be the leak.
-        #
-        # The helper overwrites scope/iceberg/rls_cm/maintenance/dbfs
-        # always, but ``catalog_filter``/``batch_size``/
-        # ``hive_dbfs_target_path`` are conditional on non-empty
-        # params. The Hive workflow *does* set catalog_filter, so
-        # it gets overwritten here — but we still expect batch_size
-        # (which Hive overrides) to diverge from what it would be if
-        # UC had not injected a value. We test the cleaner signal:
-        # feeding a chained cfg into a SCENARIO THAT DOES NOT SET
-        # A KEY causes the prior value to persist.
         #
         # Concretely: Hive sets catalog_filter. UC doesn't. So if we
         # do UC-on-top-of-Hive-result, UC would inherit Hive's
@@ -586,8 +483,9 @@ class TestWorkflowOverrideContractsMatchYaml:
         assert params.get("include_uc") == "true"
         assert params.get("include_hive") == "false"
         assert params.get("iceberg_strategy") == "ddl_replay"
-        assert params.get("rls_cm_strategy") == "drop_and_restore"
-        assert params.get("rls_cm_maintenance_window_confirmed") == "true"
+        assert params.get("rls_cm_strategy") == "staging_copy"
+        # Path A removed the maintenance-window consent flag.
+        assert "rls_cm_maintenance_window_confirmed" not in params
         assert params.get("migrate_hive_dbfs_root") == "false"
         # UC does NOT pass batch_size or catalog_filter — those are the
         # keys most at risk of leaking from a prior Hive run.
@@ -605,9 +503,7 @@ class TestWorkflowOverrideContractsMatchYaml:
         assert params.get("migrate_hive_dbfs_root") == "true"
         assert params.get("batch_size") == "10"
         assert params.get("catalog_filter") == "integration_test_src"
-        # Hive does NOT pass rls_cm_maintenance_window_confirmed —
-        # widget default "false" is what applies. Leaking UC's "true"
-        # here would silently enable drop_and_restore on Hive.
+        # Path A removed the maintenance-window consent flag.
         assert "rls_cm_maintenance_window_confirmed" not in params
 
     def test_neg_x31_workflow_params_match(self):
@@ -674,8 +570,7 @@ class TestNotebookFileCycleSimulation:
         # Inspect the intermediate state — UC-specific keys set.
         with open(config_path) as f:
             after_uc = _yaml.safe_load(f)
-        assert after_uc["rls_cm_strategy"] == "drop_and_restore"
-        assert after_uc["rls_cm_maintenance_window_confirmed"] is True
+        assert after_uc["rls_cm_strategy"] == "staging_copy"
 
         self._cycle_step(str(config_path), str(backup_path), HIVE_OVERRIDES, restore_from_backup=True)
         with open(config_path) as f:
@@ -683,45 +578,27 @@ class TestNotebookFileCycleSimulation:
         # Hive run must have started from the pristine baseline —
         # UC-only keys gone.
         assert after_hive["rls_cm_strategy"] == ""
-        assert after_hive["rls_cm_maintenance_window_confirmed"] is False
         assert after_hive["iceberg_strategy"] == ""
         # Hive-specific keys set.
         assert after_hive["batch_size"] == 10
         assert after_hive["catalog_filter"] == ["integration_test_src"]
 
-    def test_pre_s14_notebook_cycle_leaks_uc_keys_into_hive(self, tmp_path):
-        """Documents the pre-S.14 bug: skipping the restore leaks
-        UC-only ``rls_cm_maintenance_window_confirmed=True`` into
-        the Hive run, even though the Hive workflow YAML never opts
-        into it."""
+    def test_pre_s14_notebook_cycle_leaks_into_uc(self, tmp_path):
+        """Documents the pre-S.14 bug: skipping the restore can leak
+        prior corruption into a later UC run, even though the UC
+        workflow YAML never opts into it."""
         import yaml as _yaml
 
         config_path = tmp_path / "config.yaml"
         backup_path = tmp_path / "config.yaml.pre-integration-test.bak"
         config_path.write_text(_yaml.safe_dump(_baseline_config(), sort_keys=False))
 
-        self._cycle_step(str(config_path), str(backup_path), UC_OVERRIDES, restore_from_backup=False)
-        self._cycle_step(str(config_path), str(backup_path), HIVE_OVERRIDES, restore_from_backup=False)
-
-        with open(config_path) as f:
-            after_hive = _yaml.safe_load(f)
-        # The authoritative-writes in the helper (scope, iceberg,
-        # rls_cm_strategy, rls_cm_maintenance_window_confirmed,
-        # migrate_hive_dbfs_root) self-clean even without the
-        # restore — they're always written from the widget values.
-        assert after_hive["rls_cm_strategy"] == ""
-        assert after_hive["rls_cm_maintenance_window_confirmed"] is False
-
-        # BUT: nothing in either the UC or Hive workflows writes
+        # Nothing in either the UC or Hive workflows writes
         # ``spn_client_id`` or ``target_workspace_url``. If a prior
         # negative-paths run (in the same environment) corrupted
         # those and the teardown didn't run cleanly, a later UC run
         # without the restore-from-backup would inherit the
         # corruption. Simulate that:
-        config_path.write_text(_yaml.safe_dump(_baseline_config(), sort_keys=False))
-        if backup_path.exists():
-            backup_path.unlink()
-
         self._cycle_step(
             str(config_path),
             str(backup_path),

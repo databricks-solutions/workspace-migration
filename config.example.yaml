@@ -57,16 +57,13 @@ iceberg_strategy: ""
 
 # --- Row filter / column mask on managed tables ---
 # Delta Sharing refuses to share tables protected by legacy RLS/CM.
-# ""                  — default: skip with status skipped_by_rls_cm_policy
-# "drop_and_restore"  — strip policies on source, DEEP CLONE, then
-#                       re-apply. Requires rls_cm_maintenance_window_confirmed=true.
+# ""              — default: skip with status skipped_by_rls_cm_policy
+# "staging_copy"  — CTAS each affected table into the tracking catalog's
+#                   cp_migration_staging schema, share that copy, DEEP
+#                   CLONE on target, re-apply RLS/CM on target. Source
+#                   RLS/CM untouched. Requires the migration SPN to be
+#                   a workspace admin (admin-bypass in the source filter).
 rls_cm_strategy: ""
-
-# Consent gate for rls_cm_strategy='drop_and_restore'. The strategy
-# briefly exposes the source table (unfiltered / unmasked) during
-# each DEEP CLONE. Set to true ONLY during a scheduled maintenance
-# window — setup_sharing will refuse the strategy otherwise.
-rls_cm_maintenance_window_confirmed: false
 
 # --- Target pre-existing state / collision handling (X.4) ---
 # What to do when a discovered source object has the same FQN as an

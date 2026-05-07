@@ -27,6 +27,109 @@ from pre_check.collision_detection import build_skip_status_rows, detect_collisi
 # COMMAND ----------
 
 
+ADMIN_BYPASS_PATTERNS = (
+    "is_account_group_member(",
+    "is_member(",
+    "is_user_in_group(",
+)
+
+
+def _check_staging_copy_preconditions(config, auth) -> list[str]:
+    """Return a list of error messages. Empty list = all checks passed.
+
+    Path A invariants gated on rls_cm_strategy='staging_copy':
+      1. Migration SPN must be in the workspace 'admins' group.
+      2. Every active RLS row filter / column mask function body must
+         contain one of the admin-bypass calls. Without this, the SPN's
+         CTAS into staging would read filtered/masked data.
+    """
+    if (config.rls_cm_strategy or "").strip().lower() != "staging_copy":
+        return []
+
+    errors: list[str] = []
+
+    # Check 1: SPN is in admins group on source workspace
+    me = auth.source_client.current_user.me()
+    spn_id = getattr(me, "id", None)
+    admin_members: set[str] = set()
+    for g in auth.source_client.groups.list():
+        if (getattr(g, "display_name", None) or "").lower() == "admins":
+            for m in (getattr(g, "members", None) or []):
+                v = getattr(m, "value", None)
+                if v:
+                    admin_members.add(str(v))
+            break
+    if spn_id is None or str(spn_id) not in admin_members:
+        errors.append(
+            f"rls_cm_strategy=staging_copy requires the migration SPN "
+            f"(id={spn_id!r}) to be a member of the workspace 'admins' "
+            f"group on the source workspace. Add the SPN to the admins "
+            f"group, then re-run pre_check."
+        )
+
+    # Check 2: every active filter/mask fn body has an admin-bypass call
+    bodies = _fetch_active_filter_mask_function_bodies(auth)
+    for fn_fqn, body in bodies:
+        body_lower = (body or "").lower()
+        if not any(p in body_lower for p in ADMIN_BYPASS_PATTERNS):
+            errors.append(
+                f"rls_cm_strategy=staging_copy requires every active row filter "
+                f"/ column mask function body to contain an admin-bypass call "
+                f"({', '.join(ADMIN_BYPASS_PATTERNS)}). Function {fn_fqn!r} "
+                f"body lacks one. Add an admin-bypass clause (e.g. "
+                f"`OR is_account_group_member('admins')`) and re-run."
+            )
+    return errors
+
+
+def _fetch_active_filter_mask_function_bodies(auth) -> list[tuple[str, str]]:
+    """Return [(function_fqn, function_body), ...] for every UC function
+    referenced by any active row filter or column mask on a managed table.
+
+    Iterates UC catalogs/schemas/tables and probes for row_filter / column
+    mask function names, then fetches each function's routine_definition.
+    """
+    fn_fqns: set[str] = set()
+    for catalog in auth.source_client.catalogs.list():
+        if getattr(catalog, "catalog_type", "") in ("DELTASHARING_CATALOG", "FOREIGN_CATALOG"):
+            continue
+        try:
+            schemas = auth.source_client.schemas.list(catalog_name=catalog.name)
+        except Exception:  # noqa: BLE001
+            continue
+        for sch in schemas:
+            if sch.name in ("information_schema",):
+                continue
+            try:
+                tables = auth.source_client.tables.list(
+                    catalog_name=catalog.name, schema_name=sch.name
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            for tbl in tables:
+                rf = getattr(tbl, "row_filter", None)
+                if rf is not None:
+                    fn = getattr(rf, "function_name", None)
+                    if fn:
+                        fn_fqns.add(fn)
+                for col in (getattr(tbl, "columns", None) or []):
+                    mk = getattr(col, "mask", None)
+                    if mk is not None:
+                        fn = getattr(mk, "function_name", None)
+                        if fn:
+                            fn_fqns.add(fn)
+
+    bodies: list[tuple[str, str]] = []
+    for fqn in fn_fqns:
+        try:
+            fn = auth.source_client.functions.get(fqn)
+            body = getattr(fn, "routine_definition", None) or ""
+            bodies.append((fqn, body))
+        except Exception:  # noqa: BLE001
+            bodies.append((fqn, ""))
+    return bodies
+
+
 def _is_notebook() -> bool:
     try:
         _ = dbutils  # type: ignore[name-defined]  # noqa: F821
@@ -454,6 +557,18 @@ def run(dbutils, spark):  # noqa: D103
             "WARN",
             f"Collision detection skipped: {e}",
             "Run discovery before re-running pre-check to enable collision detection.",
+        )
+
+    # Path A staging_copy preconditions — fail loud before any downstream
+    # task (setup_sharing/migrate) executes side effects. No-op when
+    # rls_cm_strategy != "staging_copy".
+    errors = _check_staging_copy_preconditions(config, auth)
+    if errors:
+        for e in errors:
+            print(e)
+        raise RuntimeError(
+            "pre_check failed Path A staging_copy preconditions:\n  - "
+            + "\n  - ".join(errors)
         )
 
     # Persist results

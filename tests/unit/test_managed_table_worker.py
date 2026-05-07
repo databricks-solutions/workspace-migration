@@ -11,6 +11,9 @@ class TestCloneTable:
         config.dry_run = dry_run
         auth = MagicMock()
         tracker = MagicMock()
+        # No staging by default → exercise the original-consumer DEEP CLONE
+        # / CTAS branches the rest of the suite asserts on.
+        tracker.get_staging_for_original.return_value = None
         validator = MagicMock()
         return {
             "config": config,
@@ -125,6 +128,7 @@ class TestIcebergManagedTable:
         config.iceberg_strategy = iceberg_strategy
         auth = MagicMock()
         tracker = MagicMock()
+        tracker.get_staging_for_original.return_value = None
         validator = MagicMock()
         return {
             "config": config,
@@ -337,105 +341,86 @@ class TestIcebergManagedTable:
         assert not any("INSERT INTO" in s for s in sqls)
 
 
-class TestRlsCmStrippedCtasBranch:
-    """When the source table was RLS/CM-stripped by setup_sharing (P.1
-    drop_and_restore), the share-consumer exposes it as ``deltasharing``
-    format during the post-strip metadata propagation window. DEEP CLONE
-    rejects that format; CTAS reads cleanly via the Delta Sharing
-    protocol. clone_table branches on the ``rls_cm_stripped`` set.
+class TestStagingCopyDeepClone:
+    """Path A — staging_copy. When tracker.get_staging_for_original returns a
+    staging FQN, clone_table must DEEP CLONE from the consumer-side staging
+    path (`<consumer>.cp_migration_staging.<staging_table>`), NOT from the
+    original consumer path. Staging tables preserve full schema/properties so
+    DEEP CLONE works directly without any CTAS fallback.
     """
 
-    def _make_deps(self) -> dict:
+    def _make_deps(self, *, staging_fqn: str | None) -> dict:
         config = MagicMock()
         config.dry_run = False
+        config.rls_cm_strategy = "staging_copy"
+        tracker = MagicMock()
+        tracker.get_staging_for_original.return_value = staging_fqn
+        validator = MagicMock()
+        validator.validate_row_count.return_value = {
+            "match": True,
+            "source_count": 5,
+            "target_count": 5,
+        }
         return {
             "config": config,
             "auth": MagicMock(),
-            "tracker": MagicMock(),
-            "validator": MagicMock(),
-            "wh_id": "wh-1",
+            "tracker": tracker,
+            "validator": validator,
+            "wh_id": "wh-id",
             "share_name": "cp_migration_share",
         }
 
     @patch("migrate.managed_table_worker.time")
     @patch("migrate.managed_table_worker.execute_and_poll")
-    def test_stripped_table_uses_ctas_not_deep_clone(self, mock_execute, mock_time):
+    def test_deep_clones_from_staging_consumer_path_when_staging_exists(
+        self, mock_execute, mock_time
+    ):
         from migrate.managed_table_worker import clone_table
 
         mock_time.time.side_effect = [100.0, 110.0, 115.0]
         mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
 
-        deps = self._make_deps()
-        deps["validator"].validate_row_count.return_value = {
-            "match": True,
-            "source_count": 4,
-            "target_count": 4,
-        }
-
-        table_info = {"object_name": "`cat`.`sch`.`t_rls`"}
-        result = clone_table(
-            table_info,
-            **deps,
-            rls_cm_stripped=frozenset({"`cat`.`sch`.`t_rls`"}),
+        deps = self._make_deps(
+            staging_fqn="`tcat`.`cp_migration_staging`.`stg_abcdef123456`"
         )
-
-        assert result["status"] == "validated"
-        sqls = [c.args[2] for c in mock_execute.call_args_list]
-        # CTAS path fires, DEEP CLONE does not.
-        assert any("AS SELECT * FROM" in s for s in sqls), sqls
-        assert not any("DEEP CLONE" in s for s in sqls), sqls
-        # Source is the consumer catalog view — same FQN shape as the CLONE path.
-        assert any("`cp_migration_share_consumer`.`sch`.`t_rls`" in s for s in sqls)
-
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
-    def test_unstripped_table_still_uses_deep_clone(self, mock_execute, mock_time):
-        """Tables not in ``rls_cm_stripped`` keep the existing DEEP CLONE path."""
-        from migrate.managed_table_worker import clone_table
-
-        mock_time.time.side_effect = [100.0, 110.0, 115.0]
-        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
-
-        deps = self._make_deps()
-        deps["validator"].validate_row_count.return_value = {
-            "match": True,
-            "source_count": 10,
-            "target_count": 10,
-        }
-
-        table_info = {"object_name": "`cat`.`sch`.`t_plain`"}
-        result = clone_table(
-            table_info,
-            **deps,
-            rls_cm_stripped=frozenset({"`cat`.`sch`.`t_rls`"}),  # different table
-        )
-
-        assert result["status"] == "validated"
-        sqls = [c.args[2] for c in mock_execute.call_args_list]
-        assert any("DEEP CLONE" in s for s in sqls), sqls
-        assert not any("AS SELECT * FROM" in s for s in sqls), sqls
-
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
-    def test_empty_rls_cm_stripped_is_noop(self, mock_execute, mock_time):
-        """Default (empty frozenset) preserves DEEP CLONE behaviour — no
-        regression for the common case where no RLS/CM tables exist."""
-        from migrate.managed_table_worker import clone_table
-
-        mock_time.time.side_effect = [100.0, 110.0, 115.0]
-        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
-
-        deps = self._make_deps()
-        deps["validator"].validate_row_count.return_value = {
-            "match": True,
-            "source_count": 1,
-            "target_count": 1,
-        }
-
-        table_info = {"object_name": "`cat`.`sch`.`tbl`"}
-        # Not passing rls_cm_stripped → default frozenset() kicks in.
+        table_info = {"object_name": "`c`.`s`.`rls_table`"}
         result = clone_table(table_info, **deps)
 
         assert result["status"] == "validated"
         sqls = [c.args[2] for c in mock_execute.call_args_list]
-        assert any("DEEP CLONE" in s for s in sqls)
+        # DEEP CLONE fires, sourced from consumer-side staging path.
+        assert any("DEEP CLONE" in s for s in sqls), sqls
+        assert any("cp_migration_staging" in s for s in sqls), sqls
+        assert any("stg_abcdef123456" in s for s in sqls), sqls
+        # Consumer catalog is `<share_name>_consumer`. Source must be
+        # `<consumer>.cp_migration_staging.<staging_table>`, NOT the original.
+        assert any(
+            "`cp_migration_share_consumer`.`cp_migration_staging`.`stg_abcdef123456`" in s
+            for s in sqls
+        ), sqls
+        # Must NOT be a CTAS, must NOT clone from the original consumer path.
+        assert not any("AS SELECT * FROM" in s for s in sqls), sqls
+        assert not any("`cp_migration_share_consumer`.`s`.`rls_table`" in s for s in sqls), sqls
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_no_staging_falls_through_to_original_consumer_deep_clone(
+        self, mock_execute, mock_time
+    ):
+        """When tracker has no staging entry for the table, clone_table must
+        fall through to DEEP CLONE from the original consumer path."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 110.0, 115.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps(staging_fqn=None)
+        table_info = {"object_name": "`c`.`s`.`plain_table`"}
+        result = clone_table(table_info, **deps)
+
+        assert result["status"] == "validated"
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        assert any("DEEP CLONE" in s for s in sqls), sqls
+        # Original consumer path, not staging.
+        assert any("`cp_migration_share_consumer`.`s`.`plain_table`" in s for s in sqls), sqls
+        assert not any("cp_migration_staging" in s for s in sqls), sqls

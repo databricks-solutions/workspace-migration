@@ -19,16 +19,7 @@
 #   include_uc               — scope.include_uc
 #   include_hive             — scope.include_hive
 #   iceberg_strategy         — "" or "ddl_replay"
-#   rls_cm_strategy          — "" (skip) or "drop_and_restore". The
-#                              ``drop_and_restore`` path requires
-#                              ``rls_cm_maintenance_window_confirmed=true``
-#                              (belt-and-braces informed-consent gate,
-#                              matching setup_sharing's own check).
-#   rls_cm_maintenance_window_confirmed
-#                            — "true" / "false". Required alongside
-#                              ``rls_cm_strategy=drop_and_restore`` because
-#                              that path briefly strips RLS/CM on source
-#                              during each table's DEEP CLONE.
+#   rls_cm_strategy          — "" (skip) or "staging_copy".
 #   migrate_hive_dbfs_root   — "true" / "false"
 #   hive_dbfs_target_path    — ADLS URL for Hive DBFS-root migration; may
 #                              be empty when ``migrate_hive_dbfs_root`` is
@@ -58,15 +49,6 @@
 #                                  target_workspace_url with a
 #                                  non-resolving hostname so pre_check's
 #                                  target auth/metastore checks fail.
-#   inject_bad_rls_cm            — when "true", set
-#                                  rls_cm_strategy="drop_and_restore" and
-#                                  force rls_cm_maintenance_window_confirmed
-#                                  to false so setup_sharing's validator
-#                                  rejects it before any side effect. The
-#                                  top-of-notebook drop_and_restore gate
-#                                  is bypassed for this injection only —
-#                                  we want the failure to land in
-#                                  setup_sharing, not here.
 
 import shutil
 
@@ -126,7 +108,6 @@ dbutils.widgets.text("include_uc", "true")  # noqa: F821
 dbutils.widgets.text("include_hive", "false")  # noqa: F821
 dbutils.widgets.text("iceberg_strategy", "")  # noqa: F821
 dbutils.widgets.text("rls_cm_strategy", "")  # noqa: F821
-dbutils.widgets.text("rls_cm_maintenance_window_confirmed", "false")  # noqa: F821
 dbutils.widgets.text("migrate_hive_dbfs_root", "false")  # noqa: F821
 dbutils.widgets.text("hive_dbfs_target_path", "")  # noqa: F821
 dbutils.widgets.text("batch_size", "")  # noqa: F821
@@ -135,7 +116,6 @@ dbutils.widgets.text("catalog_filter", "")  # noqa: F821
 # normal UC / Hive integration runs are unaffected.
 dbutils.widgets.text("inject_bad_spn_id", "false")  # noqa: F821
 dbutils.widgets.text("inject_unreachable_target", "false")  # noqa: F821
-dbutils.widgets.text("inject_bad_rls_cm", "false")  # noqa: F821
 
 
 def _get_bool(key: str, default: str) -> bool:
@@ -150,7 +130,6 @@ include_uc = _get_bool("include_uc", "true")
 include_hive = _get_bool("include_hive", "false")
 iceberg_strategy = _get_str("iceberg_strategy", "")
 rls_cm_strategy = _get_str("rls_cm_strategy", "")
-rls_cm_maintenance_window_confirmed = _get_bool("rls_cm_maintenance_window_confirmed", "false")
 migrate_hive_dbfs_root = _get_bool("migrate_hive_dbfs_root", "false")
 hive_dbfs_target_path = _get_str("hive_dbfs_target_path", "")
 batch_size_raw = _get_str("batch_size", "")
@@ -159,13 +138,9 @@ catalog_filter_raw = _get_str("catalog_filter", "")
 # Negative-path injection toggles (integration X.3).
 inject_bad_spn_id = _get_bool("inject_bad_spn_id", "false")
 inject_unreachable_target = _get_bool("inject_unreachable_target", "false")
-inject_bad_rls_cm = _get_bool("inject_bad_rls_cm", "false")
 
-# Delegate the gate + override transformation to a pure helper so the
-# logic is unit-testable without dbutils / yaml I/O (S.14). The helper
-# raises ValueError for drop_and_restore without consent (matching
-# setup_sharing's gate) EXCEPT when inject_bad_rls_cm is true, where
-# the failure must land in setup_sharing's validator instead.
+# Delegate the override transformation to a pure helper so the logic is
+# unit-testable without dbutils / yaml I/O (S.14).
 
 # COMMAND ----------
 
@@ -183,22 +158,17 @@ cfg = apply_integration_overrides(
     include_hive=include_hive,
     iceberg_strategy=iceberg_strategy,
     rls_cm_strategy=rls_cm_strategy,
-    rls_cm_maintenance_window_confirmed=rls_cm_maintenance_window_confirmed,
     migrate_hive_dbfs_root=migrate_hive_dbfs_root,
     hive_dbfs_target_path=hive_dbfs_target_path,
     batch_size_raw=batch_size_raw,
     catalog_filter_raw=catalog_filter_raw,
     inject_bad_spn_id=inject_bad_spn_id,
     inject_unreachable_target=inject_unreachable_target,
-    inject_bad_rls_cm=inject_bad_rls_cm,
 )
 
-# rls_cm_strategy may have been rewritten inside the helper (injection
-# path) — pull the resolved values back for the summary print below.
+# rls_cm_strategy may have been rewritten inside the helper — pull the
+# resolved value back for the summary print below.
 rls_cm_strategy = cfg.get("rls_cm_strategy", rls_cm_strategy)
-rls_cm_maintenance_window_confirmed = cfg.get(
-    "rls_cm_maintenance_window_confirmed", rls_cm_maintenance_window_confirmed
-)
 
 with open(config_path, "w") as f:
     yaml.safe_dump(cfg, f, sort_keys=False)
@@ -209,12 +179,10 @@ print(
     f"  scope.include_hive       = {include_hive}\n"
     f"  iceberg_strategy         = {iceberg_strategy!r}\n"
     f"  rls_cm_strategy          = {rls_cm_strategy!r}\n"
-    f"  rls_cm_maintenance_window_confirmed = {rls_cm_maintenance_window_confirmed}\n"
     f"  migrate_hive_dbfs_root   = {migrate_hive_dbfs_root}\n"
     f"  hive_dbfs_target_path    = {cfg.get('hive_dbfs_target_path', '')!r}\n"
     f"  batch_size               = {cfg.get('batch_size', '(unchanged)')}\n"
     f"  catalog_filter           = {cfg.get('catalog_filter', '(unchanged)')}\n"
     f"  [inject] bad_spn_id      = {inject_bad_spn_id}\n"
     f"  [inject] unreach_target  = {inject_unreachable_target}\n"
-    f"  [inject] bad_rls_cm      = {inject_bad_rls_cm}\n"
 )

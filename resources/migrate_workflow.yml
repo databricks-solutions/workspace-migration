@@ -102,18 +102,20 @@ resources:
           notebook_task:
             notebook_path: ../src/migrate/grants_worker.py
 
-        # Restore source-side RLS/CM that setup_sharing stripped for the
-        # drop_and_restore path. Runs once all deep-clones touching
-        # stripped tables are done. ``ALL_DONE`` so source state is
-        # restored even when a managed_table batch failed — we don't
-        # want a crash to leave source unprotected.
-        - task_key: restore_rls_cm
-          depends_on:
-            - task_key: migrate_managed_tables
-            - task_key: migrate_external_tables
+        - task_key: cleanup_staging
           run_if: ALL_DONE
           notebook_task:
-            notebook_path: ../src/migrate/restore_rls_cm.py
+            notebook_path: ../src/migrate/cleanup_staging.py
+            source: WORKSPACE
+          depends_on:
+            # Path A staging_copy: drops the staging tables that
+            # setup_sharing CTAS'd into cp_migration_staging once all
+            # consumers (managed + external) have completed their DEEP
+            # CLONEs. ``ALL_DONE`` so cleanup still runs after a worker
+            # failure — orphaned staging tables would otherwise need
+            # manual cleanup.
+            - task_key: migrate_managed_tables
+            - task_key: migrate_external_tables
 
         # --- Phase 3 Tier A: table-level governance (after grants) ---
 
@@ -268,7 +270,7 @@ resources:
             - task_key: migrate_sharing
             - task_key: migrate_online_tables
             - task_key: migrate_hive_grants
-            - task_key: restore_rls_cm
+            - task_key: cleanup_staging
           run_if: ALL_DONE
           notebook_task:
             notebook_path: ../src/migrate/summary.py

@@ -168,22 +168,25 @@ class TrackingManager:
             ) USING DELTA
         """)
 
-        # RLS/CM manifest — records the source-side row filter / column
-        # mask definition for each table that was stripped as part of a
-        # ``drop_and_restore`` migration. ``restored_at`` is NULL until
-        # the post-migrate restore task re-applies the policy. Crash
-        # recovery scans this table at the start of setup_sharing so a
-        # previous-run crash can auto-heal before new strips begin.
+        # Path A staging schema — staging table copies live here so the
+        # tracking_schema only holds metadata, not user data. One schema
+        # for all migrations against this tracking catalog.
         self.spark.sql(f"""
-            CREATE TABLE IF NOT EXISTS {self._fqn}.rls_cm_manifest (
-                table_fqn STRING NOT NULL,
-                filter_fn_fqn STRING,
-                filter_columns STRING,
-                masks_json STRING,
-                stripped_at TIMESTAMP,
-                restored_at TIMESTAMP,
-                restore_failed_at TIMESTAMP,
-                restore_error STRING,
+            CREATE SCHEMA IF NOT EXISTS {self._catalog}.cp_migration_staging
+        """)
+
+        # Path A staging manifest — records the source→staging FQN mapping
+        # for each table we copy as a substitute for stripping RLS/CM.
+        # ``dropped_at`` is NULL until cleanup_staging removes the staging
+        # table after migrate completes.
+        self.spark.sql(f"""
+            CREATE TABLE IF NOT EXISTS {self._fqn}.rls_cm_staging_manifest (
+                original_fqn STRING NOT NULL,
+                staging_fqn STRING NOT NULL,
+                created_at TIMESTAMP,
+                dropped_at TIMESTAMP,
+                drop_failed_at TIMESTAMP,
+                drop_error STRING,
                 run_id STRING
             ) USING DELTA
         """)
@@ -314,7 +317,7 @@ class TrackingManager:
         - ``skipped_by_config``: ``iceberg_strategy=""``. Flip to
           ``"ddl_replay"`` + re-run → table re-enters pending pool.
         - ``skipped_by_rls_cm_policy``: ``rls_cm_strategy=""``. Flip to
-          ``"drop_and_restore"`` + consent flag + re-run → same.
+          ``"staging_copy"`` + re-run → same.
         - Plain ``skipped`` (dry_run output): real run must re-evaluate.
 
         Previously the filter was ``NOT LIKE 'skipped%'`` which treated
@@ -361,32 +364,24 @@ class TrackingManager:
         """).collect()
         return rows[0].asDict() if rows else None
 
-    # ---------------------------------------------------------------- RLS/CM manifest
+    # ---------------------------------------------------------------- Staging manifest (Path A)
 
-    def record_rls_cm_strip(
+    def record_staging_created(
         self,
         *,
-        table_fqn: str,
-        filter_fn_fqn: str | None,
-        filter_columns: list[str],
-        masks: list[dict],
+        original_fqn: str,
+        staging_fqn: str,
         run_id: str,
     ) -> None:
-        """Insert a pre-strip manifest row. Call BEFORE executing the
-        ``ALTER TABLE ... DROP`` statements — otherwise a crash between
-        the strip and the manifest write leaves the source table
-        unprotected with no record of what to restore.
-        """
-        import json as _json
-
+        """Insert a staging-manifest row. Call AFTER the CTAS into
+        cp_migration_staging succeeds so we never record a non-existent
+        staging table."""
         self.spark.sql(
             f"""
-            INSERT INTO {self._fqn}.rls_cm_manifest
+            INSERT INTO {self._fqn}.rls_cm_staging_manifest
             SELECT
-                '{table_fqn}',
-                {('NULL' if not filter_fn_fqn else "'" + filter_fn_fqn.replace("'", "''") + "'")},
-                '{_json.dumps(filter_columns).replace("'", "''")}',
-                '{_json.dumps(masks).replace("'", "''")}',
+                '{original_fqn.replace("'", "''")}',
+                '{staging_fqn.replace("'", "''")}',
                 current_timestamp(),
                 CAST(NULL AS TIMESTAMP),
                 CAST(NULL AS TIMESTAMP),
@@ -395,72 +390,70 @@ class TrackingManager:
             """
         )
 
-    def mark_rls_cm_restored(self, table_fqn: str) -> None:
-        """Mark the manifest row as restored. Clears any prior
-        ``restore_failed_at`` / ``restore_error`` from a previous attempt."""
+    def mark_staging_dropped(self, staging_fqn: str) -> None:
+        """Mark a staging table dropped after cleanup_staging succeeded.
+        Clears any prior drop_failed_at / drop_error from a previous attempt."""
         self.spark.sql(
             f"""
-            UPDATE {self._fqn}.rls_cm_manifest
-            SET restored_at = current_timestamp(),
-                restore_failed_at = NULL,
-                restore_error = NULL
-            WHERE table_fqn = '{table_fqn.replace("'", "''")}'
-              AND restored_at IS NULL
+            UPDATE {self._fqn}.rls_cm_staging_manifest
+            SET dropped_at = current_timestamp(),
+                drop_failed_at = NULL,
+                drop_error = NULL
+            WHERE staging_fqn = '{staging_fqn.replace("'", "''")}'
+              AND dropped_at IS NULL
             """
         )
 
-    def mark_rls_cm_restore_failed(self, table_fqn: str, error_message: str) -> None:
-        """Mark the manifest row as failed-to-restore but leave
-        ``restored_at`` NULL so a future run still re-attempts."""
+    def mark_staging_drop_failed(self, staging_fqn: str, error_message: str) -> None:
+        """Stamp drop_failed_at + drop_error so the next cleanup_staging run
+        retries and operators can inspect failures."""
         safe = error_message.replace("'", "''")[:4000]
         self.spark.sql(
             f"""
-            UPDATE {self._fqn}.rls_cm_manifest
-            SET restore_failed_at = current_timestamp(),
-                restore_error = '{safe}'
-            WHERE table_fqn = '{table_fqn.replace("'", "''")}'
-              AND restored_at IS NULL
+            UPDATE {self._fqn}.rls_cm_staging_manifest
+            SET drop_failed_at = current_timestamp(),
+                drop_error = '{safe}'
+            WHERE staging_fqn = '{staging_fqn.replace("'", "''")}'
+              AND dropped_at IS NULL
             """
         )
 
-    def get_unrestored_rls_cm_manifest(self) -> list[dict]:
-        """Return every manifest row still awaiting restore, most-recent
-        strip first. Used by setup_sharing's crash-recovery scan AND by
-        the post-migrate restore task."""
-        import json as _json
-
+    def get_active_stagings(self) -> list[dict]:
+        """Return all staging rows still awaiting cleanup, oldest first.
+        cleanup_staging iterates this list to drop staging tables."""
         rows = self.spark.sql(
             f"""
-            SELECT table_fqn, filter_fn_fqn, filter_columns, masks_json,
-                   stripped_at, restore_failed_at, restore_error, run_id
-            FROM {self._fqn}.rls_cm_manifest
-            WHERE restored_at IS NULL
-            ORDER BY stripped_at DESC
+            SELECT original_fqn, staging_fqn, created_at, run_id
+            FROM {self._fqn}.rls_cm_staging_manifest
+            WHERE dropped_at IS NULL
+            ORDER BY created_at ASC
             """
         ).collect()
-        result: list[dict] = []
-        for r in rows:
-            try:
-                filter_columns = _json.loads(r.filter_columns or "[]")
-            except json.JSONDecodeError:
-                filter_columns = []
-            try:
-                masks = _json.loads(r.masks_json or "[]")
-            except json.JSONDecodeError:
-                masks = []
-            result.append(
-                {
-                    "table_fqn": r.table_fqn,
-                    "filter_fn_fqn": r.filter_fn_fqn,
-                    "filter_columns": filter_columns,
-                    "masks": masks,
-                    "stripped_at": r.stripped_at,
-                    "restore_failed_at": r.restore_failed_at,
-                    "restore_error": r.restore_error,
-                    "run_id": r.run_id,
-                }
-            )
-        return result
+        return [
+            {
+                "original_fqn": r.original_fqn,
+                "staging_fqn": r.staging_fqn,
+                "created_at": r.created_at,
+                "run_id": r.run_id,
+            }
+            for r in rows
+        ]
+
+    def get_staging_for_original(self, original_fqn: str) -> str | None:
+        """Look up the staging FQN for an original table FQN. Returns None
+        if no active staging exists. managed_table_worker uses this to find
+        the staging consumer-side path for DEEP CLONE."""
+        rows = self.spark.sql(
+            f"""
+            SELECT staging_fqn
+            FROM {self._fqn}.rls_cm_staging_manifest
+            WHERE original_fqn = '{original_fqn.replace("'", "''")}'
+              AND dropped_at IS NULL
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ).collect()
+        return rows[0].staging_fqn if rows else None
 
     def get_tables_with_rls_cm(self) -> set[str]:
         """Return the set of table FQNs that have row filters or column masks

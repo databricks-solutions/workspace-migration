@@ -3,7 +3,7 @@ resources:
     negative_paths_integration_test:
       name: "${var.job_prefix}-negative-paths-integration-test"
       description: |
-        Integration X.3: negative-path coverage. Four scenarios verify the
+        Integration X.3: negative-path coverage. Three scenarios verify the
         migration tool fails loud-and-safe (or succeeds cleanly as a no-op)
         when misconfigured:
 
@@ -11,10 +11,8 @@ resources:
           X.3.2  Unreachable target_workspace_url   -> pre_check FAILs
           X.3.3  include_uc=false AND include_hive=false
                                                     -> migrate SUCCEEDs as no-op
-          X.3.4  rls_cm_strategy='drop_and_restore' without consent flag
-                                                    -> setup_sharing FAILs
 
-        All four chains rewrite the same workspace ``config.yaml``, so they
+        All three chains rewrite the same workspace ``config.yaml``, so they
         run sequentially (not in parallel) — otherwise one chain's config
         write races another chain's read. A single ``teardown`` at the end
         restores ``config.yaml`` from the backup ``setup_X31_config`` took
@@ -129,40 +127,6 @@ resources:
               trigger_task_key: "trigger_X33_migrate"
               parent_run_id: "{{job.run_id}}"
 
-        # ---------- Scenario X.3.4: bad rls_cm_strategy ----------
-
-        - task_key: setup_X34_config
-          depends_on:
-            - task_key: assert_X33
-          run_if: ALL_DONE
-          notebook_task:
-            notebook_path: ../tests/integration/setup_test_config.py
-            base_parameters:
-              include_uc: "true"
-              include_hive: "false"
-              iceberg_strategy: ""
-              rls_cm_strategy: ""
-              migrate_hive_dbfs_root: "false"
-              hive_dbfs_target_path: ""
-              inject_bad_rls_cm: "true"
-
-        - task_key: trigger_X34_setup_sharing
-          depends_on:
-            - task_key: setup_X34_config
-          notebook_task:
-            notebook_path: ../src/migrate/setup_sharing.py
-
-        - task_key: assert_X34
-          depends_on:
-            - task_key: trigger_X34_setup_sharing
-          run_if: ALL_DONE
-          notebook_task:
-            notebook_path: ../tests/integration/test_negative_paths.py
-            base_parameters:
-              scenario: "X.3.4"
-              trigger_task_key: "trigger_X34_setup_sharing"
-              parent_run_id: "{{job.run_id}}"
-
         # ---------- Teardown: always restore config.yaml ----------
         # ``ALL_DONE`` so the backup is restored even when multiple
         # assertion tasks failed. Depends on every leaf task so the
@@ -179,9 +143,6 @@ resources:
             - task_key: setup_X33_config
             - task_key: trigger_X33_migrate
             - task_key: assert_X33
-            - task_key: setup_X34_config
-            - task_key: trigger_X34_setup_sharing
-            - task_key: assert_X34
           run_if: ALL_DONE
           notebook_task:
             notebook_path: ../tests/integration/teardown_negative_paths.py

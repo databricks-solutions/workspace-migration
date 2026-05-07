@@ -145,21 +145,16 @@ class MigrationConfig:
     # Row filter / column mask on managed tables — Delta Sharing refuses to
     # share tables with legacy RLS/CM (``ALTER TABLE ... SET ROW FILTER`` /
     # ``SET MASK``). Supported values:
-    #   ""                  — default; affected tables are recorded in
-    #                         migration_status with ``skipped_by_rls_cm_policy``
-    #                         and their data does not move to target.
-    #   "drop_and_restore"  — NOT YET IMPLEMENTED. Planned: temporarily drop
-    #                         RLS/CM on source, clone to target via share,
-    #                         restore on source. Brief exposure window on
-    #                         source while the clone runs. See README.
+    #   ""              — default; affected tables are recorded in
+    #                     migration_status with ``skipped_by_rls_cm_policy``
+    #                     and their data does not move to target.
+    #   "staging_copy"  — clone the table to an unprotected staging table on
+    #                     source (in the migration tracking schema), share
+    #                     the staging copy, CTAS into the target, then re-
+    #                     apply the original RLS/CM on the target. Source
+    #                     row filter / column mask are never altered. See
+    #                     README and docs/RLS_CM_STAGING_COPY.md.
     rls_cm_strategy: str = ""
-    # Informed-consent gate for ``rls_cm_strategy='drop_and_restore'``.
-    # The strategy briefly exposes source-side data (during DEEP CLONE)
-    # because row filter / column mask are dropped on source before the
-    # clone and re-applied after. Operators must flip this to ``true``
-    # to acknowledge the exposure window. Without it, setup_sharing
-    # refuses the drop_and_restore path.
-    rls_cm_maintenance_window_confirmed: bool = False
     # Hive (Phase 2) — unused in Phase 1 notebooks but fields exist so the
     # dataclass matches the full config file schema.
     migrate_hive_dbfs_root: bool = False
@@ -242,9 +237,6 @@ class MigrationConfig:
             include_hive=_coerce_bool((raw.get("scope") or {}).get("include_hive", False)),
             iceberg_strategy=str(raw.get("iceberg_strategy", "")),
             rls_cm_strategy=str(raw.get("rls_cm_strategy", "")),
-            rls_cm_maintenance_window_confirmed=_coerce_bool(
-                raw.get("rls_cm_maintenance_window_confirmed")
-            ),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
             hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
             hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),

@@ -10,16 +10,16 @@ resources:
           notebook_task:
             notebook_path: ../tests/integration/setup_test_config.py
             # UC integration test: UC on, Hive off, Iceberg DDL replay on,
-            # RLS/CM drop_and_restore with maintenance-window consent so
-            # the P.1 end-to-end fixture (strip → clone → restore) can
-            # exercise the full flow. Hive DBFS-root stays off so we
-            # don't need an external-location grant for the UC-only suite.
+            # RLS/CM staging_copy so the P.1 end-to-end fixture exercises
+            # the staging-table flow (CTAS into cp_migration_staging →
+            # share staging → DEEP CLONE → cleanup_staging) without
+            # touching source RLS/CM policies. Hive DBFS-root stays off
+            # so we don't need an external-location grant for the UC-only suite.
             base_parameters:
               include_uc: "true"
               include_hive: "false"
               iceberg_strategy: "ddl_replay"
-              rls_cm_strategy: "drop_and_restore"
-              rls_cm_maintenance_window_confirmed: "true"
+              rls_cm_strategy: "staging_copy"
               migrate_hive_dbfs_root: "false"
               hive_dbfs_target_path: ""
 

@@ -88,18 +88,15 @@ def clone_table(
     validator: Validator,
     wh_id: str,
     share_name: str,
-    rls_cm_stripped: frozenset[str] = frozenset(),
 ) -> dict:
     """Deep clone a single managed table from delta share to target.
 
-    ``rls_cm_stripped`` holds FQNs whose RLS/CM was stripped by
-    ``setup_sharing`` in this run. Those tables are routed through
-    CTAS instead of DEEP CLONE: the share-consumer reports them as
-    ``deltasharing`` format during the post-strip metadata propagation
-    window, which DEEP CLONE refuses (``DELTA_CLONE_UNSUPPORTED_SOURCE``)
-    but CTAS reads cleanly via the Delta Sharing protocol regardless
-    of format. Row-count validation on the target is identical for
-    both paths.
+    Path A staging_copy: tables with RLS/CM are CTAS'd into a staging
+    schema by ``setup_sharing`` and the staging FQN is added to the
+    share. ``tracker.get_staging_for_original`` returns the staging FQN
+    so this worker can DEEP CLONE the staging copy directly. Tables
+    without staging entries DEEP CLONE the original consumer-side path.
+    Row-count validation is identical for both paths.
     """
     obj_name = table_info["object_name"]
     # X.1 kill-injection: simulated mid-batch crash for integration tests.
@@ -243,11 +240,26 @@ def clone_table(
                 "duration_seconds": duration,
             }
 
-    # --- Delta (default) — DEEP CLONE, CTAS fallback for RLS/CM-stripped tables ---
+    # --- Delta (default) — DEEP CLONE from staging consumer path if staging
+    #     exists (Path A staging_copy), else from the original consumer path.
     consumer_fqn = f"`{consumer_catalog}`.`{schema}`.`{table}`"
-    if obj_name in rls_cm_stripped:
-        sql = f"CREATE OR REPLACE TABLE {target_fqn} AS SELECT * FROM {consumer_fqn}"
-        logger.info("Executing CTAS (RLS/CM-stripped) for %s", obj_name)
+    staging_fqn = tracker.get_staging_for_original(obj_name) if tracker is not None else None
+    if staging_fqn:
+        # Path A: the staging table was CTAS'd from the source into the source
+        # workspace's `cp_migration_staging` schema, so it's a regular Delta
+        # table with full schema and properties preserved — DEEP CLONE works
+        # without a CTAS fallback. Build the consumer-side path:
+        #   `<consumer>.cp_migration_staging.<staging_table_name>`.
+        # `staging_fqn` looks like `tcat`.`cp_migration_staging`.`stg_abc...`;
+        # extract just the trailing identifier.
+        staging_table_name = staging_fqn.rstrip("`").split("`")[-1]
+        staging_consumer_fqn = (
+            f"`{consumer_catalog}`.`cp_migration_staging`.`{staging_table_name}`"
+        )
+        sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {staging_consumer_fqn}"
+        logger.info(
+            "Executing DEEP CLONE from staging for %s (staging=%s)", obj_name, staging_fqn
+        )
     else:
         sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {consumer_fqn}"
         logger.info("Executing DEEP CLONE for %s", obj_name)
@@ -323,16 +335,6 @@ def run(dbutils, spark) -> None:
 
     wh_id = find_warehouse(auth)
 
-    # Snapshot the RLS/CM-stripped FQNs once per batch. Workers for these
-    # tables will route through CTAS instead of DEEP CLONE — see clone_table.
-    rls_cm_stripped: frozenset[str] = frozenset(m["table_fqn"] for m in tracker.get_unrestored_rls_cm_manifest())
-    if rls_cm_stripped:
-        logger.info(
-            "Routing %d RLS/CM-stripped table(s) through CTAS instead of DEEP CLONE: %s",
-            len(rls_cm_stripped),
-            sorted(rls_cm_stripped),
-        )
-
     # Process batch with thread pool
 
     results: list[dict] = []
@@ -348,7 +350,6 @@ def run(dbutils, spark) -> None:
                 validator=validator,
                 wh_id=wh_id,
                 share_name=SHARE_NAME,
-                rls_cm_stripped=rls_cm_stripped,
             ): tbl
             for tbl in batch
         }

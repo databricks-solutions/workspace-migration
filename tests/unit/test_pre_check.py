@@ -489,3 +489,63 @@ class TestPreCheckCollisionDetection:
         assert len(coll) == 1
         assert coll[0]["status"] == "WARN"
         assert "run discovery" in coll[0]["action_required"].lower()
+
+
+class TestStagingCopyPreChecks:
+    def test_skipped_when_strategy_not_staging_copy(self, mocker):
+        from pre_check.pre_check import _check_staging_copy_preconditions
+        config = mocker.MagicMock()
+        config.rls_cm_strategy = ""
+        auth = mocker.MagicMock()
+        errors = _check_staging_copy_preconditions(config, auth)
+        assert errors == []
+
+    def test_fails_when_strategy_staging_copy_and_spn_not_admin(self, mocker):
+        """staging_copy requires the migration SPN be a workspace admin."""
+        from pre_check.pre_check import _check_staging_copy_preconditions
+        config = mocker.MagicMock()
+        config.rls_cm_strategy = "staging_copy"
+        auth = mocker.MagicMock()
+        # SPN is NOT in the admins group (no admins group in iter)
+        auth.source_client.current_user.me.return_value = mocker.MagicMock(id="spn-123")
+        auth.source_client.groups.list.return_value = [
+            mocker.MagicMock(display_name="developers", members=[]),
+            mocker.MagicMock(display_name="readers", members=[]),
+        ]
+        # Patch the body-fetcher to return [] so this test isolates the SPN check
+        mocker.patch("pre_check.pre_check._fetch_active_filter_mask_function_bodies",
+                     return_value=[])
+        errors = _check_staging_copy_preconditions(config, auth)
+        assert any("admins" in e.lower() for e in errors)
+
+    def test_passes_when_spn_admin_and_filters_have_bypass(self, mocker):
+        """All-clear: SPN admin + every filter/mask has is_account_group_member admin bypass."""
+        from pre_check.pre_check import _check_staging_copy_preconditions
+        config = mocker.MagicMock()
+        config.rls_cm_strategy = "staging_copy"
+        auth = mocker.MagicMock()
+        # SPN is in admins group
+        admins_group = mocker.MagicMock(display_name="admins")
+        admins_group.members = [mocker.MagicMock(value="spn-123")]
+        auth.source_client.groups.list.return_value = [admins_group]
+        auth.source_client.current_user.me.return_value = mocker.MagicMock(id="spn-123")
+        # Bypass-pattern present
+        mocker.patch("pre_check.pre_check._fetch_active_filter_mask_function_bodies",
+                     return_value=[("c.s.fn1", "RETURN region = 'US' OR is_account_group_member('admins')")])
+        errors = _check_staging_copy_preconditions(config, auth)
+        assert errors == []
+
+    def test_fails_when_filter_lacks_admin_bypass(self, mocker):
+        """SPN admin OK, but a filter body lacks any admin-bypass call → error."""
+        from pre_check.pre_check import _check_staging_copy_preconditions
+        config = mocker.MagicMock()
+        config.rls_cm_strategy = "staging_copy"
+        auth = mocker.MagicMock()
+        admins_group = mocker.MagicMock(display_name="admins")
+        admins_group.members = [mocker.MagicMock(value="spn-123")]
+        auth.source_client.groups.list.return_value = [admins_group]
+        auth.source_client.current_user.me.return_value = mocker.MagicMock(id="spn-123")
+        mocker.patch("pre_check.pre_check._fetch_active_filter_mask_function_bodies",
+                     return_value=[("c.s.fn_bad", "RETURN region = 'US'")])
+        errors = _check_staging_copy_preconditions(config, auth)
+        assert any("c.s.fn_bad" in e for e in errors)

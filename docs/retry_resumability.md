@@ -101,16 +101,18 @@ from migrate.reconciliation import maybe_kill
 maybe_kill(config, _bump_kill_counter(), "my_worker")
 ```
 
-## Interaction with the RLS/CM manifest (P.1)
+## Interaction with the staging manifest (Path A)
 
-P.1 (PR #22 / #31) shipped a separate crash-recovery mechanism for `rls_cm_strategy='drop_and_restore'`: the `rls_cm_manifest` table records each source-side policy drop so a crash between `DROP` and `SET` can auto-heal on the next run. That manifest is **not** consumed by reconciliation.
+Path A (`rls_cm_strategy='staging_copy'`) ships a separate crash-recovery mechanism for the staging tables that `setup_sharing` creates in `<tracking_catalog>.cp_migration_staging`: the `rls_cm_staging_manifest` table records each staging table the run materialised so the post-migrate `cleanup_staging` task can drop them — including stagings left behind by an earlier crashed run. That manifest is **not** consumed by reconciliation.
+
+The manifest schema is `(original_fqn, staging_fqn, created_at, dropped_at, drop_failed_at, drop_error, run_id)`. `cleanup_staging.py` reads `tracker.get_active_stagings()` (every row where `dropped_at IS NULL`), issues `DROP TABLE IF EXISTS <staging_fqn>` per row, and stamps `dropped_at` on success or `drop_failed_at` + `drop_error` on failure. A single bad drop never blocks the rest of the batch — the task continues, then raises at the end if anything failed so the operator sees the workflow task fail. Re-running the task is idempotent: `DROP TABLE IF EXISTS` tolerates already-dropped tables, and the `WHERE dropped_at IS NULL` filter naturally excludes finished work.
 
 Both systems coexist by design:
 
-- `rls_cm_manifest` tracks **source-side** strips (rare, opt-in, narrow blast radius).
-- `migration_status` tracks **target-side** migration progress (every object, every run).
+- `rls_cm_staging_manifest` tracks **target-side staging tables** created during `setup_sharing` (rare, opt-in to the `staging_copy` strategy, narrow blast radius — only RLS/CM-bearing tables).
+- `migration_status` tracks **target-side migration progress** for every object across every run.
 
-Merging them would couple two unrelated lifecycles and hurt the clarity of both. The reconciler skips any row whose `status` is RLS/CM-specific (there is no such status today — P.1 writes only `setup_sharing`-scoped fields into the manifest, not `migration_status`).
+Merging them would couple two unrelated lifecycles and hurt the clarity of both. The reconciler skips any row whose `status` is staging-specific (there is no such status today — `setup_sharing` writes only its own scoped fields into the manifest, not `migration_status`).
 
 ## Deferred for follow-up
 

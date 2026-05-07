@@ -7,7 +7,7 @@ Two artefacts are covered:
   (or succeeded as no-op for X.3.3). Source-level checks lock in the
   per-scenario expected-substring contract.
 - ``resources/negative_paths_integration_test_workflow.yml`` — YAML
-  that wires up the four scenarios. Shape checks make sure all four
+  that wires up the three scenarios. Shape checks make sure all three
   chains exist, run sequentially (required because they share
   ``config.yaml``), and each has a ``run_if: ALL_DONE`` assertion task.
 
@@ -84,9 +84,6 @@ class TestAssertionNotebookSource:
         # X.3.1 / X.3.2 must reference pre_check's check-name keys
         assert "check_source_auth" in src
         assert "check_target_auth" in src
-        # X.3.4 must reference the consent flag and strategy name
-        assert "rls_cm_maintenance_window_confirmed" in src
-        assert "drop_and_restore" in src
 
     def test_x33_asserts_success_not_failure(self):
         """X.3.3 is a no-op, not an error. The assertion must check for
@@ -106,7 +103,7 @@ class TestNegativePathWorkflowShape:
         jobs = data["resources"]["jobs"]
         assert list(jobs) == ["negative_paths_integration_test"]
 
-    def test_has_four_trigger_tasks_one_per_scenario(self):
+    def test_has_three_trigger_tasks_one_per_scenario(self):
         data = _workflow_yaml()
         tasks = data["resources"]["jobs"]["negative_paths_integration_test"]["tasks"]
         task_keys = {t["task_key"] for t in tasks}
@@ -114,7 +111,6 @@ class TestNegativePathWorkflowShape:
             "trigger_X31_pre_check",
             "trigger_X32_pre_check",
             "trigger_X33_migrate",
-            "trigger_X34_setup_sharing",
         ):
             assert expected in task_keys, f"missing trigger task {expected!r}"
 
@@ -122,7 +118,7 @@ class TestNegativePathWorkflowShape:
         data = _workflow_yaml()
         tasks = data["resources"]["jobs"]["negative_paths_integration_test"]["tasks"]
         by_key = {t["task_key"]: t for t in tasks}
-        for scenario_num in ("X31", "X32", "X33", "X34"):
+        for scenario_num in ("X31", "X32", "X33"):
             assert_key = f"assert_{scenario_num}"
             assert assert_key in by_key, f"missing {assert_key}"
             task = by_key[assert_key]
@@ -135,7 +131,7 @@ class TestNegativePathWorkflowShape:
             )
 
     def test_chains_run_sequentially(self):
-        """The four chains rewrite the same ``config.yaml`` and a parallel
+        """The three chains rewrite the same ``config.yaml`` and a parallel
         layout would race. Each subsequent chain's setup must depend on
         the previous chain's assertion task."""
         data = _workflow_yaml()
@@ -149,7 +145,6 @@ class TestNegativePathWorkflowShape:
             "setup_X32_config must depend on assert_X31 — chains share config.yaml."
         )
         assert "assert_X32" in _deps("setup_X33_config")
-        assert "assert_X33" in _deps("setup_X34_config")
 
     def test_teardown_depends_on_every_task(self):
         """Teardown restores config.yaml from the backup; it must wait for
@@ -165,16 +160,6 @@ class TestNegativePathWorkflowShape:
             assert k in dep_keys, f"teardown must depend on {k!r} to avoid racing the config restore"
         assert teardown.get("run_if") == "ALL_DONE"
 
-    def test_x34_triggers_setup_sharing_not_migrate(self):
-        """The validator lives in setup_sharing, not migrate. Running the
-        whole migrate workflow would mask the early-validator failure
-        (the run might fail for unrelated reasons further downstream)."""
-        data = _workflow_yaml()
-        tasks = data["resources"]["jobs"]["negative_paths_integration_test"]["tasks"]
-        by_key = {t["task_key"]: t for t in tasks}
-        trig = by_key["trigger_X34_setup_sharing"]
-        assert trig["notebook_task"]["notebook_path"].endswith("src/migrate/setup_sharing.py")
-
     def test_injection_widgets_wired_to_correct_scenarios(self):
         data = _workflow_yaml()
         tasks = data["resources"]["jobs"]["negative_paths_integration_test"]["tasks"]
@@ -184,7 +169,6 @@ class TestNegativePathWorkflowShape:
             by_key["setup_X32_config"]["notebook_task"]["base_parameters"].get("inject_unreachable_target")
             == "true"
         )
-        assert by_key["setup_X34_config"]["notebook_task"]["base_parameters"].get("inject_bad_rls_cm") == "true"
 
     def test_x33_sets_both_scopes_false(self):
         data = _workflow_yaml()
