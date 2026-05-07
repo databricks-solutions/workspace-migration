@@ -33,6 +33,15 @@ logger = logging.getLogger("summary")
 
 
 # COMMAND ----------
+# Widgets — declared at notebook top so per-workflow summary tasks can pass
+# their object-type slice. Empty / missing = summarise everything (back-compat).
+try:
+    dbutils.widgets.text("object_types", "")  # type: ignore[name-defined]  # noqa: F821
+except NameError:
+    pass
+
+
+# COMMAND ----------
 # Helpers — importable for unit tests
 
 
@@ -40,6 +49,22 @@ def aggregate_by_status(df: DataFrame) -> list[dict]:
     """Aggregate migration counts by status."""
     from pyspark.sql.functions import count
 
+    rows = df.groupBy("status").agg(count("*").alias("total")).orderBy("status").collect()
+    return [row.asDict() for row in rows]
+
+
+def aggregate_by_status_filtered(df: DataFrame, object_types: list[str]) -> list[dict]:
+    """Same as aggregate_by_status, but pre-filters to rows whose object_type
+    is in `object_types`. Used by per-workflow summary tasks
+    (summary_uc / summary_hive / summary_governance).
+
+    Empty `object_types` = no filter (return everything) — matches the
+    pre-split behaviour for backwards compatibility.
+    """
+    from pyspark.sql.functions import col, count
+
+    if object_types:
+        df = df.filter(col("object_type").isin(object_types))
     rows = df.groupBy("status").agg(count("*").alias("total")).orderBy("status").collect()
     return [row.asDict() for row in rows]
 
@@ -148,11 +173,19 @@ if _is_notebook():
     spark_session = spark  # type: ignore[name-defined] # noqa: F821
     tracker = TrackingManager(spark_session, config)
 
+    # Per-workflow filter (workflow split): empty / missing → summarise everything.
+    object_types_param = ""
+    try:
+        object_types_param = dbutils.widgets.get("object_types")  # type: ignore[name-defined] # noqa: F821
+    except Exception:  # noqa: BLE001
+        pass
+    object_types = [t.strip() for t in object_types_param.split(",") if t.strip()]
+
     logger.info("Fetching latest migration status...")
     latest_df = tracker.get_latest_migration_status()
 
     # Aggregate and print
-    status_rows = aggregate_by_status(latest_df)
+    status_rows = aggregate_by_status_filtered(latest_df, object_types)
     type_rows = aggregate_by_object_type(latest_df)
     failed = get_failed_objects(latest_df)
 
