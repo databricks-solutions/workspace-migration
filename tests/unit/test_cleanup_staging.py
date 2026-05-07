@@ -25,28 +25,11 @@ def test_cleanup_staging_skips_when_strategy_not_staging_copy():
     spark = MagicMock()
     config = MagicMock()
     config.rls_cm_strategy = ""  # default skip — not staging_copy
-    config.include_uc = True
 
     with _patch_config(config), _patch_tracker(MagicMock()):
         run(MagicMock(), spark)
 
     spark.sql.assert_not_called()
-
-
-def test_cleanup_staging_skips_when_include_uc_false():
-    """include_uc=false short-circuits before any tracker access."""
-    from migrate.cleanup_staging import run
-    spark = MagicMock()
-    config = MagicMock()
-    config.rls_cm_strategy = "staging_copy"
-    config.include_uc = False
-    tracker = MagicMock()
-
-    with _patch_config(config), _patch_tracker(tracker):
-        run(MagicMock(), spark)
-
-    spark.sql.assert_not_called()
-    tracker.get_active_stagings.assert_not_called()
 
 
 def test_cleanup_staging_skips_when_no_active_stagings():
@@ -55,7 +38,6 @@ def test_cleanup_staging_skips_when_no_active_stagings():
     spark = MagicMock()
     config = MagicMock()
     config.rls_cm_strategy = "staging_copy"
-    config.include_uc = True
     tracker = MagicMock()
     tracker.get_active_stagings.return_value = []
 
@@ -75,7 +57,6 @@ def test_cleanup_staging_removes_from_share_then_drops_each_staging():
     spark = MagicMock()
     config = MagicMock()
     config.rls_cm_strategy = "staging_copy"
-    config.include_uc = True
     tracker = MagicMock()
     tracker.get_active_stagings.return_value = [
         {"original_fqn": "`c`.`s`.`t1`", "staging_fqn": "`tc`.`cp_migration_staging`.`stg_a`",
@@ -110,7 +91,6 @@ def test_cleanup_staging_swallows_not_in_share_on_alter_share():
     spark = MagicMock()
     config = MagicMock()
     config.rls_cm_strategy = "staging_copy"
-    config.include_uc = True
     tracker = MagicMock()
     tracker.get_active_stagings.return_value = [
         {"original_fqn": "`c`.`s`.`t1`", "staging_fqn": "`tc`.`cp_migration_staging`.`stg_a`",
@@ -132,7 +112,6 @@ def test_cleanup_staging_continues_on_per_table_failure_then_raises():
     spark = MagicMock()
     config = MagicMock()
     config.rls_cm_strategy = "staging_copy"
-    config.include_uc = True
     tracker = MagicMock()
     tracker.get_active_stagings.return_value = [
         {"original_fqn": "`c`.`s`.`t1`", "staging_fqn": "`tc`.`cp_migration_staging`.`stg_a`",

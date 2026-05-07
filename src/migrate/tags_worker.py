@@ -109,9 +109,6 @@ def apply_tag_group(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping tags_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

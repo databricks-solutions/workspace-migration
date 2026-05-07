@@ -260,7 +260,6 @@ class TestViewsWorkerRetryLoop:
         spark = MagicMock()
 
         cfg = MagicMock()
-        cfg.include_uc = True
         cfg.dry_run = False
 
         with (
@@ -321,7 +320,6 @@ class TestViewsWorkerRetryLoop:
         spark = MagicMock()
 
         cfg = MagicMock()
-        cfg.include_uc = True
         cfg.dry_run = False
 
         with (

@@ -132,10 +132,6 @@ class MigrationConfig:
     tracking_schema: str = "cp_migration"
     dry_run: bool = False
     batch_size: int = 50
-    # Scope: which source metastore domains to discover/migrate. Default is UC
-    # only — Hive enablement is opt-in.
-    include_uc: bool = True
-    include_hive: bool = False
     # Iceberg (Phase 2.5) — set to "ddl_replay" to opt into Option A for
     # UC-managed Iceberg tables (DDL replay + re-ingest via cp_migration_share).
     # Leaving this empty blocks Iceberg migration so customers have to
@@ -233,8 +229,6 @@ class MigrationConfig:
             tracking_schema=str(raw.get("tracking_schema", "cp_migration")),
             dry_run=_coerce_bool(raw.get("dry_run")),
             batch_size=int(raw.get("batch_size", 50)),
-            include_uc=_coerce_bool((raw.get("scope") or {}).get("include_uc", True)),
-            include_hive=_coerce_bool((raw.get("scope") or {}).get("include_hive", False)),
             iceberg_strategy=str(raw.get("iceberg_strategy", "")),
             rls_cm_strategy=str(raw.get("rls_cm_strategy", "")),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),

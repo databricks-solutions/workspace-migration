@@ -56,9 +56,6 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
     if (config.rls_cm_strategy or "").strip().lower() != "staging_copy":
         logger.info("rls_cm_strategy is not 'staging_copy'; nothing to clean up.")
         return
-    if not config.include_uc:
-        logger.info("scope.include_uc=false; skipping cleanup_staging.")
-        return
 
     auth = AuthManager(config, dbutils)  # noqa: F841 — kept for symmetry
     tracker = TrackingManager(spark, config)

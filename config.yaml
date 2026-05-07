@@ -34,15 +34,6 @@ spn_client_id: REPLACE_WITH_APPLICATION_ID
 spn_secret_scope: migration
 spn_secret_key: spn-secret
 
-# --- Scope: which source metastore domains to discover/migrate ---
-# Default: UC only. Set include_hive=true to also cover the legacy
-# hive_metastore catalog (discovery + migrate workflows will run Hive
-# steps). The Hive integration test requires include_hive=true — flip
-# it on the workspace copy before triggering that test.
-scope:
-  include_uc: true
-  include_hive: false
-
 # --- Scoping ---
 # Comma-separated; leave empty to include everything.
 catalog_filter: ""

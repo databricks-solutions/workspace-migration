@@ -43,6 +43,8 @@ permissions:
 
 include:
   - resources/*.yml
+  - resources/production/*.yml
+  - resources/integration_tests/*.yml
 
 targets:
   dev:

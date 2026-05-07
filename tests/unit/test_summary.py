@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 from migrate.summary import (
     aggregate_by_status,
+    aggregate_by_status_filtered,
     get_failed_objects,
     print_failures,
     print_object_type_table,
@@ -141,3 +142,67 @@ class TestGetFailedObjects:
         assert result[0]["object_name"] == "catalog.schema.tbl"
         assert result[0]["error_message"] == "timeout"
         mock_df.filter.assert_called_once()
+
+
+# --------------------------------------------------------------------------- #
+#  aggregate_by_status_filtered
+# --------------------------------------------------------------------------- #
+
+
+class TestAggregateByStatusFiltered:
+    """summary's aggregate_by_status_filtered must only count rows whose
+    object_type is in the supplied object_types list (per-workflow slicing)."""
+
+    def test_filters_by_object_types_when_list_provided(self):
+        # When object_types is non-empty, df.filter must be invoked before
+        # the groupBy/agg/orderBy chain runs on the *filtered* DataFrame.
+        mock_df = MagicMock()
+        filtered_df = MagicMock()
+        mock_df.filter.return_value = filtered_df
+
+        mock_row = MagicMock()
+        mock_row.asDict.return_value = {"status": "validated", "total": 2}
+        filtered_df.groupBy.return_value.agg.return_value.orderBy.return_value.collect.return_value = [mock_row]
+
+        result = aggregate_by_status_filtered(mock_df, object_types=["managed_table"])
+
+        assert result == [{"status": "validated", "total": 2}]
+        mock_df.filter.assert_called_once()
+        filtered_df.groupBy.assert_called_once_with("status")
+
+    def test_governance_slice_returns_filtered_rows(self):
+        mock_df = MagicMock()
+        filtered_df = MagicMock()
+        mock_df.filter.return_value = filtered_df
+
+        validated_row = MagicMock()
+        validated_row.asDict.return_value = {"status": "validated", "total": 1}
+        skipped_row = MagicMock()
+        skipped_row.asDict.return_value = {"status": "skipped", "total": 1}
+        filtered_df.groupBy.return_value.agg.return_value.orderBy.return_value.collect.return_value = [
+            skipped_row,
+            validated_row,
+        ]
+
+        result = aggregate_by_status_filtered(mock_df, object_types=["tag", "row_filter"])
+
+        statuses = {r["status"]: r["total"] for r in result}
+        assert statuses == {"validated": 1, "skipped": 1}
+        mock_df.filter.assert_called_once()
+
+    def test_empty_object_types_skips_filter_back_compat(self):
+        # Empty list = no filter (back-compat with pre-split behaviour).
+        mock_df = MagicMock()
+
+        v_row = MagicMock()
+        v_row.asDict.return_value = {"status": "validated", "total": 4}
+        s_row = MagicMock()
+        s_row.asDict.return_value = {"status": "skipped", "total": 1}
+        mock_df.groupBy.return_value.agg.return_value.orderBy.return_value.collect.return_value = [s_row, v_row]
+
+        result = aggregate_by_status_filtered(mock_df, object_types=[])
+
+        statuses = {r["status"]: r["total"] for r in result}
+        assert statuses == {"validated": 4, "skipped": 1}
+        mock_df.filter.assert_not_called()
+        mock_df.groupBy.assert_called_once_with("status")

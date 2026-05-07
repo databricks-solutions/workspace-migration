@@ -8,16 +8,14 @@ resources:
       tasks:
         - task_key: setup_test_config
           notebook_task:
-            notebook_path: ../tests/integration/setup_test_config.py
-            # UC integration test: UC on, Hive off, Iceberg DDL replay on,
-            # RLS/CM staging_copy so the P.1 end-to-end fixture exercises
-            # the staging-table flow (CTAS into cp_migration_staging →
-            # share staging → DEEP CLONE → cleanup_staging) without
-            # touching source RLS/CM policies. Hive DBFS-root stays off
-            # so we don't need an external-location grant for the UC-only suite.
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # UC integration test: Iceberg DDL replay on, RLS/CM staging_copy
+            # so the P.1 end-to-end fixture exercises the staging-table flow
+            # (CTAS into cp_migration_staging → share staging → DEEP CLONE →
+            # cleanup_staging) without touching source RLS/CM policies. Hive
+            # DBFS-root stays off so we don't need an external-location grant
+            # for the UC-only suite.
             base_parameters:
-              include_uc: "true"
-              include_hive: "false"
               iceberg_strategy: "ddl_replay"
               rls_cm_strategy: "staging_copy"
               migrate_hive_dbfs_root: "false"
@@ -27,31 +25,31 @@ resources:
           depends_on:
             - task_key: setup_test_config
           notebook_task:
-            notebook_path: ../tests/integration/seed_uc_test_data.py
+            notebook_path: ../../tests/integration/seed_uc_test_data.py
 
         - task_key: pre_check
           depends_on:
             - task_key: seed_uc
           notebook_task:
-            notebook_path: ../src/pre_check/pre_check.py
+            notebook_path: ../../src/pre_check/pre_check.py
 
         - task_key: discovery
           depends_on:
             - task_key: pre_check
           notebook_task:
-            notebook_path: ../src/discovery/discovery.py
+            notebook_path: ../../src/discovery/discovery.py
 
-        - task_key: migrate
+        - task_key: migrate_uc
           depends_on:
             - task_key: discovery
           run_job_task:
-            job_id: ${resources.jobs.migrate.id}
+            job_id: ${resources.jobs.migrate_uc.id}
 
         - task_key: test_uc
           depends_on:
-            - task_key: migrate
+            - task_key: migrate_uc
           notebook_task:
-            notebook_path: ../tests/integration/test_uc_end_to_end.py
+            notebook_path: ../../tests/integration/test_uc_end_to_end.py
 
         - task_key: teardown_uc
           depends_on:
@@ -59,8 +57,8 @@ resources:
             - task_key: seed_uc
             - task_key: pre_check
             - task_key: discovery
-            - task_key: migrate
+            - task_key: migrate_uc
             - task_key: test_uc
           run_if: ALL_DONE
           notebook_task:
-            notebook_path: ../tests/integration/teardown_uc.py
+            notebook_path: ../../tests/integration/teardown_uc.py

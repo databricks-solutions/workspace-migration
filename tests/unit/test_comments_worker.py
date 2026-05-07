@@ -146,18 +146,3 @@ class TestCommentsWorkerErrorSuppression:
         assert results == []
 
 
-class TestCommentsWorkerScopeGate:
-    """Source-level contract: ``run()`` must early-return when
-    include_uc=False so we don't read discovery_inventory from a
-    Hive-only migration."""
-
-    def test_run_short_circuits_on_include_uc_false(self):
-        import pathlib
-
-        src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "comments_worker.py").read_text()
-        # The gate must come before any spark.sql read.
-        assert "if not config.include_uc" in src
-        gate_idx = src.index("if not config.include_uc")
-        first_spark = src.find("spark.sql", gate_idx)
-        # Gate appears before first spark.sql call in run()
-        assert first_spark > gate_idx

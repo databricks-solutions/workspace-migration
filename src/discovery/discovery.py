@@ -18,9 +18,10 @@ except NameError:
 
 # Discovery: unified entry point for UC and Hive discovery.
 #
-# Both domains write to a single `discovery_inventory` table; rows are
-# distinguished by the `source_type` column ('uc' or 'hive'). Scope is
-# controlled via config.include_uc / config.include_hive.
+# Both domains always run and write to a single `discovery_inventory`
+# table; rows are distinguished by the `source_type` column ('uc' or
+# 'hive'). An empty Hive metastore (e.g., a workspace without legacy
+# Hive tables) yields zero hive rows and is a normal no-op.
 
 import contextlib
 from collections import Counter
@@ -497,24 +498,17 @@ def run(dbutils, spark):  # noqa: D103
 
     tracker.init_tracking_tables()
 
-    if not (config.include_uc or config.include_hive):
-        print("Neither scope.include_uc nor scope.include_hive is enabled — nothing to discover.")
-        return []
-
     now = datetime.now(tz=timezone.utc)
     inventory: list[dict] = []
-    dlt_count = 0
 
-    if config.include_uc:
-        uc_rows, dlt_count = _discover_uc(config, explorer, now)
-        inventory.extend(uc_rows)
-    else:
-        print("[uc] Skipped (scope.include_uc = false)")
+    # Both scopes always scan — workflow split removed scope flags.
+    # Empty scan results (e.g., no Hive metastore on this workspace) are a normal no-op.
+    print("[uc] Scanning UC catalogs...")
+    uc_rows, dlt_count = _discover_uc(config, explorer, now)
+    inventory.extend(uc_rows)
 
-    if config.include_hive:
-        inventory.extend(_discover_hive(config, explorer, now))
-    else:
-        print("[hive] Skipped (scope.include_hive = false)")
+    print("[hive] Scanning hive_metastore...")
+    inventory.extend(_discover_hive(config, explorer, now))
 
     print(f"\nTotal objects discovered: {len(inventory)}")
 

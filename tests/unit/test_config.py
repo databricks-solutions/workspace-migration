@@ -31,28 +31,6 @@ class TestMigrationConfig:
         assert config.migrate_hive_dbfs_root is False
         assert config.hive_dbfs_target_path == ""
         assert config.hive_target_catalog == "hive_upgraded"
-        # Scope defaults: UC only
-        assert config.include_uc is True
-        assert config.include_hive is False
-
-    def test_from_workspace_file_scope_block(self, tmp_path):
-        """The scope: block toggles include_uc / include_hive."""
-        path = _write(
-            tmp_path,
-            """
-source_workspace_url: https://src.azuredatabricks.net
-target_workspace_url: https://tgt.azuredatabricks.net
-spn_client_id: client-id
-spn_secret_scope: migration
-spn_secret_key: spn-secret
-scope:
-  include_uc: false
-  include_hive: true
-""",
-        )
-        config = MigrationConfig.from_workspace_file(str(path))
-        assert config.include_uc is False
-        assert config.include_hive is True
 
     def test_from_workspace_file_minimal(self, tmp_path):
         path = _write(
@@ -207,24 +185,6 @@ rls_cm_strategy: staging_copy
         )
         config = MigrationConfig.from_workspace_file(str(path))
         assert config.rls_cm_strategy == "staging_copy"
-
-    def test_scope_missing_defaults_uc_only(self, tmp_path):
-        """When scope block is missing, include_uc defaults True, include_hive False —
-        prevents accidental Hive enumeration on UC-only migrations.
-        """
-        path = _write(
-            tmp_path,
-            """
-source_workspace_url: https://src.azuredatabricks.net
-target_workspace_url: https://tgt.azuredatabricks.net
-spn_client_id: client-id
-spn_secret_scope: migration
-spn_secret_key: spn-secret
-""",
-        )
-        config = MigrationConfig.from_workspace_file(str(path))
-        assert config.include_uc is True
-        assert config.include_hive is False
 
     def test_batch_size_coerced_to_int(self, tmp_path):
         """YAML may deserialise ``batch_size: 100`` as int or str depending

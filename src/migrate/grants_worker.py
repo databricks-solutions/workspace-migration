@@ -121,9 +121,6 @@ def replay_grants(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping UC grants_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)

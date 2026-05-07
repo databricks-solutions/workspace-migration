@@ -21,7 +21,7 @@ migrations, account consolidations, or moving between Azure regions.
 
 **Legacy Hive Metastore**
 - Databases, managed + external tables, views, functions, grants
-- Separate workflow chain; toggleable via `scope.include_hive`
+- Migrated by the standalone `migrate_hive` job (run only when needed)
 
 ## Layout
 
@@ -96,8 +96,6 @@ databricks bundle deploy -t dev
 | `tracking_schema` | no | `cp_migration` | Schema under `tracking_catalog` for the tracking tables |
 | `dry_run` | no | `false` | Emit `skipped`/`dry_run` status rows; run no DDL against target |
 | `batch_size` | no | `50` | Max objects per batched for-each task (keeps payload under the 3000-byte Databricks Jobs limit) |
-| `scope.include_uc` | no | `true` | Discover + migrate UC objects |
-| `scope.include_hive` | no | `false` | Discover + migrate `hive_metastore` objects. Opt-in. |
 | `iceberg_strategy` | no | `""` | `""` skips Iceberg managed tables (marking `skipped_by_config`). `"ddl_replay"` opts into the Option A path — rebuild schema + re-ingest via `cp_migration_share`. Loses snapshot history / time travel / branches + tags. |
 | `rls_cm_strategy` | no | `""` | Managed tables carrying legacy row filter / column mask. `""` skips them (marking `skipped_by_rls_cm_policy`). `"staging_copy"` CTAS-copies each affected table into `<tracking_catalog>.cp_migration_staging`, shares the staging copy, DEEP CLONEs on target, then drops the staging copy. Source RLS/CM is never mutated. Requires the migration SPN to be a workspace admin and every active filter/mask to contain an admin-bypass call (`pre_check` enforces both). |
 | `on_target_collision` | no | `"fail"` | What to do when a discovered source object has the same FQN as an object already on target AND no `migration_status` row says the tool created it. `"fail"` (default) — pre_check emits a FAIL `check_target_collisions` row and the migrate workflow refuses to start; operator must rename / drop the colliding object and rerun pre_check. `"skip"` — pre_check emits a WARN row and seeds `skipped_target_exists` migration_status rows; workers skip those objects on the next migrate run (target copy left untouched). See [docs/idempotency_audit.md](docs/idempotency_audit.md#collision-handling-x4). |
@@ -113,7 +111,6 @@ databricks bundle deploy -t dev
    - `source_workspace_url` / `target_workspace_url`
    - `spn_client_id` + `spn_secret_scope`/`spn_secret_key` (OAuth service
      principal with access to both workspaces)
-   - `scope.include_uc` / `scope.include_hive`
    - optional: `catalog_filter`, `schema_filter`, `iceberg_strategy`,
      `migrate_hive_dbfs_root`, `hive_dbfs_target_path`
 3. `databricks bundle deploy -t dev --var migration_spn_id=<your-app-id>`
@@ -126,10 +123,52 @@ databricks bundle deploy -t dev
    by the tool. By default (`on_target_collision: fail`) this blocks
    step 7. Either rename / drop the colliding target objects, or flip
    `on_target_collision: skip` to proceed and leave them untouched.
-7. Run `migrate` to replay on target
+7. Run the `migrate_*` jobs to replay on target — see the
+   [Operator flow](#operator-flow) section below for the 4-job model
+   and ordering.
 
 To change values later, edit your local `config.yaml` and redeploy —
 **don't edit the workspace copy** (it's a mirror and gets overwritten).
+
+### Operator flow
+
+The migration tool ships four production jobs. Run them in this order:
+
+1. **`discovery`** — scans the source workspace and writes
+   `discovery_inventory`. The `migrate_*` jobs depend on it
+   operationally; run discovery first.
+2. **`migrate_uc`** — UC data plane migration: managed/external tables,
+   views, volumes, models, online tables, plus UC grants. Runs
+   `setup_sharing` → `orchestrator` → workers → `cleanup_staging` →
+   `summary_uc`.
+3. **`migrate_hive`** — Hive (legacy) data plane migration:
+   external/managed tables, functions, views, plus Hive ACLs replayed
+   as UC grants on the target catalog.
+4. **`migrate_governance`** — fine-grained governance: tags, comments,
+   row filters, column masks, customer-defined shares, policies,
+   monitors, foreign catalogs, connections.
+
+Each `migrate_*` job is independent and standalone-runnable. They
+assume `discovery_inventory` has been populated by an earlier
+`discovery` run.
+
+#### Standalone-runnable contract
+
+`migrate_governance` runs standalone (per design Q1 in
+[docs/workflow_split_design.md](docs/workflow_split_design.md)). It
+assumes target catalog/schema/table/view/volume objects already exist
+on target. **Do NOT** run `migrate_governance` against an empty
+target — it will write governance state for objects that don't exist.
+
+The `migrate_governance` job's first task `pre_check_governance`
+validates only that `discovery_inventory` has governance rows. It
+does **not** validate target objects.
+
+#### Pre-conditions
+
+For Path A `staging_copy` strategy (recommended for RLS/CM tables),
+see the [Row filter / column mask on managed tables](#row-filter--column-mask-on-managed-tables)
+section below.
 
 ### Running the integration tests
 
@@ -145,17 +184,20 @@ environment-specific fields **once** after deploy.
      (the SPN needs `READ_FILES` + `WRITE_FILES` +
      `CREATE_EXTERNAL_TABLE` on the corresponding external location)
 3. Trigger `uc_integration_test` — the first task (`setup_test_config`)
-   rewrites the workspace config.yaml with UC-appropriate toggles
-   (`include_uc=true`, `include_hive=false`, `iceberg_strategy=ddl_replay`),
-   runs seed → pre_check → discovery → migrate → test, and `teardown_uc`
-   restores the original config.yaml from the backup.
+   rewrites the workspace config.yaml with UC-appropriate behavioural
+   settings (`iceberg_strategy=ddl_replay`), runs
+   seed → pre_check → discovery → `migrate_uc` → test, and
+   `teardown_uc` restores the original config.yaml from the backup.
 4. Trigger `hive_integration_test` — same pattern, with Hive-appropriate
-   toggles (`include_hive=true`, `migrate_hive_dbfs_root=true`,
-   `iceberg_strategy=""`). Your operator-set `hive_dbfs_target_path`
-   from step 2 is preserved — workflows don't overwrite env-specific
-   paths, only the behavioral toggles.
+   settings (`migrate_hive_dbfs_root=true`, `iceberg_strategy=""`),
+   running seed → pre_check → discovery → `migrate_hive` → test. Your
+   operator-set `hive_dbfs_target_path` from step 2 is preserved —
+   workflows don't overwrite env-specific paths, only the behavioural
+   settings.
+5. Trigger `governance_integration_test` — exercises the standalone
+   `migrate_governance` job against fixtures pre-seeded on target.
 
-The per-workflow toggles live in each workflow's YAML task parameters;
+The per-workflow settings live in each workflow's YAML task parameters;
 edit them there if you need to change test behavior.
 
 See [docs/external_hive_metastore.md](docs/external_hive_metastore.md) for
@@ -245,11 +287,11 @@ depending on whether a prior migration created it).
    staging FQN to `cp_migration_share`, and `managed_table_worker`
    DEEP CLONEs the staging table on target. Source RLS/CM is **never**
    mutated — there is no maintenance window in which the source is
-   unprotected. After migrate completes, the `cleanup_staging` task
-   (gated on `run_if: ALL_DONE` in `migrate_workflow.yml`) drops the
-   staging tables. On target: `row_filters_worker` /
-   `column_masks_worker` apply the filter / mask from
-   `discovery_inventory` as usual.
+   unprotected. After `migrate_uc` completes, the `cleanup_staging`
+   task (gated on `run_if: ALL_DONE` inside `migrate_uc_workflow.yml`)
+   drops the staging tables. The filter / mask itself is reapplied on
+   target by `migrate_governance` (`row_filters_worker` /
+   `column_masks_worker`) reading from `discovery_inventory`.
 
    **Pre-conditions** (both enforced by `pre_check`):
 

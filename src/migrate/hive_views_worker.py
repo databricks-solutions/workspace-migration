@@ -150,9 +150,6 @@ def migrate_hive_view(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_hive:
-        logger.info("Skipping hive_views_worker: scope.include_hive=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

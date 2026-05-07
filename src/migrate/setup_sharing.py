@@ -309,9 +309,6 @@ def _validate_rls_cm_strategy(config: MigrationConfig) -> str:
 def run(dbutils, spark) -> None:  # noqa: ARG001
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping setup_sharing: scope.include_uc=false.")
-        return
     # Validate config-gated flags BEFORE any side effects so operator errors
     # (bad rls_cm_strategy value) don't leave orphan shares / recipients.
     strategy = _validate_rls_cm_strategy(config)

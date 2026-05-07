@@ -7,4 +7,4 @@ resources:
       tasks:
         - task_key: discovery
           notebook_task:
-            notebook_path: ../src/discovery/discovery.py
+            notebook_path: ../../src/discovery/discovery.py

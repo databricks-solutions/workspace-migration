@@ -399,7 +399,6 @@ class TestRunSkipsRlsCmTables:
 
         config = MagicMock()
         config.dry_run = False
-        config.include_uc = True
         config.rls_cm_strategy = ""
 
         auth = MagicMock()
@@ -516,7 +515,6 @@ class TestStagingCopyFlow:
     def _config(self) -> MagicMock:
         config = MagicMock()
         config.rls_cm_strategy = "staging_copy"
-        config.include_uc = True
         config.dry_run = False
         config.tracking_catalog = "tcat"
         config.current_run_id = "run-abc"

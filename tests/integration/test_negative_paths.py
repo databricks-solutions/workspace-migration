@@ -23,8 +23,7 @@ except NameError:
 #
 #   X.3.1  invalid spn_client_id               -> pre_check fails (auth error)
 #   X.3.2  unreachable target_workspace_url    -> pre_check fails (target error)
-#   X.3.3  include_uc=false AND include_hive=false
-#                                             -> discovery / migrate succeed as no-op
+#   X.3.3  no discoverable source objects      -> discovery / migrate succeed as no-op
 #
 # This single assertion notebook is run once per scenario (``run_if:
 # ALL_DONE`` so it runs even when the preceding task fails). The
@@ -145,11 +144,14 @@ elif scenario == "X.3.2":
     # errors. pre_check still raises "Pre-check failed: ... FAIL".
     _assert_failed_with(("pre-check failed", "check_target_auth", "check_target_metastore"))
 elif scenario == "X.3.3":
-    # Both scopes false: migrate workflow's setup_sharing short-circuits
-    # (``include_uc=false``), orchestrator publishes empty task values,
-    # for_each workers receive empty batches (no-op), summary succeeds.
-    # The trigger task here is the migrate run_job_task — it should
-    # SUCCEED.
+    # Empty discovery: nothing seeded for the negative-paths run, so
+    # discovery emits an empty inventory; the orchestrator publishes
+    # empty task values; for_each workers receive empty batches (no-op);
+    # summary succeeds. The trigger task here is the migrate run_job_task
+    # — it should SUCCEED. (Pre-WS-10 this scenario was triggered by
+    # ``include_uc=false AND include_hive=false`` short-circuiting
+    # setup_sharing; semantics retained for backwards-compat coverage of
+    # the empty-batch path.)
     _assert_succeeded_as_noop()
 else:
     raise ValueError(f"Unknown scenario: {scenario!r}")

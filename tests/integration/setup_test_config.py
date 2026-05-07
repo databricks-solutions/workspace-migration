@@ -16,8 +16,6 @@
 # workflows themselves carry the test-specific behavior flags.
 #
 # Parameters consumed (all strings; "true"/"false" for booleans):
-#   include_uc               — scope.include_uc
-#   include_hive             — scope.include_hive
 #   iceberg_strategy         — "" or "ddl_replay"
 #   rls_cm_strategy          — "" (skip) or "staging_copy".
 #   migrate_hive_dbfs_root   — "true" / "false"
@@ -104,8 +102,6 @@ else:
 
 # COMMAND ----------
 
-dbutils.widgets.text("include_uc", "true")  # noqa: F821
-dbutils.widgets.text("include_hive", "false")  # noqa: F821
 dbutils.widgets.text("iceberg_strategy", "")  # noqa: F821
 dbutils.widgets.text("rls_cm_strategy", "")  # noqa: F821
 dbutils.widgets.text("migrate_hive_dbfs_root", "false")  # noqa: F821
@@ -126,8 +122,6 @@ def _get_str(key: str, default: str = "") -> str:
     return str(dbutils.widgets.get(key) or default).strip()  # type: ignore[name-defined]  # noqa: F821
 
 
-include_uc = _get_bool("include_uc", "true")
-include_hive = _get_bool("include_hive", "false")
 iceberg_strategy = _get_str("iceberg_strategy", "")
 rls_cm_strategy = _get_str("rls_cm_strategy", "")
 migrate_hive_dbfs_root = _get_bool("migrate_hive_dbfs_root", "false")
@@ -154,8 +148,6 @@ with open(config_path) as f:
 
 cfg = apply_integration_overrides(
     baseline_cfg,
-    include_uc=include_uc,
-    include_hive=include_hive,
     iceberg_strategy=iceberg_strategy,
     rls_cm_strategy=rls_cm_strategy,
     migrate_hive_dbfs_root=migrate_hive_dbfs_root,
@@ -175,8 +167,6 @@ with open(config_path, "w") as f:
 
 print(
     f"Overrode {config_path} for this integration test run:\n"
-    f"  scope.include_uc         = {include_uc}\n"
-    f"  scope.include_hive       = {include_hive}\n"
     f"  iceberg_strategy         = {iceberg_strategy!r}\n"
     f"  rls_cm_strategy          = {rls_cm_strategy!r}\n"
     f"  migrate_hive_dbfs_root   = {migrate_hive_dbfs_root}\n"

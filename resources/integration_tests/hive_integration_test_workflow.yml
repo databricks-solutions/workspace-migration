@@ -8,17 +8,14 @@ resources:
       tasks:
         - task_key: setup_test_config
           notebook_task:
-            notebook_path: ../tests/integration/setup_test_config.py
-            # Hive integration test: UC on (setup_sharing still runs for UC
-            # orchestrator), Hive on, DBFS-root migration on. iceberg_strategy
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # Hive integration test: DBFS-root migration on. iceberg_strategy
             # stays empty — no Iceberg fixture on the Hive side.
             # hive_dbfs_target_path is left empty so the operator-configured
             # value in the workspace config.yaml (set once after deploy) is
             # preserved — avoids baking an env-specific ADLS URL into the
             # repo.
             base_parameters:
-              include_uc: "true"
-              include_hive: "true"
               iceberg_strategy: ""
               rls_cm_strategy: ""
               migrate_hive_dbfs_root: "true"
@@ -42,31 +39,31 @@ resources:
           depends_on:
             - task_key: setup_test_config
           notebook_task:
-            notebook_path: ../tests/integration/seed_hive_test_data.py
+            notebook_path: ../../tests/integration/seed_hive_test_data.py
 
         - task_key: pre_check
           depends_on:
             - task_key: seed_hive
           notebook_task:
-            notebook_path: ../src/pre_check/pre_check.py
+            notebook_path: ../../src/pre_check/pre_check.py
 
         - task_key: discovery
           depends_on:
             - task_key: pre_check
           notebook_task:
-            notebook_path: ../src/discovery/discovery.py
+            notebook_path: ../../src/discovery/discovery.py
 
-        - task_key: migrate
+        - task_key: migrate_hive
           depends_on:
             - task_key: discovery
           run_job_task:
-            job_id: ${resources.jobs.migrate.id}
+            job_id: ${resources.jobs.migrate_hive.id}
 
         - task_key: test_hive
           depends_on:
-            - task_key: migrate
+            - task_key: migrate_hive
           notebook_task:
-            notebook_path: ../tests/integration/test_hive_end_to_end.py
+            notebook_path: ../../tests/integration/test_hive_end_to_end.py
 
         - task_key: teardown_hive
           depends_on:
@@ -74,8 +71,8 @@ resources:
             - task_key: seed_hive
             - task_key: pre_check
             - task_key: discovery
-            - task_key: migrate
+            - task_key: migrate_hive
             - task_key: test_hive
           run_if: ALL_DONE
           notebook_task:
-            notebook_path: ../tests/integration/teardown_hive.py
+            notebook_path: ../../tests/integration/teardown_hive.py

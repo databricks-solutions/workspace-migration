@@ -89,9 +89,6 @@ def apply_foreign_catalog(fc: dict, *, auth: AuthManager, dry_run: bool) -> dict
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping foreign_catalogs_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

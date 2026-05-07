@@ -1,0 +1,61 @@
+resources:
+  jobs:
+    governance_integration_test:
+      name: "${var.job_prefix}-governance-integration-test"
+      description: |
+        Governance workflow integration test: pre-seeds target via direct
+        SQL (no UC test dependency, per design D3), seeds source RLS/CM/
+        tag fixtures, runs migrate_governance only, asserts governance
+        state. Path A staging_copy is enabled because some governance
+        tests touch tables that have RLS/CM.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            base_parameters:
+              # Path A staging_copy stays on (some governance tests touch RLS/CM tables)
+              rls_cm_strategy: "staging_copy"
+
+        - task_key: seed_uc
+          depends_on:
+            - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_uc_test_data.py
+
+        - task_key: seed_governance_target
+          depends_on:
+            - task_key: seed_uc
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_governance_target_state.py
+
+        - task_key: discovery
+          depends_on:
+            - task_key: seed_governance_target
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+
+        - task_key: migrate_governance
+          depends_on:
+            - task_key: discovery
+          run_job_task:
+            job_id: "${resources.jobs.migrate_governance.id}"
+
+        - task_key: test_governance
+          depends_on:
+            - task_key: migrate_governance
+          notebook_task:
+            notebook_path: ../../tests/integration/test_governance_end_to_end.py
+
+        - task_key: teardown_governance
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: setup_test_config
+            - task_key: seed_uc
+            - task_key: seed_governance_target
+            - task_key: discovery
+            - task_key: migrate_governance
+            - task_key: test_governance
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_uc.py

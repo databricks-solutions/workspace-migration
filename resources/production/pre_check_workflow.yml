@@ -7,4 +7,4 @@ resources:
       tasks:
         - task_key: pre_check
           notebook_task:
-            notebook_path: ../src/pre_check/pre_check.py
+            notebook_path: ../../src/pre_check/pre_check.py

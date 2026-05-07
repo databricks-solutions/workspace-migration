@@ -305,9 +305,6 @@ def _parse(rows: list[dict]) -> list[dict]:
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping sharing_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
     wh_id = find_warehouse(auth)
