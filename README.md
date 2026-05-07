@@ -99,8 +99,7 @@ databricks bundle deploy -t dev
 | `scope.include_uc` | no | `true` | Discover + migrate UC objects |
 | `scope.include_hive` | no | `false` | Discover + migrate `hive_metastore` objects. Opt-in. |
 | `iceberg_strategy` | no | `""` | `""` skips Iceberg managed tables (marking `skipped_by_config`). `"ddl_replay"` opts into the Option A path — rebuild schema + re-ingest via `cp_migration_share`. Loses snapshot history / time travel / branches + tags. |
-| `rls_cm_strategy` | no | `""` | Managed tables carrying legacy row filter / column mask. `""` skips them (marking `skipped_by_rls_cm_policy`). `"drop_and_restore"` temporarily drops the RLS/CM on source, DEEP CLONEs via the share, and re-applies after — requires `rls_cm_maintenance_window_confirmed=true`. |
-| `rls_cm_maintenance_window_confirmed` | conditional | `false` | Operator consent gate for `rls_cm_strategy='drop_and_restore'`. Must be `true` to opt in — the strategy exposes the source table to unfiltered/unmasked reads during each DEEP CLONE. Only appropriate for maintenance-window migrations. |
+| `rls_cm_strategy` | no | `""` | Managed tables carrying legacy row filter / column mask. `""` skips them (marking `skipped_by_rls_cm_policy`). `"staging_copy"` CTAS-copies each affected table into `<tracking_catalog>.cp_migration_staging`, shares the staging copy, DEEP CLONEs on target, then drops the staging copy. Source RLS/CM is never mutated. Requires the migration SPN to be a workspace admin and every active filter/mask to contain an admin-bypass call (`pre_check` enforces both). |
 | `on_target_collision` | no | `"fail"` | What to do when a discovered source object has the same FQN as an object already on target AND no `migration_status` row says the tool created it. `"fail"` (default) — pre_check emits a FAIL `check_target_collisions` row and the migrate workflow refuses to start; operator must rename / drop the colliding object and rerun pre_check. `"skip"` — pre_check emits a WARN row and seeds `skipped_target_exists` migration_status rows; workers skip those objects on the next migrate run (target copy left untouched). See [docs/idempotency_audit.md](docs/idempotency_audit.md#collision-handling-x4). |
 | `migrate_hive_dbfs_root` | no | `false` | Enables `hive_managed_dbfs_worker` — copies DBFS-root bytes to `hive_dbfs_target_path` and registers the target table as EXTERNAL |
 | `hive_dbfs_target_path` | conditional | `""` | ADLS/S3/GCS path where DBFS-root bytes land on target. Required when `migrate_hive_dbfs_root=true`. The SPN needs `READ_FILES`/`WRITE_FILES`/`CREATE_EXTERNAL_TABLE` on the external location that owns this path. |
@@ -239,35 +238,34 @@ depending on whether a prior migration created it).
    means after the migration (e.g. point queries at source during
    cutover, or rebuild from upstream).
 
-3. **Opt into `rls_cm_strategy: drop_and_restore`** with
-   `rls_cm_maintenance_window_confirmed: true`. The flow:
-   - `setup_sharing` captures the current RLS/CM definition (row filter
-     function + input columns; per-column mask functions + using columns)
-     into `rls_cm_manifest`, then `ALTER TABLE ... DROP ROW FILTER` /
-     `DROP MASK` on source.
-   - The table enters `cp_migration_share` like any normal table and
-     `managed_table_worker` DEEP CLONEs it to target.
-   - After all DEEP CLONEs finish, the new `restore_rls_cm` task
-     re-applies the saved definitions on source and stamps
-     `restored_at` in the manifest. Runs with `ALL_DONE` so source is
-     restored even when an upstream clone failed.
-   - On target: `row_filters_worker` / `column_masks_worker` apply the
-     filter/mask from `discovery_inventory` as usual.
+3. **Opt into `rls_cm_strategy: staging_copy`** (Path A). For each
+   affected table, the tool creates a staging copy in
+   `<tracking_catalog>.cp_migration_staging.stg_<sha12>` via
+   `CREATE OR REPLACE TABLE ... AS SELECT * FROM <original>`, adds the
+   staging FQN to `cp_migration_share`, and `managed_table_worker`
+   DEEP CLONEs the staging table on target. Source RLS/CM is **never**
+   mutated — there is no maintenance window in which the source is
+   unprotected. After migrate completes, the `cleanup_staging` task
+   (gated on `run_if: ALL_DONE` in `migrate_workflow.yml`) drops the
+   staging tables. On target: `row_filters_worker` /
+   `column_masks_worker` apply the filter / mask from
+   `discovery_inventory` as usual.
 
-   **Risk**: between the source drop and the source restore, the table
-   is unprotected. Any concurrent reader on source sees unfiltered,
-   unmasked data. Window ≈ total migrate wall-clock per table (in
-   parallel). Only appropriate for maintenance-window migrations —
-   hence the `rls_cm_maintenance_window_confirmed` consent gate.
+   **Pre-conditions** (both enforced by `pre_check`):
 
-   **Crash recovery**: if the migration crashes between strip and
-   restore, the next `setup_sharing` invocation scans
-   `rls_cm_manifest` for rows with `restored_at IS NULL`, re-applies
-   those policies **before** processing any new tables, and stamps the
-   manifest. A restore that itself fails records `restore_failed_at` +
-   `restore_error` on that row for manual follow-up; the loop
-   continues with the next table — one bad table doesn't block
-   healing the rest.
+   - The migration SPN **must be a workspace admin** on the source
+     workspace. The CTAS into staging reads through the source's row
+     filter; without admin status, the SPN gets filtered data and the
+     staging copy is incomplete.
+   - **Every active row filter / column mask function body must
+     contain an admin-bypass call** — one of `is_account_group_member(`,
+     `is_member(`, or `is_user_in_group(`. Without this, even an admin
+     SPN's CTAS returns filtered data.
+
+   `pre_check` validates both invariants before any side-effecting
+   work. If either fails, `staging_copy` is rejected and the operator
+   must either grant admin status / add the bypass clause, or fall
+   back to skip / ABAC.
 
 ## Architecture
 
