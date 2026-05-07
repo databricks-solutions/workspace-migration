@@ -34,8 +34,6 @@ from typing import Any
 def apply_integration_overrides(
     baseline_cfg: dict,
     *,
-    include_uc: bool,
-    include_hive: bool,
     iceberg_strategy: str,
     rls_cm_strategy: str,
     migrate_hive_dbfs_root: bool,
@@ -53,9 +51,6 @@ def apply_integration_overrides(
     """
     cfg = copy.deepcopy(baseline_cfg) if baseline_cfg else {}
 
-    scope = cfg.setdefault("scope", {})
-    scope["include_uc"] = include_uc
-    scope["include_hive"] = include_hive
     cfg["iceberg_strategy"] = iceberg_strategy
     cfg["rls_cm_strategy"] = rls_cm_strategy
     cfg["migrate_hive_dbfs_root"] = migrate_hive_dbfs_root

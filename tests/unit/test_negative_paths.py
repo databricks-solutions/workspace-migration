@@ -170,10 +170,3 @@ class TestNegativePathWorkflowShape:
             == "true"
         )
 
-    def test_x33_sets_both_scopes_false(self):
-        data = _workflow_yaml()
-        tasks = data["resources"]["jobs"]["negative_paths_integration_test"]["tasks"]
-        by_key = {t["task_key"]: t for t in tasks}
-        params = by_key["setup_X33_config"]["notebook_task"]["base_parameters"]
-        assert params["include_uc"] == "false"
-        assert params["include_hive"] == "false"

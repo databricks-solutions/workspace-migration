@@ -41,7 +41,6 @@ def _baseline_config() -> dict:
         "spn_client_id": "REPLACE_WITH_APPLICATION_ID",
         "spn_secret_scope": "migration",
         "spn_secret_key": "spn-secret",
-        "scope": {"include_uc": True, "include_hive": False},
         "catalog_filter": "",
         "schema_filter": "",
         "dry_run": False,
@@ -62,8 +61,6 @@ def _baseline_config() -> dict:
 # ``TestWorkflowOverrideContractsMatchYaml`` suite will fail loudly.
 # ---------------------------------------------------------------
 UC_OVERRIDES = dict(
-    include_uc=True,
-    include_hive=False,
     iceberg_strategy="ddl_replay",
     rls_cm_strategy="staging_copy",
     migrate_hive_dbfs_root=False,
@@ -73,8 +70,6 @@ UC_OVERRIDES = dict(
 )
 
 HIVE_OVERRIDES = dict(
-    include_uc=True,
-    include_hive=True,
     iceberg_strategy="",
     rls_cm_strategy="",
     migrate_hive_dbfs_root=True,
@@ -84,8 +79,6 @@ HIVE_OVERRIDES = dict(
 )
 
 NEG_X31_OVERRIDES = dict(
-    include_uc=True,
-    include_hive=False,
     iceberg_strategy="",
     rls_cm_strategy="",
     migrate_hive_dbfs_root=False,
@@ -213,7 +206,6 @@ class TestApplyIntegrationOverridesBehavior:
 
     def test_uc_overrides_shape(self):
         cfg = apply_integration_overrides(_baseline_config(), **UC_OVERRIDES)
-        assert cfg["scope"] == {"include_uc": True, "include_hive": False}
         assert cfg["iceberg_strategy"] == "ddl_replay"
         assert cfg["rls_cm_strategy"] == "staging_copy"
         assert cfg["migrate_hive_dbfs_root"] is False
@@ -225,7 +217,6 @@ class TestApplyIntegrationOverridesBehavior:
 
     def test_hive_overrides_shape(self):
         cfg = apply_integration_overrides(_baseline_config(), **HIVE_OVERRIDES)
-        assert cfg["scope"] == {"include_uc": True, "include_hive": True}
         assert cfg["iceberg_strategy"] == ""
         assert cfg["rls_cm_strategy"] == ""
         assert cfg["migrate_hive_dbfs_root"] is True
@@ -238,13 +229,11 @@ class TestApplyIntegrationOverridesBehavior:
         reused for the next scenario in a chain."""
         baseline = _baseline_config()
         snapshot = {
-            "scope": dict(baseline["scope"]),
             "batch_size": baseline["batch_size"],
             "catalog_filter": baseline["catalog_filter"],
             "rls_cm_strategy": baseline["rls_cm_strategy"],
         }
         _ = apply_integration_overrides(baseline, **UC_OVERRIDES)
-        assert baseline["scope"] == snapshot["scope"]
         assert baseline["batch_size"] == snapshot["batch_size"]
         assert baseline["catalog_filter"] == snapshot["catalog_filter"]
         assert baseline["rls_cm_strategy"] == snapshot["rls_cm_strategy"]
@@ -317,7 +306,6 @@ class TestOverrideCycleCleanSlate:
         assert hive_cfg["batch_size"] == 10
         assert hive_cfg["catalog_filter"] == ["integration_test_src"]
         assert hive_cfg["migrate_hive_dbfs_root"] is True
-        assert hive_cfg["scope"] == {"include_uc": True, "include_hive": True}
 
     def test_hive_then_uc_clean_slate(self):
         """Reverse order also clean — Hive-only ``batch_size=10`` and
@@ -356,8 +344,6 @@ class TestOverrideCycleCleanSlate:
         # X.3.1 — bad SPN.
         x31 = apply_integration_overrides(
             baseline,
-            include_uc=True,
-            include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
@@ -376,8 +362,6 @@ class TestOverrideCycleCleanSlate:
         # X.3.2 — unreachable target.
         x32 = apply_integration_overrides(
             baseline,
-            include_uc=True,
-            include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
@@ -395,11 +379,11 @@ class TestOverrideCycleCleanSlate:
         )
         assert x32["target_workspace_url"] == "https://adb-0000000000000000.0.azuredatabricks.net"
 
-        # X.3.3 — both scopes off, no injection.
+        # X.3.3 — no injection (used to assert both scopes off, but
+        # scope flags were dropped in WS-10/WS-11; workflow choice now
+        # gates scope, not config).
         x33 = apply_integration_overrides(
             baseline,
-            include_uc=False,
-            include_hive=False,
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
@@ -407,7 +391,6 @@ class TestOverrideCycleCleanSlate:
             batch_size_raw="",
             catalog_filter_raw="",
         )
-        assert x33["scope"] == {"include_uc": False, "include_hive": False}
         # Must not carry prior scenarios' corruptions.
         assert x33["spn_client_id"] == "REPLACE_WITH_APPLICATION_ID"
         assert x33["target_workspace_url"] == "https://adb-TARGET.azuredatabricks.net"
@@ -480,8 +463,6 @@ class TestWorkflowOverrideContractsMatchYaml:
         # Subset check: the test overrides must faithfully reflect the
         # YAML's scope-affecting params. We don't require exact equality
         # because the YAML also carries ``migrate_hive_dbfs_root`` etc.
-        assert params.get("include_uc") == "true"
-        assert params.get("include_hive") == "false"
         assert params.get("iceberg_strategy") == "ddl_replay"
         assert params.get("rls_cm_strategy") == "staging_copy"
         # Path A removed the maintenance-window consent flag.
@@ -496,8 +477,6 @@ class TestWorkflowOverrideContractsMatchYaml:
         params = self._read_workflow_params(
             "hive_integration_test_workflow.yml", "setup_test_config"
         )
-        assert params.get("include_uc") == "true"
-        assert params.get("include_hive") == "true"
         assert params.get("iceberg_strategy") == ""
         assert params.get("rls_cm_strategy") == ""
         assert params.get("migrate_hive_dbfs_root") == "true"
