@@ -165,3 +165,93 @@ class TestCommentsWorkerErrorSuppression:
         assert results == []
 
 
+class TestCommentsWorkerBatching:
+    """M7: ``run()`` issues at most one info_schema query per
+    (catalog, schema) per info_schema view, not one per object."""
+
+    def _fake_row(self, **kw):
+        r = MagicMock()
+        for k, v in kw.items():
+            setattr(r, k, v)
+        return r
+
+    def _make_collectable(self, rows):
+        m = MagicMock()
+        m.collect.return_value = rows
+        return m
+
+    def test_run_batches_info_schema_by_schema(self, monkeypatch):
+        """With 2 non-Delta tables in (c1, s1), expect 1 columns query and
+        1 tables query against c1.information_schema, not 2 of each."""
+        from migrate import comments_worker
+
+        issued: list[str] = []
+
+        def fake_sql(text):
+            issued.append(text)
+            if "discovery_inventory" in text and "DISTINCT catalog_name " in text and "schema_name" not in text:
+                return self._make_collectable([self._fake_row(catalog_name="c1")])
+            if "discovery_inventory" in text and "DISTINCT catalog_name, schema_name" in text:
+                return self._make_collectable([
+                    self._fake_row(catalog_name="c1", schema_name="s1"),
+                ])
+            if "discovery_inventory" in text and "lower(format) <> 'delta'" in text:
+                return self._make_collectable([
+                    self._fake_row(object_name="`c1`.`s1`.`t1`", format="parquet"),
+                    self._fake_row(object_name="`c1`.`s1`.`t2`", format="parquet"),
+                ])
+            if "discovery_inventory" in text and "object_type IN ('external_table','managed_table')" in text:
+                return self._make_collectable([
+                    self._fake_row(object_name="`c1`.`s1`.`t1`"),
+                    self._fake_row(object_name="`c1`.`s1`.`t2`"),
+                ])
+            if "discovery_inventory" in text and "object_type = 'volume'" in text:
+                return self._make_collectable([])
+            if "information_schema.catalogs" in text:
+                return self._make_collectable([self._fake_row(comment=None)])
+            if "information_schema.schemata" in text:
+                return self._make_collectable([self._fake_row(comment=None)])
+            if "information_schema.tables" in text:
+                return self._make_collectable([])
+            if "information_schema.columns" in text:
+                return self._make_collectable([])
+            if "information_schema.volumes" in text:
+                return self._make_collectable([])
+            return self._make_collectable([])
+
+        spark = MagicMock()
+        spark.sql.side_effect = fake_sql
+        dbutils = MagicMock()
+
+        fake_config = MagicMock(
+            tracking_catalog="t",
+            tracking_schema="ts",
+            dry_run=True,
+        )
+        monkeypatch.setattr(
+            comments_worker.MigrationConfig,
+            "from_workspace_file",
+            classmethod(lambda cls: fake_config),
+        )
+        monkeypatch.setattr(comments_worker, "AuthManager", MagicMock())
+        monkeypatch.setattr(comments_worker, "TrackingManager", MagicMock())
+        monkeypatch.setattr(comments_worker, "find_warehouse", lambda auth: "wh1")
+
+        comments_worker.run(dbutils, spark)
+
+        columns_qs = [q for q in issued if "information_schema.columns" in q]
+        tables_qs = [q for q in issued if "information_schema.tables" in q]
+        volumes_qs = [q for q in issued if "information_schema.volumes" in q]
+
+        assert len(columns_qs) == 1, (
+            f"expected 1 batched columns query per schema, got {len(columns_qs)}: {columns_qs}"
+        )
+        assert len(tables_qs) == 1, (
+            f"expected 1 batched tables query per schema, got {len(tables_qs)}: {tables_qs}"
+        )
+        # Volumes query fires per schema regardless of how many volumes —
+        # the schema in this fixture has zero volumes, but the batched
+        # SELECT still runs.
+        assert len(volumes_qs) == 1
+
+

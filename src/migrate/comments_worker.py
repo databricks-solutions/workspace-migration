@@ -121,18 +121,24 @@ def run(dbutils, spark) -> None:
     # Re-read from source information_schema at migrate time.
     # Comments on catalogs + schemas: always.
     # Comments on non-Delta tables: only those need explicit replay.
+    #
+    # Batches information_schema queries by (catalog, schema) instead of
+    # per-object — at 100k tables this is ~100x fewer queries (one per
+    # schema for each info_schema view, vs one per table). See review M7.
     results: list[dict] = []
+    inv_fqn = f"{config.tracking_catalog}.{config.tracking_schema}.discovery_inventory"
 
+    # ---- Catalog comments (one query per catalog; N is small) ----
     cat_rows = spark.sql(
-        f"SELECT DISTINCT catalog_name "
-        f"FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
+        f"SELECT DISTINCT catalog_name FROM {inv_fqn} "
         f"WHERE source_type = 'uc' AND catalog_name IS NOT NULL"
     ).collect()
 
     for row in cat_rows:
         with _SuppressLog(results, row.catalog_name, "CATALOG"):
             comment_rows = spark.sql(
-                f"SELECT comment FROM system.information_schema.catalogs WHERE catalog_name = '{row.catalog_name}'"
+                f"SELECT comment FROM system.information_schema.catalogs "
+                f"WHERE catalog_name = '{_escape(row.catalog_name)}'"
             ).collect()
             if comment_rows and comment_rows[0].comment:
                 results.append(
@@ -146,124 +152,126 @@ def run(dbutils, spark) -> None:
                     )
                 )
 
-    sch_rows = spark.sql(
-        f"SELECT DISTINCT catalog_name, schema_name "
-        f"FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
-        f"WHERE source_type = 'uc' AND catalog_name IS NOT NULL AND schema_name IS NOT NULL"
+    # ---- Build per-(catalog, schema) lookups from discovery_inventory ----
+    non_delta_set: set[tuple[str, str, str]] = set()
+    for row in spark.sql(
+        f"SELECT object_name, format FROM {inv_fqn} "
+        f"WHERE source_type = 'uc' "
+        f"AND object_type IN ('external_table','managed_table') "
+        f"AND (format IS NULL OR lower(format) <> 'delta')"
+    ).collect():
+        parts = row.object_name.strip("`").split("`.`")
+        if len(parts) == 3:
+            non_delta_set.add((parts[0], parts[1], parts[2]))
+
+    all_tables_set: set[tuple[str, str, str]] = set()
+    for row in spark.sql(
+        f"SELECT object_name FROM {inv_fqn} "
+        f"WHERE source_type = 'uc' "
+        f"AND object_type IN ('external_table','managed_table')"
+    ).collect():
+        parts = row.object_name.strip("`").split("`.`")
+        if len(parts) == 3:
+            all_tables_set.add((parts[0], parts[1], parts[2]))
+
+    volume_set: set[tuple[str, str, str]] = set()
+    for row in spark.sql(
+        f"SELECT object_name FROM {inv_fqn} "
+        f"WHERE source_type = 'uc' AND object_type = 'volume'"
+    ).collect():
+        parts = row.object_name.strip("`").split("`.`")
+        if len(parts) == 3:
+            volume_set.add((parts[0], parts[1], parts[2]))
+
+    # ---- One info_schema query per (catalog, schema) for each comment kind ----
+    sch_pairs = spark.sql(
+        f"SELECT DISTINCT catalog_name, schema_name FROM {inv_fqn} "
+        f"WHERE source_type = 'uc' "
+        f"AND catalog_name IS NOT NULL AND schema_name IS NOT NULL"
     ).collect()
 
-    for row in sch_rows:
-        with _SuppressLog(results, f"{row.catalog_name}.{row.schema_name}", "SCHEMA"):
-            comment_rows = spark.sql(
-                f"SELECT comment FROM `{row.catalog_name}`.information_schema.schemata "
-                f"WHERE schema_name = '{row.schema_name}'"
+    for pair in sch_pairs:
+        cat, sch = pair.catalog_name, pair.schema_name
+
+        # 1) Schema comment
+        with _SuppressLog(results, f"{cat}.{sch}", "SCHEMA"):
+            sch_meta = spark.sql(
+                f"SELECT comment FROM `{cat}`.information_schema.schemata "
+                f"WHERE schema_name = '{_escape(sch)}'"
             ).collect()
-            if comment_rows and comment_rows[0].comment:
+            if sch_meta and sch_meta[0].comment:
                 results.append(
                     _emit_comment(
                         "SCHEMA",
-                        f"`{row.catalog_name}`.`{row.schema_name}`",
-                        comment_rows[0].comment,
+                        f"`{cat}`.`{sch}`",
+                        sch_meta[0].comment,
                         auth=auth,
                         wh_id=wh_id,
                         dry_run=config.dry_run,
                     )
                 )
 
-    # Non-Delta tables — TBLPROPERTIES + COMMENT ON TABLE
-    non_delta = spark.sql(
-        f"SELECT object_name, format FROM "
-        f"{config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
-        f"WHERE source_type = 'uc' AND object_type IN ('external_table','managed_table') "
-        f"AND (format IS NULL OR lower(format) <> 'delta')"
-    ).collect()
-    for row in non_delta:
-        with _SuppressLog(results, row.object_name, "TABLE"):
-            # COMMENT ON TABLE is replayed from DESCRIBE TABLE EXTENDED;
-            # information_schema.tables.comment covers this too.
-            parts = row.object_name.strip("`").split("`.`")
-            if len(parts) == 3:
-                catalog, schema, name = parts
-                tbl_meta = spark.sql(
-                    f"SELECT comment FROM `{catalog}`.information_schema.tables "
-                    f"WHERE table_schema='{schema}' AND table_name='{name}'"
-                ).collect()
-                if tbl_meta and tbl_meta[0].comment:
+        # 2) Table comments — non-Delta only (DEEP CLONE handles Delta).
+        with _SuppressLog(results, f"{cat}.{sch}", "TABLES"):
+            tbl_rows = spark.sql(
+                f"SELECT table_name, comment FROM `{cat}`.information_schema.tables "
+                f"WHERE table_schema = '{_escape(sch)}' AND comment IS NOT NULL"
+            ).collect()
+            for tr in tbl_rows:
+                if (cat, sch, tr.table_name) in non_delta_set and tr.comment:
                     results.append(
                         _emit_comment(
                             "TABLE",
-                            row.object_name,
-                            tbl_meta[0].comment,
+                            f"`{cat}`.`{sch}`.`{tr.table_name}`",
+                            tr.comment,
                             auth=auth,
                             wh_id=wh_id,
                             dry_run=config.dry_run,
                         )
                     )
 
-    # Column comments — Delta DEEP CLONE preserves column metadata for
-    # managed Delta tables, but external tables and non-Delta tables need
-    # explicit replay. We iterate every UC table we discovered and replay
-    # any column with a non-null comment. Delta managed-table columns will
-    # usually already carry the comment on target; re-issuing the ALTER
-    # TABLE is idempotent.
-    all_tables = spark.sql(
-        f"SELECT object_name FROM "
-        f"{config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
-        f"WHERE source_type = 'uc' AND object_type IN ('external_table','managed_table')"
-    ).collect()
-    for row in all_tables:
-        parts = row.object_name.strip("`").split("`.`")
-        if len(parts) != 3:
-            continue
-        catalog, schema, name = parts
-        with _SuppressLog(results, row.object_name, "COLUMN"):
-            col_meta = spark.sql(
-                f"SELECT column_name, comment FROM `{catalog}`.information_schema.columns "
-                f"WHERE table_schema='{schema}' AND table_name='{name}' AND comment IS NOT NULL"
+        # 3) Column comments — all UC tables (ALTER TABLE ALTER COLUMN
+        #    is idempotent for Delta managed tables that already carry
+        #    the comment from DEEP CLONE).
+        with _SuppressLog(results, f"{cat}.{sch}", "COLUMNS"):
+            col_rows = spark.sql(
+                f"SELECT table_name, column_name, comment "
+                f"FROM `{cat}`.information_schema.columns "
+                f"WHERE table_schema = '{_escape(sch)}' AND comment IS NOT NULL"
             ).collect()
-            for c in col_meta:
-                if c.comment:
+            for cr in col_rows:
+                if (cat, sch, cr.table_name) in all_tables_set and cr.comment:
                     results.append(
                         _emit_comment(
                             "COLUMN",
-                            row.object_name,
-                            c.comment,
+                            f"`{cat}`.`{sch}`.`{cr.table_name}`",
+                            cr.comment,
                             auth=auth,
                             wh_id=wh_id,
                             dry_run=config.dry_run,
-                            column_name=c.column_name,
+                            column_name=cr.column_name,
                         )
                     )
 
-    # Volume comments — the volume_worker creates the target volume shell
-    # but does not copy the ``COMMENT`` clause, so replay here via
-    # information_schema.volumes.
-    vol_rows = spark.sql(
-        f"SELECT object_name FROM "
-        f"{config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
-        f"WHERE source_type = 'uc' AND object_type = 'volume'"
-    ).collect()
-    for row in vol_rows:
-        parts = row.object_name.strip("`").split("`.`")
-        if len(parts) != 3:
-            continue
-        catalog, schema, name = parts
-        with _SuppressLog(results, row.object_name, "VOLUME"):
-            vol_meta = spark.sql(
-                f"SELECT comment FROM `{catalog}`.information_schema.volumes "
-                f"WHERE volume_schema='{schema}' AND volume_name='{name}'"
+        # 4) Volume comments
+        with _SuppressLog(results, f"{cat}.{sch}", "VOLUMES"):
+            vol_rows = spark.sql(
+                f"SELECT volume_name, comment "
+                f"FROM `{cat}`.information_schema.volumes "
+                f"WHERE volume_schema = '{_escape(sch)}' AND comment IS NOT NULL"
             ).collect()
-            if vol_meta and vol_meta[0].comment:
-                results.append(
-                    _emit_comment(
-                        "VOLUME",
-                        row.object_name,
-                        vol_meta[0].comment,
-                        auth=auth,
-                        wh_id=wh_id,
-                        dry_run=config.dry_run,
+            for vr in vol_rows:
+                if (cat, sch, vr.volume_name) in volume_set and vr.comment:
+                    results.append(
+                        _emit_comment(
+                            "VOLUME",
+                            f"`{cat}`.`{sch}`.`{vr.volume_name}`",
+                            vr.comment,
+                            auth=auth,
+                            wh_id=wh_id,
+                            dry_run=config.dry_run,
+                        )
                     )
-                )
 
     if results:
         tracker.append_migration_status(results)
