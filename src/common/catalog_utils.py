@@ -73,6 +73,11 @@ class CatalogExplorer:
     def __init__(self, spark: object, auth_manager: AuthManager) -> None:
         self.spark = spark
         self.auth_manager = auth_manager
+        # Per-instance memoization for list_foreign_catalogs(): both
+        # discovery.py and list_foreign_catalog_names() invoke it in the
+        # same run, and the underlying ``catalogs.list(include_browse=True)``
+        # is slow at scale.
+        self._foreign_catalogs_cache: list[dict] | None = None
 
     # ------------------------------------------------------------------
     # Catalogs & schemas
@@ -690,23 +695,32 @@ class CatalogExplorer:
         return results
 
     def list_foreign_catalogs(self) -> list[dict]:
-        """Foreign catalogs — federated catalogs backed by a UC connection."""
+        """Foreign catalogs — federated catalogs backed by a UC connection.
+
+        Result is memoized on the instance because ``discovery.py`` and
+        ``list_foreign_catalog_names()`` both call this in the same run.
+
+        Raises:
+            Underlying SDK exceptions (``PermissionDenied`` etc.)
+            propagate so a misconfigured run fails loudly rather than
+            silently producing an empty foreign-catalog inventory.
+        """
+        if self._foreign_catalogs_cache is not None:
+            return self._foreign_catalogs_cache
         results: list[dict] = []
-        try:
-            client = self.auth_manager.source_client  # type: ignore[attr-defined]
-            for c in client.catalogs.list(include_browse=True):
-                ctype = str(getattr(c, "catalog_type", ""))
-                if "FOREIGN" in ctype.upper():
-                    results.append(
-                        {
-                            "catalog_name": c.name,
-                            "connection_name": getattr(c, "connection_name", None),
-                            "options": dict(getattr(c, "options", {}) or {}),
-                            "comment": getattr(c, "comment", None),
-                        }
-                    )
-        except Exception:  # noqa: BLE001
-            return []
+        client = self.auth_manager.source_client  # type: ignore[attr-defined]
+        for c in client.catalogs.list(include_browse=True):
+            ctype = str(getattr(c, "catalog_type", ""))
+            if "FOREIGN" in ctype.upper():
+                results.append(
+                    {
+                        "catalog_name": c.name,
+                        "connection_name": getattr(c, "connection_name", None),
+                        "options": dict(getattr(c, "options", {}) or {}),
+                        "comment": getattr(c, "comment", None),
+                    }
+                )
+        self._foreign_catalogs_cache = results
         return results
 
     def list_foreign_catalog_names(self) -> set[str]:

@@ -716,3 +716,46 @@ class TestPythonUdfEnvironmentClause:
         assert "pkg (extra)" in ddl
         # Only one AS $$ — we haven't prematurely closed the ENVIRONMENT block.
         assert ddl.count("AS $$") == 1
+
+
+class TestListForeignCatalogs:
+    """list_foreign_catalogs() — M4 caches per instance, M5 propagates errors."""
+
+    def _explorer_with_one_foreign(self):
+        auth_mgr = MagicMock()
+        fc = MagicMock()
+        fc.name = "fc1"
+        fc.catalog_type = "FOREIGN_CATALOG"
+        fc.connection_name = "conn1"
+        fc.options = {}
+        fc.comment = None
+        auth_mgr.source_client.catalogs.list.return_value = [fc]
+        return CatalogExplorer(MagicMock(), auth_mgr), auth_mgr
+
+    def test_list_foreign_catalogs_caches_result_across_calls(self):
+        """M4: repeat calls hit the SDK only once per explorer instance."""
+        explorer, auth_mgr = self._explorer_with_one_foreign()
+
+        a = explorer.list_foreign_catalogs()
+        b = explorer.list_foreign_catalogs()
+        names = explorer.list_foreign_catalog_names()
+
+        assert a == b
+        assert names == {"fc1"}
+        assert auth_mgr.source_client.catalogs.list.call_count == 1, (
+            "list_foreign_catalogs must be memoized per explorer instance"
+        )
+
+    def test_list_foreign_catalogs_propagates_permission_denied(self):
+        """M5: a permission failure raises rather than silently returning []."""
+        import pytest
+        from databricks.sdk.errors import PermissionDenied
+
+        auth_mgr = MagicMock()
+        auth_mgr.source_client.catalogs.list.side_effect = PermissionDenied(
+            "User does not have USE CATALOG"
+        )
+        explorer = CatalogExplorer(MagicMock(), auth_mgr)
+
+        with pytest.raises(PermissionDenied):
+            explorer.list_foreign_catalogs()
