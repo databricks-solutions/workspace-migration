@@ -177,6 +177,8 @@ def apply_model(
         # allocated storage_location. Skip silently when the source URI is
         # empty, the version create/fetch failed, or the copy notebook
         # couldn't be uploaded — operators see the fallback in error_message.
+        # Mirrors volume_worker: artifact bytes are essential, so a copy
+        # failure hard-fails the model migration row.
         target_loc = getattr(created_version, "storage_location", None) if created_version else None
         if artifact_copy_available and source_uri and target_loc:
             try:
@@ -189,9 +191,20 @@ def apply_model(
                 total_bytes += int(res.get("bytes_copied", 0))
                 total_files += int(res.get("file_count", 0))
             except Exception as exc:  # noqa: BLE001
-                version_errors.append(
-                    f"v{version_num} artifact copy failed (src={source_uri}): {exc}"
+                duration = time.time() - start
+                results.append(
+                    {
+                        "object_name": obj_key,
+                        "object_type": "registered_model",
+                        "status": "failed",
+                        "error_message": (
+                            f"v{version_num} artifact copy failed "
+                            f"(src={source_uri}): {exc}"
+                        ),
+                        "duration_seconds": duration,
+                    }
                 )
+                return results
 
         # 3. Aliases for this version
         for alias in v.get("aliases") or []:

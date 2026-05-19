@@ -62,6 +62,30 @@ def test_apply_model_propagates_non_already_exists(monkeypatch):
     assert "nope" in results[0]["error_message"]
 
 
+def test_apply_model_hard_fails_on_artifact_copy_failure(monkeypatch):
+    """L4: artifact copy failure hard-fails the model row (mirrors volume_worker).
+
+    Previously the failure was appended to ``version_errors`` and the row
+    was recorded as ``validation_failed``; we now hard-fail because the
+    artifact bytes are essential, not best-effort metadata.
+    """
+    auth, client = _auth_with_target()
+    client.registered_models.create.return_value = None
+
+    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", lambda *a, **k: None)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("copy job failed")
+
+    monkeypatch.setattr(models_worker, "run_target_file_copy", boom)
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    assert len(results) == 1
+    assert results[0]["status"] == "failed"
+    assert "copy job failed" in results[0]["error_message"]
+    assert "v1 artifact copy failed" in results[0]["error_message"]
+
+
 def test_apply_model_version_idempotent_on_already_exists(monkeypatch):
     """If a version exists, fetch it and proceed to artifact copy."""
     auth, client = _auth_with_target()
