@@ -729,6 +729,7 @@ class TestSharingIdempotency:
     def test_apply_share_tolerates_share_already_exists(self, mock_exec):
         """Pin: share shell already-exists is swallowed — proceed to add objects."""
         from databricks.sdk.errors import AlreadyExists
+
         from migrate.sharing_worker import apply_share
 
         mock_exec.return_value = _ok()
@@ -844,6 +845,7 @@ class TestModelsIdempotency:
     def test_model_already_exists_continues_to_versions(self, _ensure, _copy):
         """Pin: registered_models.create AlreadyExists does not fail the model."""
         from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         auth = MagicMock()
@@ -865,6 +867,7 @@ class TestModelsIdempotency:
     def test_version_already_exists_continues_to_aliases(self, _ensure, _copy):
         """Pin: model_versions.create AlreadyExists does not fail the model."""
         from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         auth = MagicMock()

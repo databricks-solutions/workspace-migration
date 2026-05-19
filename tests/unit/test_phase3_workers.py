@@ -495,6 +495,7 @@ class TestModelsWorker:
     @patch("migrate.models_worker.time")
     def test_idempotent_on_already_exists(self, mock_time, mock_ensure, mock_copy):
         from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 101.0]
