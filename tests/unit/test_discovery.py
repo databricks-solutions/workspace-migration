@@ -108,7 +108,12 @@ class TestFilterSemantics:
             catalog_filter=["cat_a", "cat_b"],
         )
         explorer = mock_explorer_cls.return_value
-        explorer.list_catalogs.return_value = []
+        # Return something matching so the H8 "filter resolves to nothing"
+        # guard doesn't fire — this test is about wiring, not empty-result.
+        explorer.list_catalogs.return_value = ["cat_a"]
+        explorer.list_schemas.return_value = []
+        explorer.list_foreign_catalog_names.return_value = set()
+        explorer.list_foreign_catalogs.return_value = []
 
         run(dbutils, spark)
 
@@ -321,6 +326,120 @@ class TestForeignCatalogExclusion:
 
         list_schemas_catalogs = [c.args[0] for c in explorer.list_schemas.call_args_list]
         assert list_schemas_catalogs == ["managed_a", "managed_b"]
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_catalog_filter_naming_only_foreign_raises(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        """H8: operator names a foreign catalog in catalog_filter →
+        post-exclusion list is empty → discovery would 'succeed' with
+        zero rows. Raise instead so the misconfiguration is visible."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=["foreign_cat"])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["foreign_cat"]
+        explorer.list_foreign_catalog_names.return_value = {"foreign_cat"}
+
+        import pytest
+
+        with pytest.raises(ValueError, match="catalog_filter"):
+            run(dbutils, spark)
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_catalog_filter_partial_foreign_does_not_raise(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        """At least one managed catalog survives → continue normally."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=["foreign_cat", "managed_cat"])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["foreign_cat", "managed_cat"]
+        explorer.list_foreign_catalog_names.return_value = {"foreign_cat"}
+        explorer.list_schemas.return_value = []
+        explorer.list_foreign_catalogs.return_value = []
+
+        run(dbutils, spark)
+
+        # Only the managed catalog should be iterated.
+        list_schemas_catalogs = [c.args[0] for c in explorer.list_schemas.call_args_list]
+        assert list_schemas_catalogs == ["managed_cat"]
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_empty_filter_with_only_foreign_catalogs_does_not_raise(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        """Empty filter = 'discover everything'. If the workspace happens
+        to have only foreign catalogs, schema iteration is a legitimate
+        no-op — governance metadata still flows through list_foreign_catalogs."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=[])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["foreign_cat"]
+        explorer.list_foreign_catalog_names.return_value = {"foreign_cat"}
+        explorer.list_foreign_catalogs.return_value = [
+            {"catalog_name": "foreign_cat", "connection_name": "conn", "options": {}, "comment": None},
+        ]
+
+        inventory = run(dbutils, spark)
+
+        # No schema iteration, but governance row still emitted.
+        explorer.list_schemas.assert_not_called()
+        foreign_rows = [r for r in inventory if r["object_type"] == "foreign_catalog"]
+        assert len(foreign_rows) == 1
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
+    def test_catalog_filter_naming_nonexistent_catalog_raises(
+        self,
+        mock_explorer_cls,
+        mock_tracker_cls,
+        mock_auth_cls,
+        mock_from_file,
+    ):
+        """Operator names a catalog that doesn't exist in the workspace —
+        list_catalogs returns []. Same silent-failure risk as the foreign
+        case; raise."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(catalog_filter=["nonexistent_cat"])
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = []
+        explorer.list_foreign_catalog_names.return_value = set()
+
+        import pytest
+
+        with pytest.raises(ValueError, match="catalog_filter"):
+            run(dbutils, spark)
 
 
 class TestToolOwnedCatalogs:

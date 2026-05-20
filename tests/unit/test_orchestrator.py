@@ -34,7 +34,7 @@ class TestOrchestrator:
     def test_batch_building(self):
         """Verify objects are split into correct batch sizes."""
         objects = [{"object_name": f"table_{i}", "object_type": "managed_table"} for i in range(7)]
-        batches = build_batches(objects, batch_size=3)
+        batches, _ = build_batches(objects, batch_size=3)
 
         assert len(batches) == 3
         batch_0 = json.loads(batches[0])
@@ -54,7 +54,7 @@ class TestOrchestrator:
     def test_batch_building_exact_fit(self):
         """Verify exact multiples produce correct number of batches."""
         objects = [{"object_name": f"t_{i}"} for i in range(6)]
-        batches = build_batches(objects, batch_size=3)
+        batches, _ = build_batches(objects, batch_size=3)
 
         assert len(batches) == 2
         assert len(json.loads(batches[0])) == 3
@@ -63,15 +63,16 @@ class TestOrchestrator:
     def test_batch_building_single_batch(self):
         """Verify objects smaller than batch size produce one batch."""
         objects = [{"object_name": f"t_{i}"} for i in range(2)]
-        batches = build_batches(objects, batch_size=50)
+        batches, _ = build_batches(objects, batch_size=50)
 
         assert len(batches) == 1
         assert len(json.loads(batches[0])) == 2
 
     def test_empty_inventory(self):
         """Verify no batches are created for empty input."""
-        batches = build_batches([], batch_size=50)
+        batches, oversize = build_batches([], batch_size=50)
         assert batches == []
+        assert oversize == []
 
     def test_batch_json_roundtrip(self):
         """Verify batches are valid JSON that can be round-tripped."""
@@ -79,7 +80,7 @@ class TestOrchestrator:
             {"object_name": "`cat`.`sch`.`tbl`", "object_type": "managed_table", "row_count": 100},
             {"object_name": "`cat`.`sch`.`tbl2`", "object_type": "managed_table", "row_count": 200},
         ]
-        batches = build_batches(objects, batch_size=10)
+        batches, _ = build_batches(objects, batch_size=10)
 
         assert len(batches) == 1
         parsed = json.loads(batches[0])
@@ -96,7 +97,7 @@ class TestOrchestrator:
                 "row_count": 100,
             },
         ]
-        batches = build_batches(objects, batch_size=10)
+        batches, _ = build_batches(objects, batch_size=10)
 
         parsed = json.loads(batches[0])
         assert "create_statement" not in parsed[0]
@@ -127,7 +128,7 @@ class TestBuildBatchesByteCap:
         wouldn't trigger, but 10+ such objects would blow past
         ``MAX_BATCH_BYTES``; the orchestrator must close the batch early."""
         objects = [self._obj(i) for i in range(20)]
-        batches = build_batches(objects, batch_size=50)
+        batches, _ = build_batches(objects, batch_size=50)
 
         assert len(batches) > 1, "Byte cap should have forced multiple batches."
         for b in batches:
@@ -143,42 +144,69 @@ class TestBuildBatchesByteCap:
     def test_count_cap_still_wins_when_under_byte_cap(self):
         """If objects are tiny, count cap is the binding constraint."""
         objects = [{"object_name": f"t_{i}"} for i in range(10)]
-        batches = build_batches(objects, batch_size=3)
+        batches, _ = build_batches(objects, batch_size=3)
 
         assert len(batches) == 4  # 3 + 3 + 3 + 1
         for b in batches:
             assert len(json.loads(b)) <= 3
 
-    def test_single_huge_object_emits_warning_but_is_batched(self, caplog):
-        """An object whose own JSON is > ``MAX_BATCH_BYTES`` is still emitted
-        (alone) — dropping it silently would be worse than an operator-
-        visible for_each failure with the warning pointing at the culprit."""
+    def test_single_huge_object_excluded_from_batches(self, caplog):
+        """H6: an object whose own JSON exceeds ``MAX_BATCH_BYTES`` is
+        skipped from batches entirely and returned as ``oversize`` so the
+        caller can record a terminal-failed migration_status row. Letting
+        for_each crash the whole batch at runtime was worse."""
         huge = {
             "object_name": "`cat`.`sch`.`huge_object`",
+            "object_type": "managed_table",
             "storage_location": "x" * (MAX_BATCH_BYTES + 1000),
         }
-        with caplog.at_level(logging.WARNING, logger="orchestrator"):
-            batches = build_batches([huge], batch_size=50)
+        with caplog.at_level(logging.WARNING, logger="migrate.batching"):
+            batches, oversize = build_batches([huge], batch_size=50)
 
-        assert len(batches) == 1
-        parsed = json.loads(batches[0])
-        assert parsed[0]["object_name"] == "`cat`.`sch`.`huge_object`"
-        assert any("Single object encoded to" in r.message for r in caplog.records)
+        # No batch produced — the only object was oversize.
+        assert batches == []
+        # The original (non-stripped) object dict is returned.
+        assert oversize == [huge]
+        assert any("skipping from batches" in r.message for r in caplog.records)
         assert any("huge_object" in r.message for r in caplog.records)
 
-    def test_huge_object_is_flushed_into_its_own_batch(self):
-        """A huge object after normal ones must close the prior batch and
-        land alone in a new batch — not be appended past the byte cap."""
-        tiny = [{"object_name": f"t_{i}"} for i in range(3)]
-        huge = {"object_name": "huge", "payload": "x" * (MAX_BATCH_BYTES + 500)}
+    def test_huge_object_partitioned_from_normal_batch(self):
+        """H6: tiny objects batch normally; the oversize one is excluded
+        from batches and surfaced as ``oversize``."""
+        tiny = [{"object_name": f"t_{i}", "object_type": "managed_table"} for i in range(3)]
+        huge = {
+            "object_name": "huge",
+            "object_type": "managed_table",
+            "payload": "x" * (MAX_BATCH_BYTES + 500),
+        }
         objects = tiny + [huge]
-        batches = build_batches(objects, batch_size=50)
+        batches, oversize = build_batches(objects, batch_size=50)
 
-        # 1 batch of 3 tiny + 1 batch of huge alone.
-        parsed = [json.loads(b) for b in batches]
-        assert len(parsed) == 2
-        assert {o["object_name"] for o in parsed[0]} == {"t_0", "t_1", "t_2"}
-        assert parsed[1][0]["object_name"] == "huge"
+        # One batch with the three tiny objects.
+        assert len(batches) == 1
+        parsed = json.loads(batches[0])
+        assert {o["object_name"] for o in parsed} == {"t_0", "t_1", "t_2"}
+        # The huge object is reported but not batched.
+        assert len(oversize) == 1
+        assert oversize[0]["object_name"] == "huge"
+
+    def test_oversize_objects_preserve_object_type_for_status_row(self):
+        """Caller needs ``object_name`` AND ``object_type`` to write a
+        migration_status row. Both must be preserved in the oversize list.
+
+        Note: the size check uses the stripped object (``create_statement``
+        is stripped). To trigger oversize, the bulk must live on a
+        non-stripped field like ``storage_location``."""
+        huge = {
+            "object_name": "`cat`.`sch`.`big`",
+            "object_type": "external_table",
+            "storage_location": "x" * (MAX_BATCH_BYTES + 500),
+        }
+        _, oversize = build_batches([huge], batch_size=50)
+
+        assert len(oversize) == 1
+        assert oversize[0]["object_name"] == "`cat`.`sch`.`big`"
+        assert oversize[0]["object_type"] == "external_table"
 
 
 

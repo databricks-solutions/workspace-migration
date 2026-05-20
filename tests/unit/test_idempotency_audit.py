@@ -449,7 +449,9 @@ class TestTagsIdempotency:
             [{"tag_name": "env", "tag_value": "prod"}],
             auth=MagicMock(), wh_id="wh", dry_run=False,
         )
-        assert res["status"] == "validated"
+        # apply_tag_group returns a list of per-tag status rows (C6).
+        assert len(res) == 1
+        assert res[0]["status"] == "validated"
         sql = mock_exec.call_args[0][2]
         assert "SET TAGS" in sql
 

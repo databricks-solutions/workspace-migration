@@ -52,6 +52,19 @@ def _tag_clause(pairs: list[tuple[str, str]]) -> str:
     return "(" + ", ".join(parts) + ")"
 
 
+def _tag_object_name(securable_fqn: str, column_name: str, tag_name: str) -> str:
+    """Construct the per-tag discovery key.
+
+    Mirrors ``src/discovery/discovery.py`` exactly:
+        ``f"{securable_fqn}:{column_name}:{tag_name}".rstrip(":")``
+
+    Workers must use this same shape so ``get_pending_objects`` LEFT JOIN
+    against discovery_inventory matches and the row is treated as
+    terminal on re-run (review finding C6).
+    """
+    return f"{securable_fqn}:{column_name}:{tag_name}".rstrip(":")
+
+
 def apply_tag_group(
     group_key: tuple[str, str, str],
     tags: list[dict],
@@ -59,8 +72,15 @@ def apply_tag_group(
     auth: AuthManager,
     wh_id: str,
     dry_run: bool,
-) -> dict:
-    """Apply all tags in a single (type, fqn, column) group with one ALTER."""
+) -> list[dict]:
+    """Apply all tags in a single (type, fqn, column) group with one ALTER.
+
+    Emits one migration_status row per tag — the ALTER is grouped for
+    SQL efficiency, but each tag is a distinct discovery_inventory row
+    and needs its own status row so ``get_pending_objects`` aligns
+    (C6). All tags in the group share the same status (the ALTER is
+    atomic).
+    """
     securable_type, securable_fqn, column_name = group_key
 
     pairs = [(t["tag_name"], t.get("tag_value") or "") for t in tags]
@@ -71,39 +91,28 @@ def apply_tag_group(
     else:
         sql = f"ALTER {securable_type} {securable_fqn} SET TAGS {clause}"
 
-    obj_key = f"TAGS_{securable_type}_{securable_fqn}"
-    if column_name:
-        obj_key += f".{column_name}"
+    def _row(tag: dict, status: str, error: str | None, duration: float) -> dict:
+        return {
+            "object_name": _tag_object_name(securable_fqn, column_name, tag["tag_name"]),
+            "object_type": "tag",
+            "status": status,
+            "error_message": error,
+            "duration_seconds": duration,
+        }
 
     start = time.time()
     if dry_run:
         logger.info("[DRY RUN] %s", sql)
-        return {
-            "object_name": obj_key,
-            "object_type": "tag",
-            "status": "skipped",
-            "error_message": "dry_run",
-            "duration_seconds": time.time() - start,
-        }
+        elapsed = time.time() - start
+        return [_row(t, "skipped", "dry_run", elapsed) for t in tags]
 
     logger.info("Executing: %s", sql)
     result = execute_and_poll(auth, wh_id, sql)
     duration = time.time() - start
     if result["state"] != "SUCCEEDED":
-        return {
-            "object_name": obj_key,
-            "object_type": "tag",
-            "status": "failed",
-            "error_message": result.get("error", result["state"]),
-            "duration_seconds": duration,
-        }
-    return {
-        "object_name": obj_key,
-        "object_type": "tag",
-        "status": "validated",
-        "error_message": None,
-        "duration_seconds": duration,
-    }
+        err = result.get("error", result["state"])
+        return [_row(t, "failed", err, duration) for t in tags]
+    return [_row(t, "validated", None, duration) for t in tags]
 
 
 def run(dbutils, spark) -> None:
@@ -141,16 +150,21 @@ def run(dbutils, spark) -> None:
     results: list[dict] = []
     for key, tags in groups.items():
         try:
-            res = apply_tag_group(key, tags, auth=auth, wh_id=wh_id, dry_run=config.dry_run)
+            group_results = apply_tag_group(key, tags, auth=auth, wh_id=wh_id, dry_run=config.dry_run)
         except Exception as exc:  # noqa: BLE001
-            res = {
-                "object_name": f"TAGS_{key[0]}_{key[1]}",
-                "object_type": "tag",
-                "status": "failed",
-                "error_message": str(exc),
-                "duration_seconds": 0.0,
-            }
-        results.append(res)
+            securable_fqn = key[1]
+            column_name = key[2]
+            group_results = [
+                {
+                    "object_name": _tag_object_name(securable_fqn, column_name, t["tag_name"]),
+                    "object_type": "tag",
+                    "status": "failed",
+                    "error_message": str(exc),
+                    "duration_seconds": 0.0,
+                }
+                for t in tags
+            ]
+        results.extend(group_results)
 
     if results:
         tracker.append_migration_status(results)

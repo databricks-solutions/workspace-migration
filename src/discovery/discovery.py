@@ -76,11 +76,23 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
     # list_foreign_catalogs(); iterating their information_schema here would
     # route through JDBC to the remote source and fail on UC-only columns.
     foreign_catalog_names = explorer.list_foreign_catalog_names()
+    excluded_foreign: list[str] = []
     if foreign_catalog_names:
-        excluded = [c for c in catalogs if c in foreign_catalog_names]
+        excluded_foreign = [c for c in catalogs if c in foreign_catalog_names]
         catalogs = [c for c in catalogs if c not in foreign_catalog_names]
-        if excluded:
-            print(f"[uc] Excluding foreign catalog(s) from schema/table discovery: {sorted(excluded)}")
+        if excluded_foreign:
+            print(f"[uc] Excluding foreign catalog(s) from schema/table discovery: {sorted(excluded_foreign)}")
+    if config.catalog_filter and not catalogs:
+        # Non-empty filter that resolves to nothing iterable is almost always
+        # operator misconfiguration (named a foreign catalog, named a
+        # tool-owned catalog, or named a catalog that doesn't exist).
+        # Empty filter is fine here — that's the "discover everything"
+        # contract and an all-foreign workspace is a legitimate no-op.
+        raise ValueError(
+            f"catalog_filter={config.catalog_filter} resolved to zero catalogs after "
+            f"excluding foreign={sorted(excluded_foreign)} and tool-owned={sorted(tool_catalogs)}. "
+            "Check the filter against the workspace's managed catalogs."
+        )
     print(f"[uc] Discovered {len(catalogs)} catalog(s) (excluding tool-owned {sorted(tool_catalogs)}): {catalogs}")
 
     for catalog in catalogs:

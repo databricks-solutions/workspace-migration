@@ -33,6 +33,7 @@ logger = logging.getLogger("orchestrator")
 
 # COMMAND ----------
 from migrate.batching import (  # noqa: E402
+    MAX_BATCH_BYTES,
     _strip_heavy_fields,
     build_batches,
 )
@@ -180,8 +181,38 @@ if _is_notebook():
     for obj_type in BATCHED_TYPES:
         pending = tracker.get_pending_objects(obj_type)
         logger.info("Pending %s: %d objects", obj_type, len(pending))
-        batches = build_batches(pending, config.batch_size)
+        batches, oversize = build_batches(pending, config.batch_size)
         batch_output[f"{obj_type}_batches"] = batches
+        if oversize:
+            # H6: objects whose stripped JSON exceeds MAX_BATCH_BYTES are
+            # skipped from batches (for_each would crash the whole batch).
+            # Record terminal-failed status so the operator sees the
+            # misconfiguration and get_pending_objects stops re-picking them.
+            tracker.append_migration_status(
+                [
+                    {
+                        "object_name": o["object_name"],
+                        "object_type": o["object_type"],
+                        "status": "failed_batch_oversize",
+                        "error_message": (
+                            f"Stripped object JSON exceeds MAX_BATCH_BYTES={MAX_BATCH_BYTES}. "
+                            "Trim heavy metadata (e.g. very long create_statement) or split the object."
+                        ),
+                        "job_run_id": str(_job_run_id),
+                        "task_run_id": None,
+                        "source_row_count": None,
+                        "target_row_count": None,
+                        "duration_seconds": None,
+                    }
+                    for o in oversize
+                ]
+            )
+            logger.error(
+                "Skipped %d %s object(s) from batches due to size cap: %s",
+                len(oversize),
+                obj_type,
+                [o.get("object_name") for o in oversize],
+            )
 
     for obj_type in LIST_TYPES:
         pending = tracker.get_pending_objects(obj_type)

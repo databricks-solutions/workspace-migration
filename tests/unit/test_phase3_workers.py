@@ -33,7 +33,11 @@ class TestTagsWorker:
             wh_id="wh-1",
             dry_run=False,
         )
-        assert result["status"] == "validated"
+        # C6: one row per tag (matches discovery's per-tag emit).
+        assert len(result) == 1
+        assert result[0]["status"] == "validated"
+        # Discovery key shape: ``<fqn>:<col>:<tag_name>`` with trailing ``:`` stripped.
+        assert result[0]["object_name"] == "`c`.`s`.`t`::env"
         sql = mock_execute.call_args[0][2]
         assert "ALTER TABLE `c`.`s`.`t` SET TAGS" in sql
         assert "'env' = 'prod'" in sql
@@ -55,7 +59,9 @@ class TestTagsWorker:
         )
         sql = mock_execute.call_args[0][2]
         assert "ALTER COLUMN `ssn` SET TAGS" in sql
-        assert result["object_name"].endswith(".ssn")
+        # Discovery emits ``<fqn>:<col>:<tag_name>`` for column tags.
+        assert len(result) == 1
+        assert result[0]["object_name"] == "`c`.`s`.`t`:ssn:pii"
 
     def test_tag_value_escapes_quotes(self):
         from migrate.tags_worker import _tag_clause
@@ -79,12 +85,13 @@ class TestTagsWorker:
             wh_id="wh-1",
             dry_run=False,
         )
-        assert result["status"] == "validated"
+        assert len(result) == 1
+        assert result[0]["status"] == "validated"
         sql = mock_execute.call_args[0][2]
         assert "ALTER CATALOG `prod_cat` SET TAGS" in sql
         assert "'owner' = 'finance'" in sql
-        # No column suffix on the tracking key.
-        assert result["object_name"] == "TAGS_CATALOG_`prod_cat`"
+        # C6: key matches discovery's per-tag format. No ``TAGS_`` prefix.
+        assert result[0]["object_name"] == "`prod_cat`::owner"
 
     @patch("migrate.tags_worker.time")
     @patch("migrate.tags_worker.execute_and_poll")
@@ -105,7 +112,13 @@ class TestTagsWorker:
             wh_id="wh-1",
             dry_run=False,
         )
-        assert result["status"] == "validated"
+        # C6: one row per tag, both share status from the single ALTER.
+        assert len(result) == 2
+        assert all(r["status"] == "validated" for r in result)
+        assert {r["object_name"] for r in result} == {
+            "`c`.`gold`::tier",
+            "`c`.`gold`::pii",
+        }
         sql = mock_execute.call_args[0][2]
         assert "ALTER SCHEMA `c`.`gold` SET TAGS" in sql
         # Two tags land in one ALTER statement (grouping contract).
@@ -128,7 +141,8 @@ class TestTagsWorker:
             wh_id="wh-1",
             dry_run=False,
         )
-        assert result["status"] == "validated"
+        assert len(result) == 1
+        assert result[0]["status"] == "validated"
         sql = mock_execute.call_args[0][2]
         assert "ALTER VOLUME `c`.`s`.`landing_vol` SET TAGS" in sql
         assert "'retention_days' = '30'" in sql
@@ -819,7 +833,8 @@ class TestPhase3WorkersIdempotency:
             wh_id="wh",
             dry_run=False,
         )
-        assert res["status"] == "validated"
+        assert len(res) == 1
+        assert res[0]["status"] == "validated"
 
 
 class TestPhase3DispatchOnObjectType:
@@ -852,6 +867,82 @@ class TestPhase3DispatchOnObjectType:
         assert "column_mask_list" in src
 
 
+class TestPhase3DiscoveryKeyAlignment:
+    """C6: Phase 3 governance workers MUST emit ``object_name`` values that
+    match discovery_inventory exactly so the ``get_pending_objects`` LEFT
+    JOIN matches the previously-validated row and treats it as terminal.
+
+    Earlier worker versions used synthetic prefixes (``ROW_FILTER_<fqn>``,
+    ``COLUMN_MASK_<fqn>.<col>``, ``TAGS_<type>_<fqn>``) which left the
+    LEFT JOIN unmatched on every run — workers re-processed every row.
+    These tests pin the alignment so any future drift fails fast.
+    """
+
+    @patch("migrate.row_filters_worker.time")
+    @patch("migrate.row_filters_worker.execute_and_poll")
+    def test_row_filter_worker_key_matches_discovery_table_fqn(self, mock_execute, mock_time):
+        """Discovery sets ``object_name=rf["table_fqn"]``. Worker must
+        match — no ``ROW_FILTER_`` prefix."""
+        from migrate.row_filters_worker import apply_row_filter
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_execute.return_value = _ok()
+        res = apply_row_filter(
+            {"table_fqn": "`c`.`s`.`t`", "filter_function_fqn": "c.s.f", "filter_columns": ["region"]},
+            auth=MagicMock(),
+            wh_id="wh",
+            dry_run=False,
+        )
+        assert res["object_name"] == "`c`.`s`.`t`"
+        assert not res["object_name"].startswith("ROW_FILTER_")
+
+    @patch("migrate.column_masks_worker.time")
+    @patch("migrate.column_masks_worker.execute_and_poll")
+    def test_column_mask_worker_key_matches_discovery_fqn_dot_col(self, mock_execute, mock_time):
+        """Discovery sets ``object_name=f"{cm['table_fqn']}.{cm['column_name']}"``.
+        Worker must match — no ``COLUMN_MASK_`` prefix."""
+        from migrate.column_masks_worker import apply_column_mask
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_execute.return_value = _ok()
+        res = apply_column_mask(
+            {"table_fqn": "`c`.`s`.`t`", "column_name": "ssn", "mask_function_fqn": "c.s.mask"},
+            auth=MagicMock(),
+            wh_id="wh",
+            dry_run=False,
+        )
+        assert res["object_name"] == "`c`.`s`.`t`.ssn"
+        assert not res["object_name"].startswith("COLUMN_MASK_")
+
+    @patch("migrate.tags_worker.time")
+    @patch("migrate.tags_worker.execute_and_poll")
+    def test_tag_worker_emits_one_row_per_tag_with_discovery_key(self, mock_execute, mock_time):
+        """Discovery emits one row per (securable, column, tag_name). Worker
+        groups tags by (securable, column) for SQL efficiency but MUST
+        fan out the result so there is a 1:1 mapping back to discovery."""
+        from migrate.tags_worker import apply_tag_group
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_execute.return_value = _ok()
+        res = apply_tag_group(
+            ("SCHEMA", "`c`.`gold`", ""),
+            [
+                {"tag_name": "tier", "tag_value": "bronze"},
+                {"tag_name": "pii", "tag_value": "false"},
+            ],
+            auth=MagicMock(),
+            wh_id="wh",
+            dry_run=False,
+        )
+        assert len(res) == 2
+        assert {r["object_name"] for r in res} == {
+            "`c`.`gold`::tier",
+            "`c`.`gold`::pii",
+        }
+        for r in res:
+            assert not r["object_name"].startswith("TAGS_")
+
+
 class TestPhase3StatusEmission:
     """Every Phase 3 worker writes to migration_status with an
     object_type matching the Phase 3 backlog (tag, row_filter,
@@ -882,7 +973,8 @@ class TestPhase3StatusEmission:
             wh_id="wh",
             dry_run=False,
         )
-        assert res["object_type"] == "tag"
+        assert len(res) == 1
+        assert res[0]["object_type"] == "tag"
 
     @patch("migrate.row_filters_worker.time")
     @patch("migrate.row_filters_worker.execute_and_poll")
@@ -931,8 +1023,9 @@ class TestPhase3WorkerErrorSurfacing:
             wh_id="wh",
             dry_run=False,
         )
-        assert res["status"] == "failed"
-        assert "PERMISSION_DENIED" in res["error_message"]
+        assert len(res) == 1
+        assert res[0]["status"] == "failed"
+        assert "PERMISSION_DENIED" in res[0]["error_message"]
 
     @patch("migrate.row_filters_worker.time")
     @patch("migrate.row_filters_worker.execute_and_poll")
@@ -1027,8 +1120,9 @@ class TestPhase3DryRun:
             wh_id="wh",
             dry_run=True,
         )
-        assert res["status"] == "skipped"
-        assert res["error_message"] == "dry_run"
+        assert len(res) == 1
+        assert res[0]["status"] == "skipped"
+        assert res[0]["error_message"] == "dry_run"
         mock_execute.assert_not_called()
 
     @patch("migrate.row_filters_worker.execute_and_poll")

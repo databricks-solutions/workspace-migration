@@ -114,15 +114,17 @@ class TestTrackingManager:
         sql_arg = mock_spark.sql.call_args[0][0]
         assert "LEFT JOIN" in sql_arg
         # Filter: ``validated``, ``skipped_by_pipeline_migration``,
-        # ``skipped_target_exists`` (X.4), and
+        # ``skipped_target_exists`` (X.4),
         # ``skipped_by_stateful_service_migration`` (streaming tables /
-        # future Stateful Services Phase) are terminal. Other skip
-        # statuses (skipped_by_config, skipped_by_rls_cm_policy, plain
-        # skipped) re-enter pending so operators can flip config flags
-        # and re-run.
+        # future Stateful Services Phase), and ``failed_batch_oversize``
+        # (H6: object exceeds MAX_BATCH_BYTES — operator must trim) are
+        # terminal. Other skip statuses (skipped_by_config,
+        # skipped_by_rls_cm_policy, plain skipped) re-enter pending so
+        # operators can flip config flags and re-run.
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
-            "'skipped_target_exists', 'skipped_by_stateful_service_migration')"
+            "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
+            "'failed_batch_oversize')"
             in sql_arg
         )
         # object_type is passed via args= (parameterized), not interpolated
@@ -261,10 +263,13 @@ class TestTrackingManager:
         # circuits the worker on the next run.
         # ``skipped_by_stateful_service_migration`` was added to
         # hard-exclude streaming tables (migrated by the future Stateful
-        # Services Phase, separate job).
+        # Services Phase, separate job). ``failed_batch_oversize`` (H6)
+        # is terminal because re-picking would just fail again — operator
+        # must trim heavy metadata.
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
-            "'skipped_target_exists', 'skipped_by_stateful_service_migration')"
+            "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
+            "'failed_batch_oversize')"
             in sql
         )
         # Guard against regression to the old LIKE filter that swept up

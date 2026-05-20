@@ -28,7 +28,8 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
-from migrate.batching import build_batches
+from migrate.batching import MAX_BATCH_BYTES, build_batches
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_orchestrator")
@@ -116,11 +117,39 @@ if _is_notebook():
     batch_size = config.batch_size
 
     # Publish task values.
+    _job_run_id = resolve_current_job_run_id(dbutils)  # type: ignore[name-defined] # noqa: F821
     for cat in ("hive_external", "hive_managed_nondbfs", "hive_managed_dbfs_root"):
         key = f"{cat}_batches"
-        batches = build_batches(by_category.get(cat, []), batch_size)
+        batches, oversize = build_batches(by_category.get(cat, []), batch_size)
         dbutils.jobs.taskValues.set(key=key, value=json.dumps(batches))  # type: ignore[name-defined] # noqa: F821
         logger.info("%s: %d batch(es) (%d objects)", key, len(batches), len(by_category.get(cat, [])))
+        if oversize:
+            # H6: see migrate/orchestrator.py for the parallel UC handler.
+            tracker.append_migration_status(
+                [
+                    {
+                        "object_name": o["object_name"],
+                        "object_type": o["object_type"],
+                        "status": "failed_batch_oversize",
+                        "error_message": (
+                            f"Stripped object JSON exceeds MAX_BATCH_BYTES={MAX_BATCH_BYTES}. "
+                            "Trim heavy metadata (e.g. very long create_statement) or split the object."
+                        ),
+                        "job_run_id": str(_job_run_id),
+                        "task_run_id": None,
+                        "source_row_count": None,
+                        "target_row_count": None,
+                        "duration_seconds": None,
+                    }
+                    for o in oversize
+                ]
+            )
+            logger.error(
+                "Skipped %d %s object(s) from batches due to size cap: %s",
+                len(oversize),
+                cat,
+                [o.get("object_name") for o in oversize],
+            )
 
     # Views and functions are lists (not batched; workers handle topological ordering).
     dbutils.jobs.taskValues.set(  # type: ignore[name-defined] # noqa: F821

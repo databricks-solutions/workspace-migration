@@ -99,6 +99,10 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "skipped_by_pipeline_migration",
     "skipped_target_exists",
     "skipped_by_stateful_service_migration",
+    # H6: object exceeded MAX_BATCH_BYTES and was excluded from for_each
+    # batches. Re-picking it would just fail again — operator must trim
+    # heavy metadata (or split the object) and clear the status row.
+    "failed_batch_oversize",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
