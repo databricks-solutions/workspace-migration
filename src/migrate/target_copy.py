@@ -39,11 +39,23 @@ TARGET_COPY_NOTEBOOK_PATH = "/Shared/cp_migration_runtime/_volume_copy"
 
 # Target-side notebook source — uploaded once per migration run and reused
 # across workers. Emits JSON with bytes_copied / file_count via notebook exit.
+#
+# Share-propagation race: when the source-side ``ALTER SHARE ADD VOLUME``
+# runs immediately before this notebook is submitted, the consumer-side
+# view of the share can lag a few seconds before the new volume is
+# visible at ``/Volumes/cp_migration_share_consumer/<schema>/<volume>``.
+# The first-volume-in-batch hits this almost every cross-region run
+# (verified 2026-05-20 source northeurope → target westeurope:
+# test_volume failed UC_VOLUME_NOT_FOUND while a later nested_volume in
+# the same run succeeded). Subsequent volumes do not race because the
+# share is warm. Retry the initial ``ls`` with backoff up to ~30s to
+# absorb the lag.
 TARGET_COPY_NOTEBOOK = """# Databricks notebook source
 # Target-side helper: recursively copies files from a source path to a
 # destination path via dbutils.fs.cp. Invoked by workers that need cross-
 # path copies (managed volumes, model artifacts).
 import json
+import time
 
 dbutils.widgets.text("src", "")
 dbutils.widgets.text("dst", "")
@@ -53,9 +65,26 @@ dst = dbutils.widgets.get("dst")
 total_bytes = 0
 total_files = 0
 
-def _copy_recursive(s, d):
+
+def _ls_with_retry(path, attempts=8, base_delay=2.0):
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return dbutils.fs.ls(path)
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            if "not_found" not in msg and "does not exist" not in msg and "uc_volume_not_found" not in msg:
+                raise
+            if i < attempts - 1:
+                time.sleep(base_delay * (1 + i))
+    raise last_exc
+
+
+def _copy_recursive(s, d, _entry=False):
     global total_bytes, total_files
-    for f in dbutils.fs.ls(s):
+    listing = _ls_with_retry(s) if _entry else dbutils.fs.ls(s)
+    for f in listing:
         target = d.rstrip("/") + "/" + f.name.rstrip("/")
         if f.isDir():
             dbutils.fs.mkdirs(target)
@@ -65,7 +94,8 @@ def _copy_recursive(s, d):
             total_bytes += f.size
             total_files += 1
 
-_copy_recursive(src, dst)
+
+_copy_recursive(src, dst, _entry=True)
 dbutils.notebook.exit(json.dumps({"bytes_copied": total_bytes, "file_count": total_files}))
 """
 
