@@ -35,6 +35,44 @@ assert total > 0, "No UC migration status records found."
 
 error_messages: list[str] = []
 
+
+def _expect_validated(row, label: str) -> bool:  # type: ignore[no-untyped-def]
+    """H11: assert a migration_status row is BOTH ``validated`` AND has
+    no ``error_message``.
+
+    Previously the test file had ~20 patterns of the form::
+
+        if row["status"] != "validated":
+            error_messages.append(...)
+
+    which silently passed when a worker recorded ``status='validated'``
+    with a non-empty ``error_message`` (e.g. ``WARNING: rebuilt with stale
+    schema``). The helper makes "validated" mean what it says.
+
+    Returns True if the row passes both checks; False otherwise.
+    Adds to ``error_messages`` on failure to match the file's
+    accumulate-then-fail-at-end style.
+    """
+    _st = row["status"] if hasattr(row, "__getitem__") else getattr(row, "status", None)
+    # Row objects expose .get() (PyRow) OR raise KeyError; tolerate both.
+    try:
+        _err = row["error_message"]
+    except (KeyError, IndexError, TypeError):
+        _err = getattr(row, "error_message", None)
+    if _st != "validated":
+        error_messages.append(
+            f"{label}: status={_st!r}, expected 'validated'. error_message={_err!r}"
+        )
+        return False
+    if _err:
+        error_messages.append(
+            f"{label}: status='validated' but error_message is set: {_err!r} "
+            "(worker recorded a warning under a passing status — see review H11)."
+        )
+        return False
+    return True
+
+
 counts = {
     row["status"]: row["n"] for row in status_df.groupBy("status").count().withColumnRenamed("count", "n").collect()
 }
@@ -205,11 +243,8 @@ if str(has_mv).lower() == "true":
     mv_status = status_df.filter("object_type = 'mv' AND object_name LIKE '%mv_high_value%'").collect()
     if not mv_status:
         error_messages.append("Phase 2.5.D: MV row missing from migration_status.")
-    elif mv_status[0]["status"] != "validated":
-        error_messages.append(
-            f"Phase 2.5.D: MV status is '{mv_status[0]['status']}', expected 'validated'. "
-            f"error={mv_status[0]['error_message']}"
-        )
+    elif not _expect_validated(mv_status[0], "Phase 2.5.D MV"):
+        pass  # error already appended
     else:
         try:
             detail = spark.sql(  # noqa: F821
@@ -261,12 +296,8 @@ if str(has_iceberg).lower() == "true":
     iceberg_row = status_df.filter("object_type = 'managed_table' AND object_name LIKE '%iceberg_sales%'").collect()
     if not iceberg_row:
         error_messages.append("Phase 2.5.B: iceberg_sales missing from migration_status.")
-    elif iceberg_row[0]["status"] != "validated":
-        error_messages.append(
-            f"Phase 2.5.B: iceberg_sales status is "
-            f"'{iceberg_row[0]['status']}', expected 'validated'. "
-            f"error={iceberg_row[0]['error_message']}"
-        )
+    elif not _expect_validated(iceberg_row[0], "Phase 2.5.B iceberg_sales"):
+        pass  # error already appended
     elif iceberg_row[0]["source_row_count"] != iceberg_row[0]["target_row_count"]:
         error_messages.append(
             f"Phase 2.5.B: iceberg_sales row count mismatch "
@@ -614,25 +645,62 @@ if str(has_iceberg).lower() == "true":
     # Row-level spot-check: sale_id=1 was seeded with customer_id=100 and
     # amount=42.00. The value 42.00 is deliberately distinctive so it
     # survives any accidental int-cast / precision-truncation issue.
+    #
+    # H10: source rows via ``spark.sql`` (notebook is on the source
+    # workspace), target rows via ``auth.target_client``'s statement
+    # execution API. The previous implementation queried both via the
+    # source ``spark`` session — a no-op compare that would pass even
+    # if the migration dropped every row on target.
+    def _fetch_target_row(fqn: str, where: str) -> dict | None:
+        from common.sql_utils import find_warehouse as _find_wh  # noqa: E402
+
+        _wh = _find_wh(_ib_auth)
+        _resp = _ib_auth.target_client.statement_execution.execute_statement(
+            warehouse_id=_wh,
+            statement=f"SELECT sale_id, customer_id, amount FROM {fqn} WHERE {where}",
+            wait_timeout="30s",
+        )
+        # Poll a few times if not yet finished.
+        from databricks.sdk.service.sql import StatementState as _SS  # noqa: E402, N814
+
+        _stmt_id = _resp.statement_id
+        _state = _resp.status.state if _resp.status else None
+        _data = _resp.result.data_array if _resp.result else None
+        _cols = (
+            [c.name for c in _resp.manifest.schema.columns]
+            if _resp.manifest and _resp.manifest.schema
+            else []
+        )
+        import time as _time  # noqa: E402
+
+        for _ in range(30):
+            if _state in (_SS.SUCCEEDED, _SS.FAILED, _SS.CANCELED, _SS.CLOSED):
+                break
+            _time.sleep(1)
+            _stat = _ib_auth.target_client.statement_execution.get_statement(_stmt_id)
+            _state = _stat.status.state if _stat.status else None
+            _data = _stat.result.data_array if _stat.result else _data
+            if _stat.manifest and _stat.manifest.schema:
+                _cols = [c.name for c in _stat.manifest.schema.columns]
+        if _state != _SS.SUCCEEDED or not _data:
+            return None
+        return dict(zip(_cols, _data[0], strict=False))
+
     try:
         _src_row = spark.sql(  # noqa: F821
             "SELECT sale_id, customer_id, amount FROM "
             "integration_test_src.test_schema.iceberg_sales WHERE sale_id = 1"
         ).collect()
-        _tgt_row = spark.sql(  # noqa: F821
-            "SELECT sale_id, customer_id, amount FROM "
-            "integration_test_src.test_schema.iceberg_sales WHERE sale_id = 1"
-        ).collect()
-        # Source and target tables share the same FQN on this test setup
-        # (migration preserves catalog.schema.table); the worker runs
-        # against target, seed writes to source. spark session here is
-        # configured for the source workspace, so to compare we go via
-        # ``auth.target_client``'s SQL warehouse instead. We're running in
-        # the source workspace notebook, so spark.sql returns source.
-        # For target, pull via the target_client tables API's row_count +
-        # re-read target via AuthManager.target_client.
+        _tgt_row = _fetch_target_row(
+            "integration_test_src.test_schema.iceberg_sales",
+            "sale_id = 1",
+        )
         if not _src_row:
             error_messages.append("2.5.8: source iceberg_sales has no row with sale_id=1.")
+        elif _tgt_row is None:
+            error_messages.append(
+                "2.5.8: target iceberg_sales has no row with sale_id=1 (or query failed)."
+            )
         else:
             _src = _src_row[0]
             _expected = {"sale_id": 1, "customer_id": 100, "amount": 42.00}
@@ -640,6 +708,21 @@ if str(has_iceberg).lower() == "true":
                 if _src[_k] != _v:
                     error_messages.append(
                         f"2.5.8: source iceberg_sales sale_id=1 {_k}={_src[_k]!r}, expected {_v!r}"
+                    )
+            # Target row-level compare. Statement Execution returns string
+            # values; coerce to source's type before comparing so we don't
+            # get spurious string-vs-number mismatches.
+            for _k in ("sale_id", "customer_id", "amount"):
+                _src_v = _src[_k]
+                _tgt_v_raw = _tgt_row.get(_k)
+                try:
+                    _tgt_v = type(_src_v)(_tgt_v_raw) if _tgt_v_raw is not None else None
+                except (TypeError, ValueError):
+                    _tgt_v = _tgt_v_raw
+                if _src_v != _tgt_v:
+                    error_messages.append(
+                        f"2.5.8: target iceberg_sales sale_id=1 {_k}={_tgt_v_raw!r}, "
+                        f"expected source value {_src_v!r}"
                     )
 
             # Compare column schema across source + target via SDK — if
@@ -657,7 +740,8 @@ if str(has_iceberg).lower() == "true":
                 else:
                     print(
                         f"2.5.8 Iceberg row-level compare validated: source sale_id=1 "
-                        f"matches expected, column set {sorted(_src_cols)} preserved on target."
+                        f"matches expected, target row matches source, column set "
+                        f"{sorted(_src_cols)} preserved on target."
                     )
             except Exception as _exc:  # noqa: BLE001
                 error_messages.append(f"2.5.8: target_client.tables.get failed for iceberg_sales: {_exc}")
@@ -735,12 +819,8 @@ if str(has_iceberg_replay).lower() == "true":
             "2.5.9: no latest migration_status row for iceberg_replay_target — "
             "get_latest_migration_status returned nothing."
         )
-    elif _latest[0]["status"] != "validated":
-        error_messages.append(
-            f"2.5.9: iceberg_replay_target latest status is "
-            f"{_latest[0]['status']!r}, expected 'validated'. "
-            f"error={_latest[0]['error_message']}"
-        )
+    elif not _expect_validated(_latest[0], "2.5.9 iceberg_replay_target latest"):
+        pass  # error already appended
 else:
     print("2.5.9: Iceberg re-run fixture not seeded; skipping.")
 
@@ -827,11 +907,8 @@ if str(has_nested_volume).lower() == "true":
     ).collect()
     if not _nv_status:
         error_messages.append("2.5.10: no migration_status row for nested_volume.")
-    elif _nv_status[0]["status"] != "validated":
-        error_messages.append(
-            f"2.5.10: nested_volume status is {_nv_status[0]['status']!r}, "
-            f"expected 'validated'. error={_nv_status[0]['error_message']}"
-        )
+    elif not _expect_validated(_nv_status[0], "2.5.10 nested_volume"):
+        pass  # error already appended
 else:
     print("2.5.10: nested_volume fixture not seeded; skipping.")
 
@@ -1159,11 +1236,7 @@ if _rls_cm_strategy_active == "staging_copy" and str(has_rls_cm_managed).lower()
             )
             continue
         _row = _ms_rows[0]
-        if _row["status"] != "validated":
-            error_messages.append(
-                f"P.4 admin-bypass row count: {_fqn} status is "
-                f"{_row['status']!r}, expected 'validated' under staging_copy."
-            )
+        if not _expect_validated(_row, f"P.4 admin-bypass row count {_fqn}"):
             continue
         _src_n = _row["source_row_count"]
         _tgt_n = _row["target_row_count"]
