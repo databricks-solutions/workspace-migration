@@ -33,19 +33,27 @@ def _strip_heavy_fields(objects: list[dict]) -> list[dict]:
     return [{k: v for k, v in o.items() if k not in _STRIPPED_FIELDS} for o in objects]
 
 
-def build_batches(objects: list[dict], batch_size: int) -> list[str]:
+def build_batches(objects: list[dict], batch_size: int) -> tuple[list[str], list[dict]]:
     """Split object dicts into JSON-encoded batch strings bounded by both
     ``batch_size`` (count ceiling) AND ``MAX_BATCH_BYTES`` (size ceiling).
 
+    Returns ``(batches, oversize)``:
+
+    - ``batches`` — list of JSON-encoded batch strings, each ≤ MAX_BATCH_BYTES.
+    - ``oversize`` — original (non-minimized) object dicts whose own
+      encoding exceeded MAX_BATCH_BYTES. These are **not** included in
+      ``batches``; the caller is expected to record a terminal-failed
+      ``migration_status`` row for each so the operator sees the
+      misconfiguration instead of for_each crashing the whole batch at
+      runtime (review finding H6).
+
     A batch is closed as soon as either ceiling would be exceeded.
     Heavy fields (see ``_STRIPPED_FIELDS``) are removed first so typical
-    objects fit comfortably. When a single object's own encoding exceeds
-    ``MAX_BATCH_BYTES`` it is still emitted (alone) — dropping it
-    silently would be worse than an operator-visible for_each failure
-    with the warning pointing at the offending object.
+    objects fit comfortably.
     """
     minimized = _strip_heavy_fields(objects)
     batches: list[str] = []
+    oversize: list[dict] = []
     current: list[dict] = []
     # Running UTF-8 byte count of the in-progress batch JSON; starts at 2
     # for the enclosing "[]".
@@ -58,8 +66,22 @@ def build_batches(objects: list[dict], batch_size: int) -> list[str]:
             current = []
             current_bytes = 2
 
-    for obj in minimized:
+    for obj, original in zip(minimized, objects):
         obj_bytes = len(json.dumps(obj, default=str).encode("utf-8"))
+
+        if obj_bytes + 2 > MAX_BATCH_BYTES:
+            # Even alone in a batch this object would exceed the cap.
+            # Skip it from batches and record for caller-side reporting.
+            logger.warning(
+                "Single object encoded to %d bytes (> %d cap); skipping from "
+                "batches. Caller will record terminal-failed status. Object: %s",
+                obj_bytes + 2,
+                MAX_BATCH_BYTES,
+                obj.get("object_name", "?"),
+            )
+            oversize.append(original)
+            continue
+
         # One comma joins this obj to an existing non-empty batch.
         sep = 1 if current else 0
 
@@ -70,17 +92,8 @@ def build_batches(objects: list[dict], batch_size: int) -> list[str]:
             _flush()
             sep = 0
 
-        if obj_bytes + 2 > MAX_BATCH_BYTES:
-            logger.warning(
-                "Single object encoded to %d bytes (> %d cap); for_each "
-                "will fail on this item. Trim heavy fields on: %s",
-                obj_bytes + 2,
-                MAX_BATCH_BYTES,
-                obj.get("object_name", "?"),
-            )
-
         current.append(obj)
         current_bytes += sep + obj_bytes
 
     _flush()
-    return batches
+    return batches, oversize
