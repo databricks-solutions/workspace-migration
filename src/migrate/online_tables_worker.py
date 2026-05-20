@@ -16,11 +16,25 @@ except NameError:
     pass
 
 # COMMAND ----------
-# Online Tables Worker (Phase 3 Task 36).
+# Online Tables Worker.
 #
-# Replays online tables via REST POST /api/2.0/online-tables. Depends on
-# the source managed table existing on target (managed_table_worker ran
-# first). Online-table index state does NOT transfer — target rebuilds.
+# Phase 4 (this PR): online tables are hard-excluded from the core
+# migration tool. Online-table index state (sync history, freshness
+# cursors) is runtime state that cannot be replayed via a REST POST —
+# even though the POST itself succeeds, the resulting target index
+# starts from zero with no provenance link to source. Migration is
+# handled by the Stateful Services Phase (separate future job) with
+# proper source-table cutover semantics. See
+# ``docs/stateful_services_phase.md``.
+#
+# This worker short-circuits all online_table rows to
+# ``skipped_by_stateful_service_migration`` (terminal) so the discovery-
+# inventory row reaches a clean terminal status and get_pending_objects
+# stops re-emitting it.
+#
+# Historical note: an earlier version of this worker called
+# ``POST /api/2.0/online-tables`` directly. That code is removed in
+# Phase 4.
 
 import json
 import logging
@@ -42,61 +56,37 @@ def _is_notebook() -> bool:
         return False
 
 
-def apply_online_table(ot: dict, *, auth: AuthManager, dry_run: bool) -> dict:
+_SKIP_MESSAGE = (
+    "Out of scope for the core migration tool. Online tables are migrated "
+    "by the Stateful Services Phase (separate future job) with proper "
+    "source-table cutover and sync rebuild. See "
+    "docs/stateful_services_phase.md."
+)
+
+
+def apply_online_table(
+    ot: dict,
+    *,
+    auth: AuthManager,  # noqa: ARG001 — signature kept for symmetry with other workers
+    dry_run: bool,  # noqa: ARG001
+) -> dict:
+    """Short-circuit every online_table row to
+    ``skipped_by_stateful_service_migration``.
+
+    Phase 4 hard-exclusion: same pattern as MV / ST. Returns immediately
+    without POSTing to target.
+    """
     name = ot.get("online_table_fqn", "")
-    definition = ot.get("definition") or {}
     obj_key = f"ONLINE_TABLE_{name}"
-
-    # Strip fields that belong to the source runtime — target POST assigns
-    # new IDs / status / unity_catalog_provisioning_state.
-    body = {
-        "name": name,
-        "spec": definition.get("spec", {}),
-    }
-
     start = time.time()
-    if dry_run:
-        logger.info("[DRY RUN] Would POST online table %s", name)
-        return {
-            "object_name": obj_key,
-            "object_type": "online_table",
-            "status": "skipped",
-            "error_message": "dry_run",
-            "duration_seconds": time.time() - start,
-        }
-
-    try:
-        auth.target_client.api_client.do(
-            "POST",
-            "/api/2.0/online-tables",
-            body=body,
-        )
-        return {
-            "object_name": obj_key,
-            "object_type": "online_table",
-            "status": "validated",
-            "error_message": "Index state rebuilds on target — initial sync runs async.",
-            "duration_seconds": time.time() - start,
-        }
-    except Exception as exc:  # noqa: BLE001
-        # Idempotency: POST /online-tables has no upsert semantic. On retry
-        # the online table may already exist — treat "already exists" as
-        # validated so a resumed run doesn't regress to failed.
-        err_text = str(exc).lower()
-        if "already" in err_text and "exists" in err_text:
-            return {
-                "object_name": obj_key, "object_type": "online_table",
-                "status": "validated",
-                "error_message": "already existed on target",
-                "duration_seconds": time.time() - start,
-            }
-        return {
-            "object_name": obj_key,
-            "object_type": "online_table",
-            "status": "failed",
-            "error_message": str(exc),
-            "duration_seconds": time.time() - start,
-        }
+    logger.info("Skipping online_table %s — handled by the Stateful Services Phase.", name)
+    return {
+        "object_name": obj_key,
+        "object_type": "online_table",
+        "status": "skipped_by_stateful_service_migration",
+        "error_message": _SKIP_MESSAGE,
+        "duration_seconds": time.time() - start,
+    }
 
 
 def run(dbutils, spark) -> None:
@@ -123,8 +113,8 @@ def run(dbutils, spark) -> None:
     if results:
         tracker.append_migration_status(results)
     logger.info(
-        "Online tables worker complete. %d validated, %d failed.",
-        sum(1 for r in results if r["status"] == "validated"),
+        "Online tables worker complete. %d skipped_by_stateful_service_migration, %d failed.",
+        sum(1 for r in results if r["status"] == "skipped_by_stateful_service_migration"),
         sum(1 for r in results if r["status"] == "failed"),
     )
 

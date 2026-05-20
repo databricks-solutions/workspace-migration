@@ -656,23 +656,30 @@ class TestForeignCatalogsWorker:
 
 
 class TestOnlineTablesWorker:
+    """Phase 4: online tables are hard-excluded from the core migration
+    tool. ``apply_online_table`` short-circuits to
+    ``skipped_by_stateful_service_migration`` without touching the
+    target — index state is runtime state that the Stateful Services
+    Phase (separate future job) handles via proper sync-rebuild
+    semantics. See ``docs/stateful_services_phase.md``."""
+
     @patch("migrate.online_tables_worker.time")
-    def test_posts_online_table(self, mock_time):
+    def test_apply_online_table_hard_excludes(self, mock_time):
         from migrate.online_tables_worker import apply_online_table
 
-        mock_time.time.side_effect = [100.0, 101.0]
+        mock_time.time.side_effect = [100.0, 100.1]
         auth = MagicMock()
-        auth.target_client.api_client.do.return_value = {"ok": True}
 
         res = apply_online_table(
             {"online_table_fqn": "c.s.online_t", "definition": {"spec": {"source_table_full_name": "c.s.t"}}},
             auth=auth,
             dry_run=False,
         )
-        assert res["status"] == "validated"
-        body = auth.target_client.api_client.do.call_args.kwargs["body"]
-        assert body["name"] == "c.s.online_t"
-        assert body["spec"]["source_table_full_name"] == "c.s.t"
+        assert res["status"] == "skipped_by_stateful_service_migration"
+        assert res["object_name"] == "ONLINE_TABLE_c.s.online_t"
+        assert "Stateful Services Phase" in res["error_message"]
+        # No POST issued — that's the entire point of hard-exclusion.
+        auth.target_client.api_client.do.assert_not_called()
 
 
 # ---------------------------------------------------- Sharing ---------
