@@ -324,6 +324,14 @@ class TestCommentsIdempotency:
 
 
 class TestMvStIdempotency:
+    """Phase 4: both MV and ST are hard-excluded. Idempotency is
+    trivially guaranteed because the worker performs no target-side
+    mutation — every row short-circuits to
+    ``skipped_by_stateful_service_migration``. Earlier idempotency tests
+    for the DDL-replay branch are removed because the branch no longer
+    exists.
+    """
+
     def _deps(self) -> dict:
         c = MagicMock()
         c.dry_run = False
@@ -331,102 +339,31 @@ class TestMvStIdempotency:
             "config": c, "auth": MagicMock(), "tracker": MagicMock(), "wh_id": "wh",
         }
 
-    @patch("migrate.mv_st_worker._is_sql_created", return_value=(True, "empty"))
     @patch("migrate.mv_st_worker.time")
-    @patch("migrate.mv_st_worker.execute_and_poll")
-    def test_create_success_then_refresh_success(self, mock_exec, mock_time, _sql_created):
+    def test_mv_hard_exclude_is_idempotent(self, mock_time):
+        """Re-running on the same row produces the same skip status with
+        no target-side calls — by definition idempotent."""
         from migrate.mv_st_worker import migrate_mv_st
 
-        mock_time.time.side_effect = [100.0, 101.0, 102.0]
-        mock_exec.return_value = _ok()
+        mock_time.time.side_effect = [100.0, 100.1, 100.2, 100.3]
         deps = self._deps()
-        res = migrate_mv_st(
-            {"object_name": "`c`.`s`.`mv`", "object_type": "mv",
-             "pipeline_id": "p1", "create_statement": "CREATE MATERIALIZED VIEW `c`.`s`.`mv` AS SELECT 1"},
-            **deps,
-        )
-        assert res["status"] == "validated"
-        assert mock_exec.call_count == 2  # CREATE + REFRESH
+        obj = {"object_name": "`c`.`s`.`mv`", "object_type": "mv", "pipeline_id": "p1"}
 
-    @patch("migrate.mv_st_worker._is_sql_created", return_value=(True, "empty"))
+        res1 = migrate_mv_st(obj, **deps)
+        res2 = migrate_mv_st(obj, **deps)
+        assert res1["status"] == res2["status"] == "skipped_by_stateful_service_migration"
+        deps["auth"].target_client.statement_execution.execute_statement.assert_not_called()
+
     @patch("migrate.mv_st_worker.time")
-    @patch("migrate.mv_st_worker.execute_and_poll")
-    def test_create_already_exists_treated_as_validated(self, mock_exec, mock_time, _sql_created):
-        """BUG FIX: retry with MV already present must not mark failed."""
-        from migrate.mv_st_worker import migrate_mv_st
-
-        mock_time.time.side_effect = [100.0, 101.0, 102.0]
-        mock_exec.side_effect = [
-            {"state": "FAILED", "error": "Table or view `c`.`s`.`mv` already exists"},
-            _ok(),  # REFRESH
-        ]
-        deps = self._deps()
-        res = migrate_mv_st(
-            {"object_name": "`c`.`s`.`mv`", "object_type": "mv",
-             "pipeline_id": "p1", "create_statement": "CREATE MATERIALIZED VIEW ..."},
-            **deps,
-        )
-        assert res["status"] == "validated"
-        assert "already existed" in (res["error_message"] or "")
-
-    @patch("migrate.mv_st_worker._is_sql_created", return_value=(False, "libraries=1"))
-    @patch("migrate.mv_st_worker.time")
-    @patch("migrate.mv_st_worker.execute_and_poll")
-    def test_dlt_owned_pipeline_is_skipped(self, mock_exec, mock_time, _sql_created):
-        """Pin: DLT-owned pipelines are skipped with skipped_by_pipeline_migration."""
-        from migrate.mv_st_worker import migrate_mv_st
-
-        mock_time.time.side_effect = [100.0, 101.0]
-        deps = self._deps()
-        res = migrate_mv_st(
-            {"object_name": "`c`.`s`.`mv`", "object_type": "mv",
-             "pipeline_id": "p1", "create_statement": "CREATE MATERIALIZED VIEW ..."},
-            **deps,
-        )
-        assert res["status"] == "skipped_by_pipeline_migration"
-        mock_exec.assert_not_called()
-
-    @patch("migrate.mv_st_worker._is_sql_created", return_value=(True, "empty"))
-    @patch("migrate.mv_st_worker.time")
-    @patch("migrate.mv_st_worker.execute_and_poll")
-    def test_create_non_already_error_still_fails(self, mock_exec, mock_time, _sql_created):
-        """Pin: CREATE errors that aren't 'already exists' are still failures."""
-        from migrate.mv_st_worker import migrate_mv_st
-
-        mock_time.time.side_effect = [100.0, 101.0]
-        mock_exec.return_value = {"state": "FAILED", "error": "PERMISSION_DENIED"}
-        deps = self._deps()
-        res = migrate_mv_st(
-            {"object_name": "`c`.`s`.`mv`", "object_type": "mv",
-             "pipeline_id": "p1", "create_statement": "CREATE MATERIALIZED VIEW ..."},
-            **deps,
-        )
-        assert res["status"] == "failed"
-
-    @patch("migrate.mv_st_worker._is_sql_created")
-    @patch("migrate.mv_st_worker.time")
-    @patch("migrate.mv_st_worker.execute_and_poll")
-    def test_streaming_table_is_skipped_by_stateful_service_migration(self, mock_exec, mock_time, mock_is_sql):
-        """Pin: streaming tables are hard-excluded from the core tool and
-        short-circuit to ``skipped_by_stateful_service_migration``. The
-        Stateful Services Phase (separate future job) migrates them with
-        proper offset/checkpoint handling. Regression guard against
-        reintroducing a DDL-replay path for STs here —
-        ``_is_sql_created`` and ``execute_and_poll`` must not be called.
-        """
+    def test_st_hard_exclude_is_idempotent(self, mock_time):
         from migrate.mv_st_worker import migrate_mv_st
 
         mock_time.time.side_effect = [100.0, 100.1]
         deps = self._deps()
-        res = migrate_mv_st(
-            {"object_name": "`c`.`s`.`st1`", "object_type": "st",
-             "pipeline_id": "p1", "create_statement": "CREATE STREAMING TABLE ..."},
-            **deps,
-        )
+        obj = {"object_name": "`c`.`s`.`st1`", "object_type": "st", "pipeline_id": "p1"}
+        res = migrate_mv_st(obj, **deps)
         assert res["status"] == "skipped_by_stateful_service_migration"
         assert "Stateful Services Phase" in (res["error_message"] or "")
-        mock_is_sql.assert_not_called()
-        mock_exec.assert_not_called()
 
 
 # ============================================================================
@@ -669,34 +606,24 @@ class TestForeignCatalogsIdempotency:
 # ============================================================================
 # online_tables_worker
 # ============================================================================
-# | any | missing | POST /online-tables             | validated |
-# | any | exists  | POST -> "already exists"        | BUG FIX: now validated |
+# Phase 4: online tables are hard-excluded. ``apply_online_table`` short-
+# circuits to ``skipped_by_stateful_service_migration`` — idempotent by
+# construction because no target-side mutation occurs.
 
 
 class TestOnlineTablesIdempotency:
-    def test_post_succeeds(self):
+    def test_hard_exclude_is_idempotent(self):
+        """Re-running on the same row produces the same skip status; the
+        target POST endpoint is never called."""
         from migrate.online_tables_worker import apply_online_table
 
         auth = MagicMock()
-        auth.target_client.api_client.do.return_value = None
-        res = apply_online_table(
-            {"online_table_fqn": "c.s.ot", "definition": {"spec": {}}},
-            auth=auth, dry_run=False,
-        )
-        assert res["status"] == "validated"
-
-    def test_already_exists_is_validated(self):
-        """BUG FIX: retry with online table already present no longer marks failed."""
-        from migrate.online_tables_worker import apply_online_table
-
-        auth = MagicMock()
-        auth.target_client.api_client.do.side_effect = Exception("online table already exists")
-        res = apply_online_table(
-            {"online_table_fqn": "c.s.ot", "definition": {"spec": {}}},
-            auth=auth, dry_run=False,
-        )
-        assert res["status"] == "validated"
-        assert "already existed" in (res["error_message"] or "")
+        obj = {"online_table_fqn": "c.s.ot", "definition": {"spec": {}}}
+        res1 = apply_online_table(obj, auth=auth, dry_run=False)
+        res2 = apply_online_table(obj, auth=auth, dry_run=False)
+        assert res1["status"] == res2["status"] == "skipped_by_stateful_service_migration"
+        assert "Stateful Services Phase" in (res1["error_message"] or "")
+        auth.target_client.api_client.do.assert_not_called()
 
 
 # ============================================================================

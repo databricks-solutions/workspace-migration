@@ -225,16 +225,65 @@ def apply_model(
         )
     if version_errors:
         status_msg_parts.append("Errors: " + "; ".join(version_errors[:5]))
+    # H5: missing artifact copy is a real failure mode, not a passing run
+    # with a warning. Without artifacts, the registered model is metadata-
+    # only on target — operator intervention is required. Mark
+    # validation_failed (non-terminal) so the next migrate run retries
+    # once the helper notebook is uploadable, matching the volume worker
+    # contract (artifact bytes are essential).
+    _is_failed = bool(version_errors) or not artifact_copy_available
     results.append(
         {
             "object_name": obj_key,
             "object_type": "registered_model",
-            "status": "validated" if not version_errors else "validation_failed",
+            "status": "validation_failed" if _is_failed else "validated",
             "error_message": " ".join(status_msg_parts),
             "duration_seconds": duration,
         }
     )
     return results
+
+
+def cleanup_partial_target(
+    object_name: str, *, auth: AuthManager, spark=None, config=None
+) -> None:
+    """Drop the target registered model so the retry can recreate cleanly.
+
+    C5: registered_model migration is multi-step (shell + N versions +
+    artifact copies + aliases). When a run crashes between steps it
+    leaves partial state on target (e.g. v1-v4 metadata present plus a
+    half-copied v5 artifact directory). On retry, ``apply_model`` would
+    happily tolerate ``AlreadyExists`` on the shell but leave the
+    partial v5 unreconciled. Dropping the whole model lets the retry
+    start clean.
+
+    Best-effort: swallow ``NOT_FOUND`` (model was never created or
+    crashed before the SDK call landed). Other errors propagate so the
+    reconciler can log and continue resetting the row.
+
+    Mirrors ``volume_worker.cleanup_partial_target``.
+    """
+    target_fqn = object_name
+    # Discovery key is ``MODEL_<model_fqn>`` (see apply_model). Strip
+    # the prefix so the SDK call sees the bare ``catalog.schema.name``.
+    if target_fqn.startswith("MODEL_"):
+        target_fqn = target_fqn[len("MODEL_") :]
+    target_fqn = target_fqn.strip("`").replace("`.`", ".")
+    try:
+        auth.target_client.registered_models.delete(full_name=target_fqn)
+        logger.info(
+            "Reconciliation cleanup: dropped partial target registered model %s",
+            target_fqn,
+        )
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "not" in msg and ("exist" in msg or "found" in msg):
+            logger.info(
+                "Reconciliation cleanup: target model %s already absent; nothing to drop.",
+                target_fqn,
+            )
+            return
+        raise
 
 
 def run(dbutils, spark) -> None:

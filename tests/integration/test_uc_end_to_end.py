@@ -236,6 +236,11 @@ except Exception as _exc:  # noqa: BLE001
 
 # COMMAND ----------
 # --- Phase 2.5.D: SQL-created MV ---
+# Phase 4 scope change: MVs are hard-excluded from the core migration
+# tool. The worker short-circuits to ``skipped_by_stateful_service_
+# migration`` (same pattern as ST since PR #41). The Stateful Services
+# Phase (separate future job) handles MV migration with proper pipeline-
+# state semantics. See docs/stateful_services_phase.md.
 has_mv = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
     taskKey="seed_uc", key="has_mv", debugValue="false"
 )
@@ -243,23 +248,14 @@ if str(has_mv).lower() == "true":
     mv_status = status_df.filter("object_type = 'mv' AND object_name LIKE '%mv_high_value%'").collect()
     if not mv_status:
         error_messages.append("Phase 2.5.D: MV row missing from migration_status.")
-    elif not _expect_validated(mv_status[0], "Phase 2.5.D MV"):
-        pass  # error already appended
+    elif mv_status[0]["status"] != "skipped_by_stateful_service_migration":
+        error_messages.append(
+            f"Phase 2.5.D: MV status is '{mv_status[0]['status']}', expected "
+            f"'skipped_by_stateful_service_migration' (Phase 4 hard-exclude). "
+            f"error={mv_status[0]['error_message']}"
+        )
     else:
-        try:
-            detail = spark.sql(  # noqa: F821
-                "DESCRIBE DETAIL integration_test_src.test_schema.mv_high_value"
-            ).first()
-            props = detail.properties if detail and detail.properties else {}
-            if not props.get("pipelines.pipelineId"):
-                error_messages.append(
-                    "Phase 2.5.D: MV on target is missing pipelines.pipelineId "
-                    "(target did not auto-provision a backing pipeline)"
-                )
-            else:
-                print(f"Phase 2.5.D MV validated: pipeline_id={props['pipelines.pipelineId']}")
-        except Exception as _exc:  # noqa: BLE001
-            error_messages.append(f"Phase 2.5.D: MV DESCRIBE DETAIL failed: {_exc}")
+        print(f"Phase 2.5.D MV hard-excluded (as expected): {mv_status[0]['object_name']}")
 else:
     print("Phase 2.5.D: MV fixture not seeded; skipping MV assertion.")
 

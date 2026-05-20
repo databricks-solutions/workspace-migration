@@ -89,6 +89,16 @@ def _resolve_cleanup_hooks() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         logger.debug("sharing_worker.cleanup_partial_share not available; skipping")
 
+    try:
+        from migrate.models_worker import cleanup_partial_target as _model_cleanup
+
+        # C5: multi-version model copy that crashes mid-way leaves partial
+        # state on target (shell + some versions + half-copied artifacts).
+        # Dropping the model lets the retry start clean.
+        hooks["registered_model"] = _model_cleanup
+    except Exception:  # noqa: BLE001
+        logger.debug("models_worker.cleanup_partial_target not available; skipping")
+
     return hooks
 
 

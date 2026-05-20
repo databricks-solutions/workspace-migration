@@ -106,3 +106,39 @@ def test_apply_model_version_idempotent_on_already_exists(monkeypatch):
     # copy succeeded — it does here, so validated.
     assert results[0]["status"] == "validated"
     client.model_versions.get.assert_called_once()
+
+
+def test_apply_model_validation_failed_when_helper_unavailable(monkeypatch):
+    """H5: when the target-side copy helper notebook can't be uploaded
+    (``ensure_copy_notebook_on_target`` raises), artifact bytes never
+    move. The row must NOT be ``validated`` — that's a metadata-only
+    target. Mark ``validation_failed`` so the operator sees it and the
+    next migrate retries once the helper is uploadable.
+    """
+    auth, client = _auth_with_target()
+    client.registered_models.create.return_value = None
+
+    def helper_boom(*args, **kwargs):
+        raise RuntimeError("workspace API 403: cannot upload notebook")
+
+    monkeypatch.setattr(models_worker, "ensure_copy_notebook_on_target", helper_boom)
+    # If the helper fails up front, run_target_file_copy is gated off; we
+    # still patch it as a guard so a regression that calls it would fail
+    # the test loudly.
+    monkeypatch.setattr(
+        models_worker,
+        "run_target_file_copy",
+        lambda *a, **k: pytest_fail("run_target_file_copy must not be called when helper unavailable"),
+    )
+
+    results = models_worker.apply_model(_model_with_one_version(), auth=auth, dry_run=False)
+    assert len(results) == 1
+    assert results[0]["status"] == "validation_failed"
+    err = results[0]["error_message"]
+    # The 0/0 copy summary and the helper-unavailable note must both be visible.
+    assert "0 file(s), 0 byte(s) copied." in err
+    assert "Artifact copy helper unavailable on target" in err
+
+
+def pytest_fail(msg: str):  # pragma: no cover - guard helper
+    raise AssertionError(msg)
