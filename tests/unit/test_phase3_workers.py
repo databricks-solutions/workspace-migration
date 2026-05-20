@@ -570,9 +570,12 @@ class TestModelsWorker:
     @patch("migrate.models_worker.run_target_file_copy")
     @patch("migrate.models_worker.ensure_copy_notebook_on_target")
     @patch("migrate.models_worker.time")
-    def test_copy_notebook_upload_failure_skips_artifact_copy(self, mock_time, mock_ensure, mock_copy):
-        """If the helper notebook can't be uploaded, artifact copy is skipped
-        silently and the message flags it — model metadata still migrates."""
+    def test_copy_notebook_upload_failure_marks_validation_failed(self, mock_time, mock_ensure, mock_copy):
+        """H5: if the helper notebook can't be uploaded the artifact bytes
+        never move — the model is metadata-only on target, which is a
+        real failure mode (not a passing run with a warning). Worker
+        records ``validation_failed`` so the operator sees it and the
+        next migrate retries when the helper is uploadable."""
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 101.0]
@@ -589,8 +592,7 @@ class TestModelsWorker:
             auth=auth,
             dry_run=False,
         )
-        # Still validated — artifact copy is best-effort.
-        assert results[0]["status"] == "validated"
+        assert results[0]["status"] == "validation_failed"
         assert "artifacts NOT copied" in results[0]["error_message"]
         mock_copy.assert_not_called()
 

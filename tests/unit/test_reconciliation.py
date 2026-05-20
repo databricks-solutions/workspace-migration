@@ -262,6 +262,30 @@ class TestReconcileStaleRuns:
         assert out["reset_count"] == 1
         assert out["cleanup_count"] == 0
 
+    def test_cleanup_hook_dispatched_for_registered_model(self, mock_config):
+        """C5: a registered_model in_progress row triggers
+        models_worker.cleanup_partial_target so partial multi-version
+        state is dropped before the row is reset."""
+        from migrate.reconciliation import reconcile_stale_runs
+
+        rows = [_mock_status_row("MODEL_c.s.m", "registered_model", "in_progress", "old-run")]
+        spark = _spark_returning(rows)
+        tracker = MagicMock()
+        auth = MagicMock()
+
+        with patch("migrate.models_worker.cleanup_partial_target") as cleanup:
+            out = reconcile_stale_runs(
+                spark=spark,
+                config=mock_config,
+                tracker=tracker,
+                auth=auth,
+                current_job_run_id="new-run",
+            )
+            cleanup.assert_called_once()
+            assert cleanup.call_args.args[0] == "MODEL_c.s.m"
+        assert out["cleanup_count"] == 1
+        assert out["reset_count"] == 1
+
     def test_no_hook_for_unrelated_worker(self, mock_config):
         """managed_table has no cleanup hook (DEEP CLONE is CREATE OR
         REPLACE). Reset should still happen but cleanup_count stays 0."""
@@ -455,6 +479,55 @@ class TestVolumeCleanupPartialTarget:
         auth.target_client.volumes.delete.side_effect = RuntimeError("PERMISSION_DENIED")
         with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
             cleanup_partial_target("`cat`.`sch`.`v`", auth=auth, spark=None, config=None)
+
+
+class TestModelsCleanupPartialTarget:
+    """C5: registered_model needs a cleanup hook so a crash mid multi-version
+    copy doesn't leave the next run wedged on partial state."""
+
+    def test_strips_model_prefix(self):
+        """object_name comes through as ``MODEL_<fqn>``; the SDK call must
+        receive the bare ``catalog.schema.name`` form."""
+        from migrate.models_worker import cleanup_partial_target
+
+        auth = MagicMock()
+        cleanup_partial_target("MODEL_c.s.m", auth=auth, spark=None, config=None)
+        auth.target_client.registered_models.delete.assert_called_once_with(full_name="c.s.m")
+
+    def test_strips_backticks(self):
+        from migrate.models_worker import cleanup_partial_target
+
+        auth = MagicMock()
+        cleanup_partial_target("MODEL_`c`.`s`.`m`", auth=auth, spark=None, config=None)
+        auth.target_client.registered_models.delete.assert_called_once_with(full_name="c.s.m")
+
+    def test_plain_fqn_accepted(self):
+        """If called with no ``MODEL_`` prefix, treat as bare fqn."""
+        from migrate.models_worker import cleanup_partial_target
+
+        auth = MagicMock()
+        cleanup_partial_target("c.s.m", auth=auth, spark=None, config=None)
+        auth.target_client.registered_models.delete.assert_called_once_with(full_name="c.s.m")
+
+    def test_not_found_tolerated(self):
+        from migrate.models_worker import cleanup_partial_target
+
+        auth = MagicMock()
+        auth.target_client.registered_models.delete.side_effect = RuntimeError(
+            "RESOURCE_DOES_NOT_EXIST"
+        )
+        # Must not raise — crash before CREATE landed leaves nothing to drop.
+        cleanup_partial_target("MODEL_c.s.m", auth=auth, spark=None, config=None)
+
+    def test_other_error_reraised(self):
+        from migrate.models_worker import cleanup_partial_target
+
+        auth = MagicMock()
+        auth.target_client.registered_models.delete.side_effect = RuntimeError(
+            "PERMISSION_DENIED"
+        )
+        with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+            cleanup_partial_target("MODEL_c.s.m", auth=auth, spark=None, config=None)
 
 
 class TestSharingCleanupPartialShare:
