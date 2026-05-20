@@ -7,9 +7,12 @@ import sys  # noqa: E402
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
-    _src = "/Workspace" + _nb.split("/files/")[0] + "/files/src"
-    if _src not in sys.path:
-        sys.path.insert(0, _src)
+    _files_root = "/Workspace" + _nb.split("/files/")[0] + "/files"
+    # /files/src for ``common.*`` resolution; /files for ``tests.integration.*``
+    # shared helpers (matches setup_test_config bootstrap).
+    for _p in (f"{_files_root}/src", _files_root):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 except NameError:
     pass
 
@@ -45,11 +48,20 @@ except NameError:
 
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from tests.integration._assertion_helpers import expect_validated  # type: ignore[import-not-found]
 
 config = MigrationConfig.from_workspace_file()
 tracker = TrackingManager(spark, config)  # noqa: F821
 
 error_messages: list[str] = []
+
+
+def _expect_validated(row, label: str) -> bool:  # type: ignore[no-untyped-def]
+    """Thin wrapper binding the shared helper to this notebook's
+    ``error_messages`` accumulator. See
+    ``tests/integration/_assertion_helpers.py``. Closes review H11."""
+    return expect_validated(row, label, error_messages)
+
 
 # Pull the latest migration_status snapshot once, the same way the UC
 # governance assertions inside test_uc_end_to_end did. The governance
@@ -66,7 +78,12 @@ _has_non_table_tags = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]
     taskKey="seed_uc", key="has_non_table_tags", debugValue="false"
 )
 if str(_has_non_table_tags).lower() == "true":
-    _validated_tag_rows = full_status.filter("object_type = 'tag' AND status = 'validated'").collect()
+    # H11: "validated" must mean status=validated AND empty error_message
+    # so a worker recording validated-with-warning doesn't leak through
+    # this counting assertion as a pass.
+    _validated_tag_rows = full_status.filter(
+        "object_type = 'tag' AND status = 'validated' AND (error_message IS NULL OR error_message = '')"
+    ).collect()
     # C6: object_name aligns with discovery's per-tag key:
     #   f"{securable_fqn}:{column_name}:{tag_name}".rstrip(":")
     # CATALOG/SCHEMA/VOLUME tags have empty column, so their keys look
@@ -98,8 +115,12 @@ _has_col_cmt = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noq
     taskKey="seed_uc", key="has_column_comment", debugValue="false"
 )
 if str(_has_col_cmt).lower() == "true":
+    # H11: validated + non-empty error_message indicates a warning-tainted
+    # row that should not count as "the comment migrated cleanly".
     _col_cmt_rows = full_status.filter(
-        "object_type = 'comment' AND status = 'validated' AND object_name LIKE 'COMMENT_COLUMN_%'"
+        "object_type = 'comment' AND status = 'validated' "
+        "AND (error_message IS NULL OR error_message = '') "
+        "AND object_name LIKE 'COMMENT_COLUMN_%'"
     ).collect()
     if not _col_cmt_rows:
         error_messages.append(
@@ -137,8 +158,11 @@ _has_vol_cmt = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noq
     taskKey="seed_uc", key="has_volume_comment", debugValue="false"
 )
 if str(_has_vol_cmt).lower() == "true":
+    # H11: same warning-tainted guard as the column-comment check above.
     _vol_cmt_rows = full_status.filter(
-        "object_type = 'comment' AND status = 'validated' AND object_name LIKE 'COMMENT_VOLUME_%'"
+        "object_type = 'comment' AND status = 'validated' "
+        "AND (error_message IS NULL OR error_message = '') "
+        "AND object_name LIKE 'COMMENT_VOLUME_%'"
     ).collect()
     _vol_hit = any("test_volume" in r["object_name"] for r in _vol_cmt_rows)
     if not _vol_hit:
