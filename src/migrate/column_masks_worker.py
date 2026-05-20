@@ -59,7 +59,10 @@ def apply_column_mask(
         using = ", ".join(f"`{c}`" for c in using_cols)
         sql += f" USING COLUMNS ({using})"
 
-    obj_key = f"COLUMN_MASK_{table_fqn}.{column}"
+    # C6: match discovery's key (``<table_fqn>.<column_name>``) so
+    # ``get_pending_objects`` LEFT JOIN matches and the row is terminal on
+    # re-run. The historical ``COLUMN_MASK_`` prefix prevented the join.
+    obj_key = f"{table_fqn}.{column}"
     start = time.time()
     if dry_run:
         logger.info("[DRY RUN] %s", sql)
@@ -115,7 +118,7 @@ def run(dbutils, spark) -> None:
             res = apply_column_mask(meta, auth=auth, wh_id=wh_id, dry_run=config.dry_run)
         except Exception as exc:  # noqa: BLE001
             res = {
-                "object_name": f"COLUMN_MASK_{meta.get('table_fqn', '?')}",
+                "object_name": f"{meta.get('table_fqn', '?')}.{meta.get('column_name', '?')}",
                 "object_type": "column_mask",
                 "status": "failed",
                 "error_message": str(exc),

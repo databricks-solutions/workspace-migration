@@ -67,17 +67,21 @@ _has_non_table_tags = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]
 )
 if str(_has_non_table_tags).lower() == "true":
     _validated_tag_rows = full_status.filter("object_type = 'tag' AND status = 'validated'").collect()
-    # tags_worker writes object_name = f"TAGS_{securable_type}_{fqn}[.col]"
+    # C6: object_name aligns with discovery's per-tag key:
+    #   f"{securable_fqn}:{column_name}:{tag_name}".rstrip(":")
+    # CATALOG/SCHEMA/VOLUME tags have empty column, so their keys look
+    # like ``<fqn>::<tag_name>`` (double colon, table/securable type
+    # encoded in the FQN itself).
     _tag_names = [r["object_name"] for r in _validated_tag_rows]
-    _cat_tag_hit = any(n.startswith("TAGS_CATALOG_") and "integration_test_src" in n for n in _tag_names)
-    _sch_tag_hit = any(n.startswith("TAGS_SCHEMA_") and "test_schema" in n for n in _tag_names)
-    _vol_tag_hit = any(n.startswith("TAGS_VOLUME_") and "test_volume" in n for n in _tag_names)
+    _cat_tag_hit = any("integration_test_src" in n and "::" in n for n in _tag_names if n.count(".") <= 1)
+    _sch_tag_hit = any("test_schema" in n and "::" in n for n in _tag_names)
+    _vol_tag_hit = any("test_volume" in n and "::" in n for n in _tag_names)
     if not _cat_tag_hit:
-        error_messages.append("3.15 tags: no validated CATALOG tag row (expected TAGS_CATALOG_*integration_test_src*).")
+        error_messages.append("3.15 tags: no validated CATALOG tag row (expected `integration_test_src`::<tag>).")
     if not _sch_tag_hit:
-        error_messages.append("3.15 tags: no validated SCHEMA tag row (expected TAGS_SCHEMA_*test_schema*).")
+        error_messages.append("3.15 tags: no validated SCHEMA tag row (expected ...test_schema::<tag>).")
     if not _vol_tag_hit:
-        error_messages.append("3.15 tags: no validated VOLUME tag row (expected TAGS_VOLUME_*test_volume*).")
+        error_messages.append("3.15 tags: no validated VOLUME tag row (expected ...test_volume::<tag>).")
     if _cat_tag_hit and _sch_tag_hit and _vol_tag_hit:
         print("3.15 tags validated: CATALOG / SCHEMA / VOLUME all replayed on target.")
 else:
