@@ -32,13 +32,7 @@ logger = logging.getLogger("orchestrator")
 
 
 # COMMAND ----------
-# Batching helpers live in ``migrate.batching`` (plain module — notebooks
-# can't import other notebooks). Re-exported here for back-compat so
-# existing ``from migrate.orchestrator import build_batches`` callers
-# (unit tests, downstream code) keep working.
-
-from migrate.batching import (  # noqa: E402, F401
-    MAX_BATCH_BYTES,
+from migrate.batching import (  # noqa: E402
     _strip_heavy_fields,
     build_batches,
 )
@@ -162,12 +156,14 @@ if _is_notebook():
         "view",
         # Phase 3 governance object types — published even when counts
         # are zero so downstream worker tasks always have a valid JSON
-        # payload to consume.
+        # payload to consume. ``comment`` is intentionally excluded:
+        # comments_worker reads discovery_inventory directly because
+        # comments span table / view / column / volume / schema / catalog
+        # and a flat ``comment_list`` was never a natural fit.
         "tag",
         "row_filter",
         "column_mask",
         "policy",
-        "comment",
         "monitor",
         "registered_model",
         "connection",

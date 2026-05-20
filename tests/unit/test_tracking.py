@@ -125,11 +125,26 @@ class TestTrackingManager:
             "'skipped_target_exists', 'skipped_by_stateful_service_migration')"
             in sql_arg
         )
-        assert "managed_table" in sql_arg
+        # object_type is passed via args= (parameterized), not interpolated
+        assert "managed_table" not in sql_arg
+        assert mock_spark.sql.call_args.kwargs["args"] == {"obj_type": "managed_table"}
 
         # Verify the result is a list of dicts from collect()
         assert len(result) == 1
         assert result[0]["object_name"] == "catalog.schema.table1"
+
+    def test_get_pending_objects_quote_safe(self, mock_spark, mock_config):
+        """object_type with embedded quote must travel via args= (not inlined)."""
+        mgr = TrackingManager(mock_spark, mock_config)
+        mock_result = MagicMock()
+        mock_result.collect.return_value = []
+        mock_spark.sql.return_value = mock_result
+
+        mgr.get_pending_objects("manage'd_table")
+
+        sql_arg = mock_spark.sql.call_args[0][0]
+        assert "manage'd_table" not in sql_arg
+        assert mock_spark.sql.call_args.kwargs["args"]["obj_type"] == "manage'd_table"
 
     def test_get_tables_with_rls_cm(self, mock_spark, mock_config):
         """row_filter.object_name is already the table FQN; column_mask
@@ -182,12 +197,33 @@ class TestTrackingManager:
         result = mgr.get_row("managed_table", "`cat`.`sch`.`t`")
 
         sql_arg = mock_spark.sql.call_args[0][0]
-        assert "managed_table" in sql_arg
-        assert "`cat`.`sch`.`t`" in sql_arg
+        # object_type and object_name are parameterized — not inlined
+        assert "managed_table" not in sql_arg
+        assert "`cat`.`sch`.`t`" not in sql_arg
         assert "LIMIT 1" in sql_arg
+        assert mock_spark.sql.call_args.kwargs["args"] == {
+            "obj_type": "managed_table",
+            "obj_name": "`cat`.`sch`.`t`",
+        }
         assert result is not None
         assert result["object_name"] == "`cat`.`sch`.`t`"
         assert result["create_statement"] == "CREATE TABLE ..."
+
+    def test_get_row_quote_safe(self, mock_spark, mock_config):
+        """object_name with embedded quote must travel via args=."""
+        mgr = TrackingManager(mock_spark, mock_config)
+        mock_result = MagicMock()
+        mock_result.collect.return_value = []
+        mock_spark.sql.return_value = mock_result
+
+        mgr.get_row("table", "cat.sch.O'Reilly")
+
+        sql_arg = mock_spark.sql.call_args[0][0]
+        assert "O'Reilly" not in sql_arg
+        assert mock_spark.sql.call_args.kwargs["args"] == {
+            "obj_type": "table",
+            "obj_name": "cat.sch.O'Reilly",
+        }
 
     def test_get_row_returns_none_when_not_found(self, mock_spark, mock_config):
         """get_row returns None when no row matches (empty collect)."""

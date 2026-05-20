@@ -34,6 +34,8 @@ import json
 import logging
 import time
 
+from databricks.sdk.errors import AlreadyExists
+
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
@@ -106,19 +108,20 @@ def apply_model(
             comment=model.get("comment"),
             storage_location=model.get("storage_location"),
         )
+    except AlreadyExists:
+        # IDEMPOTENT: model already exists, continue to versions + aliases
+        pass
     except Exception as exc:  # noqa: BLE001
-        # IDEMPOTENT: if model already exists, continue to versions + aliases
-        if "already" not in str(exc).lower() or "exists" not in str(exc).lower():
-            results.append(
-                {
-                    "object_name": obj_key,
-                    "object_type": "registered_model",
-                    "status": "failed",
-                    "error_message": str(exc),
-                    "duration_seconds": time.time() - start,
-                }
-            )
-            return results
+        results.append(
+            {
+                "object_name": obj_key,
+                "object_type": "registered_model",
+                "status": "failed",
+                "error_message": str(exc),
+                "duration_seconds": time.time() - start,
+            }
+        )
+        return results
 
     # Ensure the target-side copy helper notebook is uploaded once up front
     # so repeated per-version copy calls don't each re-upload it.
@@ -151,11 +154,17 @@ def apply_model(
                 source=source_uri,
                 run_id=None,
             )
+        except AlreadyExists:
+            # IDEMPOTENT: version exists — fetch it so artifacts can retry.
+            try:
+                created_version = client.model_versions.get(
+                    full_name=f"{catalog}.{schema}.{name}",
+                    version=int(version_num),
+                )
+            except Exception:  # noqa: BLE001
+                created_version = None
         except Exception as exc:  # noqa: BLE001
-            if "already" not in str(exc).lower() or "exists" not in str(exc).lower():
-                version_errors.append(f"v{version_num}: {exc}")
-            # For idempotent re-runs we still try to fetch the existing version
-            # so artifacts can be retried on a subsequent pass.
+            version_errors.append(f"v{version_num}: {exc}")
             try:
                 created_version = client.model_versions.get(
                     full_name=f"{catalog}.{schema}.{name}",
@@ -168,6 +177,8 @@ def apply_model(
         # allocated storage_location. Skip silently when the source URI is
         # empty, the version create/fetch failed, or the copy notebook
         # couldn't be uploaded — operators see the fallback in error_message.
+        # Mirrors volume_worker: artifact bytes are essential, so a copy
+        # failure hard-fails the model migration row.
         target_loc = getattr(created_version, "storage_location", None) if created_version else None
         if artifact_copy_available and source_uri and target_loc:
             try:
@@ -180,9 +191,20 @@ def apply_model(
                 total_bytes += int(res.get("bytes_copied", 0))
                 total_files += int(res.get("file_count", 0))
             except Exception as exc:  # noqa: BLE001
-                version_errors.append(
-                    f"v{version_num} artifact copy failed (src={source_uri}): {exc}"
+                duration = time.time() - start
+                results.append(
+                    {
+                        "object_name": obj_key,
+                        "object_type": "registered_model",
+                        "status": "failed",
+                        "error_message": (
+                            f"v{version_num} artifact copy failed "
+                            f"(src={source_uri}): {exc}"
+                        ),
+                        "duration_seconds": duration,
+                    }
                 )
+                return results
 
         # 3. Aliases for this version
         for alias in v.get("aliases") or []:

@@ -30,6 +30,8 @@ import json
 import logging
 import time
 
+from databricks.sdk.errors import AlreadyExists
+
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
@@ -119,15 +121,16 @@ def apply_share(
     # Create share shell (tolerate already-exists)
     try:
         auth.target_client.shares.create(name=share_name, comment=comment)
+    except AlreadyExists:
+        pass
     except Exception as exc:  # noqa: BLE001
-        if "already" not in str(exc).lower() or "exists" not in str(exc).lower():
-            return {
-                "object_name": obj_key,
-                "object_type": "share",
-                "status": "failed",
-                "error_message": str(exc),
-                "duration_seconds": time.time() - start,
-            }
+        return {
+            "object_name": obj_key,
+            "object_type": "share",
+            "status": "failed",
+            "error_message": str(exc),
+            "duration_seconds": time.time() - start,
+        }
 
     # Add objects via SQL ALTER SHARE (covers table/view/volume/schema/catalog)
     failures: list[str] = []

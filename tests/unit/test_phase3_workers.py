@@ -494,12 +494,16 @@ class TestModelsWorker:
     @patch("migrate.models_worker.ensure_copy_notebook_on_target")
     @patch("migrate.models_worker.time")
     def test_idempotent_on_already_exists(self, mock_time, mock_ensure, mock_copy):
+        from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 101.0]
         mock_copy.return_value = {"bytes_copied": 0, "file_count": 0}
         auth = MagicMock()
-        auth.target_client.registered_models.create.side_effect = Exception("RESOURCE_ALREADY_EXISTS")
+        auth.target_client.registered_models.create.side_effect = AlreadyExists(
+            "RESOURCE_ALREADY_EXISTS"
+        )
         auth.target_client.model_versions.create.return_value = MagicMock()
 
         results = apply_model(
@@ -512,9 +516,13 @@ class TestModelsWorker:
     @patch("migrate.models_worker.run_target_file_copy")
     @patch("migrate.models_worker.ensure_copy_notebook_on_target")
     @patch("migrate.models_worker.time")
-    def test_artifact_copy_failure_marks_validation_failed(self, mock_time, mock_ensure, mock_copy):
-        """Target SPN can't read source URI → status is validation_failed
-        and the offending URI is in the error message."""
+    def test_artifact_copy_failure_hard_fails(self, mock_time, mock_ensure, mock_copy):
+        """L4: artifact copy failure now hard-fails (matches volume_worker).
+
+        Previously this returned ``validation_failed`` with a warning;
+        the artifact bytes are essential, not best-effort, so a copy
+        failure marks the row ``failed`` so operators don't miss it.
+        """
         from migrate.models_worker import apply_model
 
         mock_time.time.side_effect = [100.0, 105.0]
@@ -541,7 +549,7 @@ class TestModelsWorker:
             auth=auth,
             dry_run=False,
         )
-        assert results[0]["status"] == "validation_failed"
+        assert results[0]["status"] == "failed"
         assert "artifact copy failed" in results[0]["error_message"]
         assert "abfss://source/.../m1/v1" in results[0]["error_message"]
 

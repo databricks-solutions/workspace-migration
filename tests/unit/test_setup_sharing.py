@@ -106,6 +106,51 @@ class TestSetupSharing:
         add_tables_to_share(auth, "test_share", tables)
         auth.source_client.shares.update.assert_not_called()
 
+    def test_add_tables_skips_pre_clean_when_only_adding(self):
+        """L6: when desired ⊇ current, no REMOVE updates are issued."""
+        auth = MagicMock()
+        obj1, obj2 = MagicMock(), MagicMock()
+        obj1.name, obj1.data_object_type = "cat.sch.t1", "TABLE"
+        obj2.name, obj2.data_object_type = "cat.sch.t2", "TABLE"
+        auth.source_client.shares.get.return_value = MagicMock(objects=[obj1, obj2])
+
+        # Desired = existing + one new table (superset of current)
+        tables = [
+            {"object_name": "`cat`.`sch`.`t1`"},
+            {"object_name": "`cat`.`sch`.`t2`"},
+            {"object_name": "`cat`.`sch`.`t3`"},
+        ]
+
+        add_tables_to_share(auth, "myshare", tables)
+
+        remove_updates = []
+        for call in auth.source_client.shares.update.call_args_list:
+            for u in (call.kwargs.get("updates") or []):
+                if hasattr(u.action, "value") and u.action.value == "REMOVE":
+                    remove_updates.append(u)
+        assert not remove_updates, (
+            f"Unexpected REMOVE updates when desired ⊇ current: {remove_updates}"
+        )
+
+    def test_add_tables_pre_cleans_only_stale_entries(self):
+        """L6: when desired drops an existing table, only that table is removed."""
+        auth = MagicMock()
+        obj_keep, obj_drop = MagicMock(), MagicMock()
+        obj_keep.name, obj_keep.data_object_type = "cat.sch.t1", "TABLE"
+        obj_drop.name, obj_drop.data_object_type = "cat.sch.t_removed", "TABLE"
+        auth.source_client.shares.get.return_value = MagicMock(objects=[obj_keep, obj_drop])
+
+        tables = [{"object_name": "`cat`.`sch`.`t1`"}]  # t_removed not desired
+
+        add_tables_to_share(auth, "myshare", tables)
+
+        remove_names = []
+        for call in auth.source_client.shares.update.call_args_list:
+            for u in (call.kwargs.get("updates") or []):
+                if hasattr(u.action, "value") and u.action.value == "REMOVE":
+                    remove_names.append(u.data_object.name)
+        assert remove_names == ["cat.sch.t_removed"]
+
     def test_ensure_target_catalogs_dry_run(self):
         auth = MagicMock()
         tables = [

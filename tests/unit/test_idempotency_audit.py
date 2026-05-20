@@ -728,11 +728,13 @@ class TestSharingIdempotency:
     @patch("migrate.sharing_worker.execute_and_poll")
     def test_apply_share_tolerates_share_already_exists(self, mock_exec):
         """Pin: share shell already-exists is swallowed — proceed to add objects."""
+        from databricks.sdk.errors import AlreadyExists
+
         from migrate.sharing_worker import apply_share
 
         mock_exec.return_value = _ok()
         auth = MagicMock()
-        auth.target_client.shares.create.side_effect = Exception("share 's1' already exists")
+        auth.target_client.shares.create.side_effect = AlreadyExists("share 's1' already exists")
         res = apply_share(
             {"share_name": "s1", "objects": [
                 {"data_object_type": "TABLE", "name": "c.s.t"},
@@ -841,11 +843,13 @@ class TestSharingIdempotency:
 @patch("migrate.models_worker.ensure_copy_notebook_on_target")
 class TestModelsIdempotency:
     def test_model_already_exists_continues_to_versions(self, _ensure, _copy):
-        """Pin: registered_models.create 'already exists' does not fail the model."""
+        """Pin: registered_models.create AlreadyExists does not fail the model."""
+        from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         auth = MagicMock()
-        auth.target_client.registered_models.create.side_effect = Exception(
+        auth.target_client.registered_models.create.side_effect = AlreadyExists(
             "model 'm' already exists"
         )
         auth.target_client.model_versions.create.return_value = None
@@ -861,12 +865,14 @@ class TestModelsIdempotency:
         auth.target_client.model_versions.create.assert_called_once()
 
     def test_version_already_exists_continues_to_aliases(self, _ensure, _copy):
-        """Pin: model_versions.create 'already exists' does not fail the model."""
+        """Pin: model_versions.create AlreadyExists does not fail the model."""
+        from databricks.sdk.errors import AlreadyExists
+
         from migrate.models_worker import apply_model
 
         auth = MagicMock()
         auth.target_client.registered_models.create.return_value = None
-        auth.target_client.model_versions.create.side_effect = Exception(
+        auth.target_client.model_versions.create.side_effect = AlreadyExists(
             "version 1 already exists"
         )
         auth.target_client.registered_models.set_alias.return_value = None

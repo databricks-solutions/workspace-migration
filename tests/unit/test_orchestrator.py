@@ -2,8 +2,30 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from pathlib import Path
 
 from migrate.batching import MAX_BATCH_BYTES, build_batches
+
+
+def test_orchestrator_does_not_emit_comment_list():
+    """``comment`` must not be in ``LIST_TYPES``.
+
+    ``comments_worker.run()`` reads ``discovery_inventory`` directly
+    because comments span table / view / column / volume / schema /
+    catalog and a flat ``comment_list`` was never a natural fit. The
+    historical entry in ``LIST_TYPES`` was dead — the worker never
+    consumed the task-value. Regression test.
+    """
+    src_path = Path(__file__).resolve().parents[2] / "src/migrate/orchestrator.py"
+    src = src_path.read_text()
+    m = re.search(r"LIST_TYPES\s*=\s*\(([^)]*)\)", src, re.DOTALL)
+    assert m, "LIST_TYPES tuple not found in orchestrator.py"
+    body = m.group(1)
+    assert '"comment"' not in body and "'comment'" not in body, (
+        "``comment`` reintroduced in LIST_TYPES — comments_worker reads "
+        "discovery_inventory directly, so the emit is dead. See review H7."
+    )
 
 
 class TestOrchestrator:

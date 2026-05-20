@@ -324,7 +324,8 @@ class TrackingManager:
         every skip variant as terminal. That broke the Iceberg re-run
         scenario that ``skipped_by_config`` was introduced for.
         """
-        rows = self.spark.sql(f"""
+        rows = self.spark.sql(
+            f"""
             WITH latest_status AS (
                 SELECT *
                 FROM (
@@ -341,10 +342,12 @@ class TrackingManager:
             FROM {self._fqn}.discovery_inventory d
             LEFT JOIN latest_status s
                 ON d.object_name = s.object_name AND d.object_type = s.object_type
-            WHERE d.object_type = '{object_type}'
+            WHERE d.object_type = :obj_type
               AND (s.status IS NULL
                    OR s.status NOT IN ({_TERMINAL_STATUSES_SQL}))
-        """).collect()
+            """,
+            args={"obj_type": object_type},
+        ).collect()
         return [row.asDict() for row in rows]
 
     def get_row(self, object_type: str, object_name: str) -> dict | None:
@@ -355,13 +358,16 @@ class TrackingManager:
         ``create_statement`` field, which the orchestrator strips to keep
         for_each task-value payloads under Jobs' 3000-byte limit).
         """
-        rows = self.spark.sql(f"""
+        rows = self.spark.sql(
+            f"""
             SELECT *
             FROM {self._fqn}.discovery_inventory
-            WHERE object_type = '{object_type}'
-              AND object_name = '{object_name}'
+            WHERE object_type = :obj_type
+              AND object_name = :obj_name
             LIMIT 1
-        """).collect()
+            """,
+            args={"obj_type": object_type, "obj_name": object_name},
+        ).collect()
         return rows[0].asDict() if rows else None
 
     # ---------------------------------------------------------------- Staging manifest (Path A)

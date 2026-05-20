@@ -125,20 +125,40 @@ def add_tables_to_share(
     source = auth_mgr.source_client
     batch_size = 100
 
-    # Remove any existing objects first so re-runs start from a clean slate and
-    # don't conflict with entries that used the old shared_as format.
+    # Pre-clean only objects that exist in the share but are NOT in the
+    # desired list. The previous unconditional drop created a brief
+    # empty-share window where consumers saw zero objects between the
+    # REMOVE and the subsequent ADD; skipping the pre-clean when desired
+    # is a superset of current preserves share availability for re-adds.
+    desired_names: set[str] = set()
+    for tbl in tables:
+        obj_name = tbl["object_name"]
+        parts = obj_name.strip("`").split("`.`")
+        if len(parts) == 3:
+            desired_names.add(".".join(parts))
     try:
         existing_share = source.shares.get(name=share_name, include_shared_data=True)
+        existing_objects = existing_share.objects or []
         removals = [
             SharedDataObjectUpdate(
                 action=SharedDataObjectUpdateAction.REMOVE,
                 data_object=SharedDataObject(name=o.name, data_object_type=o.data_object_type),
             )
-            for o in (existing_share.objects or [])
+            for o in existing_objects
+            if o.name not in desired_names
         ]
         if removals and not dry_run:
             source.shares.update(name=share_name, updates=removals)
-            logger.info("Removed %d stale object(s) from share '%s'.", len(removals), share_name)
+            logger.info(
+                "Removed %d stale object(s) from share '%s' (existed but no longer desired).",
+                len(removals),
+                share_name,
+            )
+        elif not removals and existing_objects:
+            logger.info(
+                "Share '%s' pre-clean skipped: existing objects are a subset of desired.",
+                share_name,
+            )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not pre-clean share: %s", exc, exc_info=True)
     existing_names: set[str] = set()
