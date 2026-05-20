@@ -7,9 +7,13 @@ import sys  # noqa: E402
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
-    _src = "/Workspace" + _nb.split("/files/")[0] + "/files/src"
-    if _src not in sys.path:
-        sys.path.insert(0, _src)
+    _files_root = "/Workspace" + _nb.split("/files/")[0] + "/files"
+    # /files/src for ``common.*`` resolution; /files for ``tests.integration.*``
+    # (shared helpers like _assertion_helpers, _config_override). Matches the
+    # setup_test_config.py bootstrap.
+    for _p in (f"{_files_root}/src", _files_root):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 except NameError:
     pass
 
@@ -20,6 +24,7 @@ except NameError:
 
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from tests.integration._assertion_helpers import expect_validated  # type: ignore[import-not-found]
 
 config = MigrationConfig.from_workspace_file()
 tracker = TrackingManager(spark, config)  # noqa: F821
@@ -37,40 +42,10 @@ error_messages: list[str] = []
 
 
 def _expect_validated(row, label: str) -> bool:  # type: ignore[no-untyped-def]
-    """H11: assert a migration_status row is BOTH ``validated`` AND has
-    no ``error_message``.
-
-    Previously the test file had ~20 patterns of the form::
-
-        if row["status"] != "validated":
-            error_messages.append(...)
-
-    which silently passed when a worker recorded ``status='validated'``
-    with a non-empty ``error_message`` (e.g. ``WARNING: rebuilt with stale
-    schema``). The helper makes "validated" mean what it says.
-
-    Returns True if the row passes both checks; False otherwise.
-    Adds to ``error_messages`` on failure to match the file's
-    accumulate-then-fail-at-end style.
-    """
-    _st = row["status"] if hasattr(row, "__getitem__") else getattr(row, "status", None)
-    # Row objects expose .get() (PyRow) OR raise KeyError; tolerate both.
-    try:
-        _err = row["error_message"]
-    except (KeyError, IndexError, TypeError):
-        _err = getattr(row, "error_message", None)
-    if _st != "validated":
-        error_messages.append(
-            f"{label}: status={_st!r}, expected 'validated'. error_message={_err!r}"
-        )
-        return False
-    if _err:
-        error_messages.append(
-            f"{label}: status='validated' but error_message is set: {_err!r} "
-            "(worker recorded a warning under a passing status — see review H11)."
-        )
-        return False
-    return True
+    """Thin wrapper binding the shared helper to this notebook's
+    ``error_messages`` accumulator. See
+    ``tests/integration/_assertion_helpers.py`` for the contract."""
+    return expect_validated(row, label, error_messages)
 
 
 counts = {
