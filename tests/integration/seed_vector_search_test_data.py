@@ -25,6 +25,7 @@ except NameError:
 # Each object is best-effort; has_* task values gate the downstream assertion.
 
 import contextlib
+import json
 import time
 
 from databricks.sdk import WorkspaceClient
@@ -159,3 +160,6 @@ dbutils.jobs.taskValues.set(key="delta_index_fqn", value=_DELTA_IDX)  # noqa: F8
 dbutils.jobs.taskValues.set(key="direct_index_fqn", value=_DIRECT_IDX)  # noqa: F821
 dbutils.jobs.taskValues.set(key="vs_endpoint_name", value=_ENDPOINT)  # noqa: F821
 print(f"[seed-vs] flags: delta={_has_delta_index} direct={_has_direct_index}")
+dbutils.notebook.exit(  # noqa: F821
+    json.dumps({"has_delta_index": _has_delta_index, "has_direct_index": _has_direct_index})
+)

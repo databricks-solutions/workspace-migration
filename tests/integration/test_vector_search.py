@@ -22,6 +22,8 @@ except NameError:
 # Each case is gated on the seed's has_* flag — skipped (not failed) if the seed
 # could not create that object (e.g. VS unavailable).
 
+import json
+
 from databricks.sdk.errors import NotFound
 
 from common.auth import AuthManager
@@ -37,6 +39,7 @@ _delta_fqn = dbutils.jobs.taskValues.get(taskKey="seed_vector_search", key="delt
 _direct_fqn = dbutils.jobs.taskValues.get(taskKey="seed_vector_search", key="direct_index_fqn", debugValue="")  # noqa: F821
 
 errors: list[str] = []
+summary: dict = {}
 
 
 def _latest_status(fqn: str):
@@ -67,8 +70,12 @@ if _has_delta == "true":
     if not _exists_on_target(_delta_fqn):
         errors.append(f"POSITIVE: {_delta_fqn} not found on target — migration did not create the index")
     if len(errors) == _n:
+        summary["delta"] = "asserted_ok"
         print(f"[test-vs] POSITIVE ok: {_delta_fqn} created_resync_pending + present on target")
+    else:
+        summary["delta"] = "FAILED"
 else:
+    summary["delta"] = "skipped_no_seed"
     print("[test-vs] POSITIVE skipped — seed did not create the Delta Sync index (VS unavailable?)")
 
 # COMMAND ----------
@@ -81,11 +88,20 @@ if _has_direct == "true":
     if _exists_on_target(_direct_fqn):
         errors.append(f"NEGATIVE: {_direct_fqn} unexpectedly EXISTS on target — Direct Access must not be migrated")
     if len(errors) == _n:
+        summary["direct"] = "asserted_ok"
         print(f"[test-vs] NEGATIVE ok: {_direct_fqn} skipped + absent on target")
+    else:
+        summary["direct"] = "FAILED"
 else:
+    summary["direct"] = "skipped_no_seed"
     print("[test-vs] NEGATIVE skipped — seed did not create the Direct Access index (VS unavailable?)")
 
 # COMMAND ----------
+# Emit a retrievable result so the run outcome is provable via the Jobs API
+# (notebook stdout is not captured there). On failure the same payload is in
+# the raised error; on success it's the notebook exit value.
+_result = json.dumps({"summary": summary, "errors": errors})
 if errors:
-    raise AssertionError("Vector Search live integration assertion failed:\n" + "\n".join(errors))
-print("[test-vs] all asserted cases passed")
+    raise AssertionError("Vector Search live integration assertion FAILED: " + _result)
+print("[test-vs] all asserted cases passed: " + _result)
+dbutils.notebook.exit(_result)  # noqa: F821
