@@ -166,3 +166,61 @@ class TestServing:
         auth.source_client.serving_endpoints.list.side_effect = Exception("403")
         assert StatefulExplorer(auth).list_model_serving_endpoints() == []
         assert "serving" in capsys.readouterr().out
+
+
+class TestLfcPipelines:
+    def test_keeps_only_ingestion_pipelines(self):
+        auth = MagicMock()
+        client = auth.source_client
+        client.pipelines.list_pipelines.return_value = [
+            _sdk_obj(pipeline_id="p1", name="lfc_one"),
+            _sdk_obj(pipeline_id="p2", name="plain_dlt"),
+        ]
+
+        def _get(pipeline_id):
+            if pipeline_id == "p1":
+                spec = MagicMock()
+                spec.ingestion_definition = MagicMock()  # present -> LFC
+                return _sdk_obj(
+                    as_dict={"name": "lfc_one", "spec": {"ingestion_definition": {"connection_name": "sf_conn"}}},
+                    name="lfc_one",
+                    spec=spec,
+                )
+            spec = MagicMock()
+            spec.ingestion_definition = None  # not LFC
+            return _sdk_obj(as_dict={"name": "plain_dlt"}, name="plain_dlt", spec=spec)
+
+        client.pipelines.get.side_effect = _get
+
+        rows = StatefulExplorer(auth).list_lfc_pipelines()
+        assert len(rows) == 1
+        assert rows[0]["pipeline_name"] == "lfc_one"
+        assert rows[0]["pipeline_id"] == "p1"
+        assert rows[0]["definition"]["spec"]["ingestion_definition"]["connection_name"] == "sf_conn"
+
+    def test_skips_pipeline_whose_get_fails_without_aborting(self, capsys):
+        auth = MagicMock()
+        client = auth.source_client
+        client.pipelines.list_pipelines.return_value = [
+            _sdk_obj(pipeline_id="bad", name="bad"),
+            _sdk_obj(pipeline_id="p1", name="lfc_one"),
+        ]
+
+        def _get(pipeline_id):
+            if pipeline_id == "bad":
+                raise RuntimeError("gone")
+            spec = MagicMock()
+            spec.ingestion_definition = MagicMock()
+            return _sdk_obj(as_dict={"name": "lfc_one"}, name="lfc_one", spec=spec)
+
+        client.pipelines.get.side_effect = _get
+
+        rows = StatefulExplorer(auth).list_lfc_pipelines()
+        assert [r["pipeline_name"] for r in rows] == ["lfc_one"]
+        assert "pipeline bad" in capsys.readouterr().out
+
+    def test_returns_empty_and_warns_when_pipelines_unavailable(self, capsys):
+        auth = MagicMock()
+        auth.source_client.pipelines.list_pipelines.side_effect = Exception("403")
+        assert StatefulExplorer(auth).list_lfc_pipelines() == []
+        assert "lakeflow connect" in capsys.readouterr().out

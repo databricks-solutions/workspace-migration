@@ -134,3 +134,32 @@ class StatefulExplorer:
             ]
 
         return self._safe("serving endpoints", _run)
+
+    def list_lfc_pipelines(self) -> list[dict]:
+        """Lakeflow Connect ingestion pipelines. list_pipelines() returns no
+        spec, so get() each pipeline and keep only those whose spec has an
+        ingestion_definition. A single pipeline's get() failing is logged and
+        skipped, never aborting the surface."""
+
+        def _run() -> list[dict]:
+            client = self._client()
+            results: list[dict] = []
+            for p in client.pipelines.list_pipelines():
+                try:
+                    full = client.pipelines.get(p.pipeline_id)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[stateful][warn] pipeline {p.pipeline_id} get() failed — skipping ({exc})")
+                    continue
+                spec = getattr(full, "spec", None)
+                if spec is None or getattr(spec, "ingestion_definition", None) is None:
+                    continue  # not an LFC ingestion pipeline
+                results.append(
+                    {
+                        "pipeline_name": full.name,
+                        "pipeline_id": p.pipeline_id,
+                        "definition": _as_dict(full),
+                    }
+                )
+            return results
+
+        return self._safe("lakeflow connect pipelines", _run)
