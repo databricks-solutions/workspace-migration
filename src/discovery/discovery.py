@@ -513,6 +513,8 @@ def _discover_stateful(config, stateful, now) -> list[dict]:
     subtype alongside the raw spec in metadata_json. Dependency analysis is a
     later step that reads these rows; discovery only enumerates + persists.
     """
+    # `config` is accepted for symmetry with _discover_uc/_discover_hive and
+    # reserved for a future stateful catalog/scope filter; unused today.
     # (object_type, list_fn, name_key)
     surfaces = [
         ("vector_search_index", stateful.list_vector_search_indexes, "index_name"),

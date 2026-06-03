@@ -50,3 +50,49 @@ def test_discover_stateful_empty_when_all_surfaces_empty():
               "list_synced_tables", "list_model_serving_endpoints", "list_lfc_pipelines"):
         getattr(stateful, m).return_value = []
     assert disc._discover_stateful(MagicMock(), stateful, _now()) == []
+
+
+def test_discover_uc_online_table_reclassified_as_stateful():
+    """online_table rows emitted by _discover_uc must be tagged
+    source_type='stateful' with capability='online_store' preserved in
+    metadata_json, and the original online_table fields must survive."""
+    explorer = MagicMock()
+    # Empty catalog list so the per-catalog loop is skipped entirely.
+    explorer.list_catalogs.return_value = []
+    explorer.list_foreign_catalog_names.return_value = set()
+
+    # The one online_table entry under test.
+    explorer.list_online_tables.return_value = [
+        {
+            "online_table_fqn": "cat.s.ot",
+            "source_table_fqn": "cat.s.src",
+            "definition": {"k": 1},
+        }
+    ]
+
+    # Workspace-level list_* methods that _discover_uc always calls.
+    explorer.list_monitors.return_value = []
+    explorer.list_policies.return_value = []
+    explorer.list_connections.return_value = []
+    explorer.list_foreign_catalogs.return_value = []
+    explorer.list_shares.return_value = []
+    explorer.list_recipients.return_value = []
+    explorer.list_providers.return_value = []
+
+    config = MagicMock()
+    config.catalog_filter = []
+    config.schema_filter = []
+    config.tracking_catalog = "_migration_tracking"
+    config.rls_cm_strategy = ""
+
+    rows, _dlt = disc._discover_uc(config, explorer, _now())
+
+    ot_rows = [r for r in rows if r["object_type"] == "online_table"]
+    assert len(ot_rows) == 1, f"expected exactly 1 online_table row, got {len(ot_rows)}"
+
+    ot = ot_rows[0]
+    assert ot["source_type"] == "stateful"
+
+    meta = json.loads(ot["metadata_json"])
+    assert meta["capability"] == "online_store"
+    assert meta["source_table_fqn"] == "cat.s.src"
