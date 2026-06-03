@@ -84,7 +84,8 @@ def _ensure_endpoint(
 ) -> bool:
     """Ensure the target VS endpoint exists and is ONLINE.
 
-    If absent, create it (mirroring the source endpoint_type). Poll up to
+    If absent, create it using the supplied ``endpoint_type`` (effectively always
+    STANDARD, the only VS endpoint type available today). Poll up to
     ``max_attempts`` for it to reach ONLINE. Returns True if ready, False if it
     is still provisioning when attempts are exhausted (caller defers the index).
     """
@@ -130,31 +131,36 @@ def migrate_index(
             "duration_seconds": time.time() - start,
         }
 
-    meta = json.loads(row.get("metadata_json") or "{}")
-    definition = meta.get("definition") or {}
+    try:
+        meta = json.loads(row.get("metadata_json") or "{}")
+        definition = meta.get("definition") or {}
 
-    if not definition:
-        return _result("failed", "discovery row has no 'definition' in metadata_json — cannot migrate index.")
+        if not definition:
+            return _result("failed", "discovery row has no 'definition' in metadata_json — cannot migrate index.")
 
-    if not _is_delta_sync(definition):
-        return _result(
-            "skipped_direct_access_unsupported",
-            "Direct Access VS index — vectors are external app-written state the "
-            "tool cannot recreate. See docs/user_guide.md (Vector Search limitations).",
+        if not _is_delta_sync(definition):
+            return _result(
+                "skipped_direct_access_unsupported",
+                "Direct Access VS index — vectors are external app-written state the "
+                "tool cannot recreate. See docs/user_guide.md (Vector Search limitations).",
+            )
+
+        endpoint_name = definition.get("endpoint_name")
+        # NOTE: VectorIndex.as_dict() has no `endpoint_type`; STANDARD is the only
+        # VS endpoint type today, so there is nothing else to mirror from source.
+        endpoint_type = definition.get("endpoint_type") or "STANDARD"
+        ready = _ensure_endpoint(
+            target_client, endpoint_name, endpoint_type,
+            max_attempts=max_attempts, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn,
         )
-
-    endpoint_name = definition.get("endpoint_name")
-    endpoint_type = definition.get("endpoint_type") or "STANDARD"
-    ready = _ensure_endpoint(
-        target_client, endpoint_name, endpoint_type,
-        max_attempts=max_attempts, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn,
-    )
-    if not ready:
-        return _result(
-            "skipped_endpoint_not_ready",
-            f"Target endpoint '{endpoint_name}' not ONLINE within wait budget; "
-            "a re-run will retry this index.",
-        )
+        if not ready:
+            return _result(
+                "skipped_endpoint_not_ready",
+                f"Target endpoint '{endpoint_name}' not ONLINE within wait budget; "
+                "a re-run will retry this index.",
+            )
+    except Exception as exc:  # noqa: BLE001 — malformed row / pre-create failure must fail only THIS index
+        return _result("failed", f"vector search pre-create step failed: {exc}")
 
     try:
         target_client.vector_search_indexes.create_index(
