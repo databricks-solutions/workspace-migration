@@ -4,7 +4,7 @@ resources:
       name: "${var.job_prefix}-migrate-uc"
       description: |
         UC data plane migration: managed/external tables, views, volumes,
-        functions, mv/st, models, online tables, plus UC grants. Depends
+        functions, mv/st, models, plus UC grants. Depends
         operationally on the discovery job populating discovery_inventory
         beforehand — run discovery first.
       run_as:
