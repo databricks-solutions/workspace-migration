@@ -10,7 +10,29 @@ resources:
       run_as:
         service_principal_name: ${var.migration_spn_id}
       tasks:
+        - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # VS integration test: no Iceberg DDL replay, no RLS/CM staging,
+            # no Hive DBFS-root migration. catalog_filter scopes discovery to
+            # the VS fixture catalog so the UC/Hive fixtures seeded in
+            # parallel runs are ignored.
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+              catalog_filter: "integration_test_src"
+
+        - task_key: seed_vector_search
+          depends_on:
+            - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_vector_search_test_data.py
+
         - task_key: discovery
+          depends_on:
+            - task_key: seed_vector_search
           notebook_task:
             notebook_path: ../../src/discovery/discovery.py
 
@@ -18,10 +40,21 @@ resources:
           depends_on:
             - task_key: discovery
           run_job_task:
-            job_id: "${resources.jobs.migrate_vector_search.id}"
+            job_id: ${resources.jobs.migrate_vector_search.id}
 
         - task_key: test_vector_search
           depends_on:
             - task_key: migrate_vector_search
           notebook_task:
             notebook_path: ../../tests/integration/test_vector_search.py
+
+        - task_key: teardown_vector_search
+          depends_on:
+            - task_key: setup_test_config
+            - task_key: seed_vector_search
+            - task_key: discovery
+            - task_key: migrate_vector_search
+            - task_key: test_vector_search
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_vector_search.py
