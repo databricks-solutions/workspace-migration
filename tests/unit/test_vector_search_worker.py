@@ -305,3 +305,19 @@ class TestRun:
         recorded = {r["object_name"]: r["status"] for r in tracker.append_migration_status.call_args.args[0]}
         assert recorded["cat.sch.bad"] == "failed"
         assert recorded["cat.sch.good"] == "created_resync_pending"
+
+
+def test_default_endpoint_wait_budget_is_generous_for_cold_start():
+    # A freshly-created VS endpoint can take ~5-20 min to provision; the
+    # default wait budget must be generous enough that a cold-start migrate
+    # reaches created_resync_pending in one run rather than giving up early.
+    import inspect
+
+    from migrate.vector_search_worker import _ensure_endpoint, migrate_index
+
+    ens = inspect.signature(_ensure_endpoint).parameters
+    mig = inspect.signature(migrate_index).parameters
+    assert ens["max_attempts"].default == 120
+    assert ens["sleep_seconds"].default == 15.0
+    assert mig["max_attempts"].default == 120
+    assert mig["sleep_seconds"].default == 15.0

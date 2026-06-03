@@ -78,16 +78,19 @@ def _ensure_endpoint(
     endpoint_name: str,
     endpoint_type: str,
     *,
-    max_attempts: int = 30,
-    sleep_seconds: float = 10.0,
+    max_attempts: int = 120,
+    sleep_seconds: float = 15.0,
     sleep_fn=time.sleep,
 ) -> bool:
     """Ensure the target VS endpoint exists and is ONLINE.
 
     If absent, create it using the supplied ``endpoint_type`` (effectively always
     STANDARD, the only VS endpoint type available today). Poll up to
-    ``max_attempts`` for it to reach ONLINE. Returns True if ready, False if it
-    is still provisioning when attempts are exhausted (caller defers the index).
+    ``max_attempts`` × ``sleep_seconds`` for it to reach ONLINE — defaulting to
+    120 × 15 s ≈ 30 min, which covers cold-start provisioning of a new endpoint
+    (typically 5–20 min). Returns True if ready, False if still provisioning
+    when attempts are exhausted; the caller records ``skipped_endpoint_not_ready``
+    and a re-run will finish the index once the endpoint is ONLINE.
     """
     try:
         ep = target_client.vector_search_endpoints.get_endpoint(endpoint_name)
@@ -114,8 +117,8 @@ def migrate_index(
     target_client,
     row: dict,
     *,
-    max_attempts: int = 30,
-    sleep_seconds: float = 10.0,
+    max_attempts: int = 120,
+    sleep_seconds: float = 15.0,
     sleep_fn=time.sleep,
 ) -> dict:
     """Migrate one vector_search_index discovery row. Returns a status dict."""
