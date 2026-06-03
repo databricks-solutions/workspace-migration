@@ -87,6 +87,7 @@ flowchart LR
 | `migrate_hive` job | Hive (legacy): databases, tables, views, functions, grants — migrated into a UC target catalog. |
 | `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
 | `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
+| `migrate_online_tables` job | Optional add-on: recreates UC Online Tables on the target and triggers a fresh re-sync from the already-migrated source Delta table. |
 | `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
 | Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
 
@@ -139,7 +140,9 @@ next section):
 
 - Streaming Tables (Kafka / Auto Loader checkpoints don't transfer)
 - Materialized Views (rebuild semantics)
-- Online Tables (preview, rebuild semantics)
+
+Online Tables were previously hard-skipped here; they are now migrated
+by the standalone `migrate_online_tables` job (see Section 6, Step 8).
 
 ### Coming in Phase 3 — stateful services
 
@@ -148,7 +151,7 @@ next section):
 | DLT pipelines | Spec + rebuild from UC (if UC-sourced) | Customer-owned definitions; checkpoints don't transfer |
 | Streaming Tables | Source-cutover | Re-create + cutover watermark; previously hard-skipped |
 | Materialized Views | Spec + rebuild | Re-create + REFRESH; previously hard-skipped |
-| Online Tables | Spec + rebuild | Re-create + sync; previously hard-skipped |
+| Online Tables | Spec + rebuild | Re-create + sync; **available now** via `migrate_online_tables` job (see Section 6, Step 8). Sync history not transferred — target re-syncs from scratch. |
 | Vector Search indexes | Spec + rebuild | Delta Sync indexes: **available now** via `migrate_vector_search` job (see Section 6, Step 7). Direct Access indexes remain deferred. |
 | Lakebase | Dump / restore | `pg_dump` / `pg_restore` out-of-band |
 | Online Feature Store | Dump / restore | Out-of-band state move |
@@ -325,9 +328,9 @@ databricks bundle deploy -t dev \
 
 This creates:
 
-- The six workflows: `pre_check`, `discovery`, `migrate_uc`,
-  `migrate_hive`, `migrate_governance`, `migrate_vector_search` (plus
-  integration-test workflows).
+- The seven workflows: `pre_check`, `discovery`, `migrate_uc`,
+  `migrate_hive`, `migrate_governance`, `migrate_vector_search`,
+  `migrate_online_tables` (plus integration-test workflows).
 - The Lakeview dashboard at `/Shared/cp_migration/dev`.
 - The `config.yaml` file at `/Workspace/Shared/cp_migration/config.yaml`.
 
@@ -337,7 +340,8 @@ This creates:
 
 The recommended order: `pre_check` → `discovery` → `pre_check` (again,
 for collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
-`migrate_governance` → `migrate_vector_search` (optional).
+`migrate_governance` → `migrate_vector_search` (optional) →
+`migrate_online_tables` (optional).
 
 ### Step 1 — `pre_check`
 
@@ -486,7 +490,48 @@ ORDER BY status, object_name;
   `databricks-gte-large-en`) are available by default and are
   unaffected.
 
-### Step 8 — Verify
+### Step 8 — `migrate_online_tables` (optional)
+
+Recreates **UC Online Tables** on the target workspace. Online table
+migration was previously handled (with a state-loss warning) inside
+`migrate_uc`; it has been moved to this standalone job so operators
+control the timing of the rebuild. Running this job is itself the
+opt-in — there is no configuration flag to enable or disable it. Bear
+in mind that every online table re-syncs from scratch against the
+target source Delta table, incurring a full data reload.
+
+**Precondition:** run `migrate_uc` first (Step 4). The job performs an
+up-front pre-check that verifies every online table's source Delta
+table exists on the target — if any are missing, the pre-check fails
+loudly before creating anything.
+
+**The online store's sync history and freshness are NOT transferred.**
+The target online table starts an entirely fresh re-sync from the
+already-migrated source Delta table; any sync state from the source
+workspace is lost.
+
+```bash
+databricks jobs run-now --job-id <migrate_online_tables_job_id> --profile target-workspace
+```
+
+Monitor progress in `migration_status`:
+
+```sql
+SELECT object_name, status, error_message
+FROM migration_tracking.cp_migration.migration_status
+WHERE object_type = 'online_table'
+ORDER BY status, object_name;
+```
+
+**Status values**
+
+| Status | Meaning |
+|---|---|
+| `created_resync_pending` | Online table created on target; re-sync is in progress. The table is not queryable until the re-sync completes. |
+| `skipped_target_exists` | The online table already exists on the target (set by a previous run or pre-existing). No action taken. |
+| `failed` | Online table creation failed. Inspect `error_message` and the workflow run logs, then re-run. |
+
+### Step 9 — Verify
 
 Confirm via the dashboard and these checks:
 
