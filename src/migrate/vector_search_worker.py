@@ -22,14 +22,14 @@ except NameError:
 # See docs/superpowers/specs/2026-06-03-vector-search-migration-design.md.
 
 import contextlib
-import json  # noqa: F401
+import json
 import time
 
 from databricks.sdk.errors import AlreadyExists
 from databricks.sdk.service.vectorsearch import (
     DeltaSyncVectorIndexSpecRequest,
     EndpointType,
-    VectorIndexType,  # noqa: F401
+    VectorIndexType,
 )
 
 from common.auth import AuthManager  # noqa: F401
@@ -103,3 +103,68 @@ def _ensure_endpoint(
             pass
         sleep_fn(sleep_seconds)
     return False
+
+
+def _is_already_exists(exc: Exception) -> bool:
+    msg = str(exc).upper()
+    return "ALREADY_EXISTS" in msg or "ALREADY EXISTS" in msg
+
+
+def migrate_index(
+    target_client,
+    row: dict,
+    *,
+    max_attempts: int = 30,
+    sleep_seconds: float = 10.0,
+    sleep_fn=time.sleep,
+) -> dict:
+    """Migrate one vector_search_index discovery row. Returns a status dict."""
+    start = time.time()
+    obj_name = row["object_name"]
+
+    def _result(status: str, error: str | None = None) -> dict:
+        return {
+            "object_name": obj_name,
+            "object_type": "vector_search_index",
+            "status": status,
+            "error_message": error,
+            "duration_seconds": time.time() - start,
+        }
+
+    meta = json.loads(row.get("metadata_json") or "{}")
+    definition = meta.get("definition") or {}
+
+    if not _is_delta_sync(definition):
+        return _result(
+            "skipped_direct_access_unsupported",
+            "Direct Access VS index — vectors are external app-written state the "
+            "tool cannot recreate. See docs/user_guide.md (Vector Search limitations).",
+        )
+
+    endpoint_name = definition.get("endpoint_name")
+    endpoint_type = definition.get("endpoint_type") or "STANDARD"
+    ready = _ensure_endpoint(
+        target_client, endpoint_name, endpoint_type,
+        max_attempts=max_attempts, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn,
+    )
+    if not ready:
+        return _result(
+            "skipped_endpoint_not_ready",
+            f"Target endpoint '{endpoint_name}' not ONLINE within wait budget; "
+            "a re-run will retry this index.",
+        )
+
+    try:
+        target_client.vector_search_indexes.create_index(
+            name=obj_name,
+            endpoint_name=endpoint_name,
+            primary_key=definition.get("primary_key"),
+            index_type=VectorIndexType.DELTA_SYNC,
+            delta_sync_index_spec=_build_delta_sync_spec(definition),
+        )
+    except Exception as exc:  # noqa: BLE001
+        if _is_already_exists(exc):
+            return _result("skipped_target_exists", f"Index already exists on target: {exc}")
+        return _result("failed", f"create_index failed: {exc}")
+
+    return _result("created_resync_pending", None)
