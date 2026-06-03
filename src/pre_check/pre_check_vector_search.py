@@ -53,7 +53,8 @@ def find_missing_source_tables(target_client, rows: list[dict]) -> list[str]:
             continue
         try:
             target_client.tables.get(src)
-        except Exception:  # noqa: BLE001 — any failure means "treat as absent"
+        except Exception as exc:  # noqa: BLE001 — any failure (absent / transient / permission) blocks the gate
+            logger.warning("tables.get(%r) failed — treating source table as absent: %s", src, exc)
             missing.append(src)
     return missing
 

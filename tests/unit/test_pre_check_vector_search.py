@@ -39,3 +39,20 @@ def test_direct_access_rows_are_excluded_from_source_check():
     missing = find_missing_source_tables(client, [_direct_row()])
     assert missing == []
     client.tables.get.assert_not_called()
+
+
+def test_malformed_metadata_json_is_skipped():
+    client = MagicMock()
+    rows = [{"object_name": "x", "object_type": "vector_search_index", "metadata_json": None}]
+    missing = find_missing_source_tables(client, rows)
+    assert missing == []
+    client.tables.get.assert_not_called()
+
+
+def test_delta_sync_without_source_table_is_skipped():
+    client = MagicMock()
+    rows = [{"object_name": "x", "object_type": "vector_search_index",
+             "metadata_json": json.dumps({"definition": {"index_type": "DELTA_SYNC", "delta_sync_index_spec": {}}})}]
+    missing = find_missing_source_tables(client, rows)
+    assert missing == []
+    client.tables.get.assert_not_called()
