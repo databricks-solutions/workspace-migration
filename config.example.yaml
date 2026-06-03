@@ -58,6 +58,12 @@ iceberg_strategy: ""
 #                   a workspace admin (admin-bypass in the source filter).
 rls_cm_strategy: ""
 
+# --- Online Tables -> Lakebase synced table migration (migrate_online_tables) ---
+# The job creates this Lakebase database instance if it does not exist.
+lakebase_instance_name: cp_migration_lakebase
+lakebase_logical_database: databricks_postgres
+lakebase_capacity: CU_1
+
 # --- Target pre-existing state / collision handling (X.4) ---
 # What to do when a discovered source object has the same FQN as an
 # object already on target, and no migration_status row says we

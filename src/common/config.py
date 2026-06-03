@@ -156,6 +156,11 @@ class MigrationConfig:
     migrate_hive_dbfs_root: bool = False
     hive_dbfs_target_path: str = ""
     hive_target_catalog: str = "hive_upgraded"
+    # Online Tables → Lakebase synced table migration (migrate_online_tables).
+    # The job creates this Lakebase database instance if it does not exist.
+    lakebase_instance_name: str = "cp_migration_lakebase"
+    lakebase_logical_database: str = "databricks_postgres"
+    lakebase_capacity: str = "CU_1"
     # Target pre-existing state / collision handling (X.4).
     #
     # When a source object has the same FQN as an object on target AND no
@@ -234,6 +239,9 @@ class MigrationConfig:
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
             hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
             hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),
+            lakebase_instance_name=str(raw.get("lakebase_instance_name", "cp_migration_lakebase")),
+            lakebase_logical_database=str(raw.get("lakebase_logical_database", "databricks_postgres")),
+            lakebase_capacity=str(raw.get("lakebase_capacity", "CU_1")),
             on_target_collision=_coerce_collision_policy(raw.get("on_target_collision", "fail")),
             test_kill_after=_coerce_test_kill_after(raw.get("test_kill_after")),
         )
