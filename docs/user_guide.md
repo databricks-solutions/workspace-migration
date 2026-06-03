@@ -87,7 +87,7 @@ flowchart LR
 | `migrate_hive` job | Hive (legacy): databases, tables, views, functions, grants — migrated into a UC target catalog. |
 | `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
 | `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
-| `migrate_online_tables` job | Optional add-on: recreates UC Online Tables on the target and triggers a fresh re-sync from the already-migrated source Delta table. |
+| `migrate_online_tables` job | Optional add-on: converts each discovered legacy online table into a **Lakebase synced table** on the target (legacy online tables are deprecated; creation is blocked platform-wide). Re-syncs from the already-migrated source Delta table into a Lakebase database instance the job creates. |
 | `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
 | Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
 
@@ -151,7 +151,7 @@ by the standalone `migrate_online_tables` job (see Section 6, Step 8).
 | DLT pipelines | Spec + rebuild from UC (if UC-sourced) | Customer-owned definitions; checkpoints don't transfer |
 | Streaming Tables | Source-cutover | Re-create + cutover watermark; previously hard-skipped |
 | Materialized Views | Spec + rebuild | Re-create + REFRESH; previously hard-skipped |
-| Online Tables | Spec + rebuild | Re-create + sync; **available now** via `migrate_online_tables` job (see Section 6, Step 8). Sync history not transferred — target re-syncs from scratch. |
+| Online Tables | Convert to Lakebase synced table | Legacy online tables are deprecated (creation blocked platform-wide). **Available now** via `migrate_online_tables` job (see Section 6, Step 8): converts each online table to a Lakebase **synced table** re-syncing from the migrated source Delta table. Consumer repoint is operator-owned. |
 | Vector Search indexes | Spec + rebuild | Delta Sync indexes: **available now** via `migrate_vector_search` job (see Section 6, Step 7). Direct Access indexes remain deferred. |
 | Lakebase | Dump / restore | `pg_dump` / `pg_restore` out-of-band |
 | Online Feature Store | Dump / restore | Out-of-band state move |
@@ -492,23 +492,31 @@ ORDER BY status, object_name;
 
 ### Step 8 — `migrate_online_tables` (optional)
 
-Recreates **UC Online Tables** on the target workspace. Online table
-migration was previously handled (with a state-loss warning) inside
-`migrate_uc`; it has been moved to this standalone job so operators
-control the timing of the rebuild. Running this job is itself the
-opt-in — there is no configuration flag to enable or disable it. Bear
-in mind that every online table re-syncs from scratch against the
-target source Delta table, incurring a full data reload.
+Converts each discovered legacy online table into a **Lakebase synced
+table** on the target workspace. Legacy UC online tables are deprecated
+and can no longer be created platform-wide; this job re-syncs the same
+data from the already-migrated source Delta table into a Lakebase
+database instance. Running this job is itself the opt-in — there is no
+configuration flag to enable or disable it.
+
+**Paid resource — Lakebase database instance.** The job provisions a
+Lakebase database instance (configured via `lakebase_instance_name`,
+`lakebase_logical_database`, and `lakebase_capacity` in `config.yaml`),
+creating it if it does not exist. This is a **paid resource** that
+persists after the migration completes. Factor this into your cost
+planning; decommission the instance manually if it is no longer needed.
 
 **Precondition:** run `migrate_uc` first (Step 4). The job performs an
 up-front pre-check that verifies every online table's source Delta
-table exists on the target — if any are missing, the pre-check fails
-loudly before creating anything.
+table exists on the target **with a primary key** — synced-table
+creation fails without a primary key and the object is recorded
+`failed`. Ensure the source Delta table was migrated with its primary
+key intact.
 
-**The online store's sync history and freshness are NOT transferred.**
-The target online table starts an entirely fresh re-sync from the
-already-migrated source Delta table; any sync state from the source
-workspace is lost.
+**Consumer repoint is operator-owned.** Once a synced table is
+created, consumer applications must be updated to connect to the new
+Lakebase Postgres endpoint. This cut-over is outside the scope of the
+tool.
 
 ```bash
 databricks jobs run-now --job-id <migrate_online_tables_job_id> --profile target-workspace
@@ -527,9 +535,20 @@ ORDER BY status, object_name;
 
 | Status | Meaning |
 |---|---|
-| `created_resync_pending` | Online table created on target; re-sync is in progress. The table is not queryable until the re-sync completes. |
-| `skipped_target_exists` | The online table already exists on the target (set by a previous run or pre-existing). No action taken. |
-| `failed` | Online table creation failed. Inspect `error_message` and the workflow run logs, then re-run. |
+| `created_resync_pending` | Synced table created on target; re-sync from the source Delta table is in progress. The table is not queryable until the sync completes. |
+| `skipped_target_exists` | A synced table with this name already exists on the target (set by a previous run or pre-existing). No action taken. |
+| `skipped_instance_not_ready` | The Lakebase database instance was still provisioning when this table was processed. Re-run the job — idempotency will retry the table once the instance is ready. |
+| `failed` | Synced table creation failed (e.g. missing primary key on the source Delta table). Inspect `error_message` and the workflow run logs, then re-run. |
+
+**Known limitations**
+
+- **Consumer repoint required.** Downstream applications that read
+  from the old online table endpoint must be reconfigured to use the
+  new Lakebase Postgres endpoint — this is an operator action outside
+  the tool's scope.
+- **Primary key mandatory.** If the source Delta table was migrated
+  without a primary key, synced-table creation will fail. Verify the
+  target table schema before running.
 
 ### Step 9 — Verify
 
@@ -546,6 +565,7 @@ WHERE status NOT IN ('validated', 'skipped_by_config',
                      'skipped_target_exists',
                      'skipped_direct_access_unsupported',
                      'skipped_endpoint_not_ready',
+                     'skipped_instance_not_ready',
                      'created_resync_pending',
                      'dry_run')
 GROUP BY object_type, status, error_message
