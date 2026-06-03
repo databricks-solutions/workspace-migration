@@ -91,3 +91,34 @@ class StatefulExplorer:
             ]
 
         return self._safe("apps", _run)
+
+    def list_database_instances(self) -> list[dict]:
+        """Lakebase Postgres instances."""
+
+        def _run() -> list[dict]:
+            return [
+                {"instance_name": i.name, "definition": _as_dict(i)}
+                for i in self._client().database.list_database_instances()
+            ]
+
+        return self._safe("lakebase instances", _run)
+
+    def list_synced_tables(self) -> list[dict]:
+        """Lakebase synced tables, enumerated per instance. Each row keeps
+        instance_name so the later dep step links synced_table -> instance."""
+
+        def _run() -> list[dict]:
+            client = self._client()
+            results: list[dict] = []
+            for inst in client.database.list_database_instances():
+                for t in client.database.list_synced_database_tables(instance_name=inst.name):
+                    results.append(
+                        {
+                            "synced_table_name": t.name,
+                            "instance_name": inst.name,
+                            "definition": _as_dict(t),
+                        }
+                    )
+            return results
+
+        return self._safe("lakebase synced tables", _run)

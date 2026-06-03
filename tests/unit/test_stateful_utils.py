@@ -110,3 +110,38 @@ class TestApps:
         auth.source_client.apps.list.side_effect = Exception("403")
         assert StatefulExplorer(auth).list_apps() == []
         assert "apps" in capsys.readouterr().out
+
+
+class TestLakebase:
+    def test_lists_database_instances(self):
+        auth = MagicMock()
+        auth.source_client.database.list_database_instances.return_value = [
+            _sdk_obj(as_dict={"name": "lb1", "pg_version": "16"}, name="lb1")
+        ]
+        rows = StatefulExplorer(auth).list_database_instances()
+        assert rows == [{"instance_name": "lb1", "definition": {"name": "lb1", "pg_version": "16"}}]
+
+    def test_lists_synced_tables_per_instance(self):
+        auth = MagicMock()
+        client = auth.source_client
+        client.database.list_database_instances.return_value = [_sdk_obj(name="lb1")]
+        client.database.list_synced_database_tables.return_value = [
+            _sdk_obj(
+                as_dict={"name": "cat.sch.synced", "database_instance_name": "lb1"},
+                name="cat.sch.synced",
+                database_instance_name="lb1",
+            )
+        ]
+        rows = StatefulExplorer(auth).list_synced_tables()
+        assert len(rows) == 1
+        assert rows[0]["synced_table_name"] == "cat.sch.synced"
+        assert rows[0]["instance_name"] == "lb1"
+        assert rows[0]["definition"]["database_instance_name"] == "lb1"
+        client.database.list_synced_database_tables.assert_called_once_with(instance_name="lb1")
+
+    def test_lakebase_surfaces_warn_and_empty_when_unavailable(self, capsys):
+        auth = MagicMock()
+        auth.source_client.database.list_database_instances.side_effect = Exception("404")
+        assert StatefulExplorer(auth).list_database_instances() == []
+        assert StatefulExplorer(auth).list_synced_tables() == []
+        assert "lakebase" in capsys.readouterr().out
