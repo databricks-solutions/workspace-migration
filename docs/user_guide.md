@@ -86,6 +86,7 @@ flowchart LR
 | `migrate_uc` job | UC data plane: managed tables, external tables, views, functions, volumes, models, grants. |
 | `migrate_hive` job | Hive (legacy): databases, tables, views, functions, grants — migrated into a UC target catalog. |
 | `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
+| `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
 | `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
 | Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
 
@@ -148,7 +149,7 @@ next section):
 | Streaming Tables | Source-cutover | Re-create + cutover watermark; previously hard-skipped |
 | Materialized Views | Spec + rebuild | Re-create + REFRESH; previously hard-skipped |
 | Online Tables | Spec + rebuild | Re-create + sync; previously hard-skipped |
-| Vector Search indexes | Spec + rebuild | Re-create + repopulate from UC source |
+| Vector Search indexes | Spec + rebuild | Delta Sync indexes: **available now** via `migrate_vector_search` job (see Section 6, Step 7). Direct Access indexes remain deferred. |
 | Lakebase | Dump / restore | `pg_dump` / `pg_restore` out-of-band |
 | Online Feature Store | Dump / restore | Out-of-band state move |
 | Apps | Spec-only re-create | Read source app spec, POST to target |
@@ -324,9 +325,9 @@ databricks bundle deploy -t dev \
 
 This creates:
 
-- The five workflows: `pre_check`, `discovery`, `migrate_uc`,
-  `migrate_hive`, `migrate_governance` (plus three integration-test
-  workflows).
+- The six workflows: `pre_check`, `discovery`, `migrate_uc`,
+  `migrate_hive`, `migrate_governance`, `migrate_vector_search` (plus
+  integration-test workflows).
 - The Lakeview dashboard at `/Shared/cp_migration/dev`.
 - The `config.yaml` file at `/Workspace/Shared/cp_migration/config.yaml`.
 
@@ -336,7 +337,7 @@ This creates:
 
 The recommended order: `pre_check` → `discovery` → `pre_check` (again,
 for collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
-`migrate_governance`.
+`migrate_governance` → `migrate_vector_search` (optional).
 
 ### Step 1 — `pre_check`
 
@@ -432,7 +433,60 @@ shares, foreign catalogs, connections, policies.
 databricks jobs run-now --job-id <migrate_governance_job_id> --profile target-workspace
 ```
 
-### Step 7 — Verify
+### Step 7 — `migrate_vector_search` (optional)
+
+Recreates **Delta Sync** Vector Search indexes on the target workspace.
+Running this job is itself the opt-in — there is no configuration flag
+to enable or disable it. Bear in mind that re-embedding every index
+against the target source tables incurs compute cost proportional to
+the size of those tables.
+
+**Precondition:** run `migrate_uc` first (Step 4). The job performs an
+up-front pre-check that verifies every index's source Delta table
+exists on the target — if any are missing, the pre-check fails loudly
+before creating anything.
+
+```bash
+databricks jobs run-now --job-id <migrate_vector_search_job_id> --profile target-workspace
+```
+
+The job also ensures the target Vector Search endpoint exists before
+attempting to create indexes. If the named endpoint does not exist it
+is created automatically; if it exists but is still provisioning the
+affected indexes are skipped and retried on the next run.
+
+Monitor progress in `migration_status`:
+
+```sql
+SELECT object_name, status, error_message
+FROM migration_tracking.cp_migration.migration_status
+WHERE object_type = 'vector_search_index'
+ORDER BY status, object_name;
+```
+
+**Status values**
+
+| Status | Meaning |
+|---|---|
+| `created_resync_pending` | Index created on target; re-embedding is in progress. The index is not queryable until the re-sync completes. |
+| `skipped_endpoint_not_ready` | The target endpoint was still provisioning when this index was processed. Re-run the job — idempotency will retry the index. |
+| `skipped_target_exists` | The index already exists on the target (set by a previous run or pre-existing). No action taken. |
+| `failed` | Index creation failed. Inspect `error_message` and the workflow run logs, then re-run. |
+
+**Known limitations**
+
+- **Direct Vector Access indexes are not migrated** — they are recorded
+  `skipped_direct_access_unsupported`. Their vectors are written
+  directly by your application (external state) and cannot be recreated
+  by this tool.
+- **Custom embedding-model serving endpoints are not checked or
+  migrated.** If a Delta Sync index uses a custom model serving endpoint
+  for embeddings, ensure that endpoint exists on the target before
+  running. Databricks-hosted embedding models (e.g.
+  `databricks-gte-large-en`) are available by default and are
+  unaffected.
+
+### Step 8 — Verify
 
 Confirm via the dashboard and these checks:
 
@@ -445,6 +499,9 @@ WHERE status NOT IN ('validated', 'skipped_by_config',
                      'skipped_by_pipeline_migration',
                      'skipped_by_stateful_service_migration',
                      'skipped_target_exists',
+                     'skipped_direct_access_unsupported',
+                     'skipped_endpoint_not_ready',
+                     'created_resync_pending',
                      'dry_run')
 GROUP BY object_type, status, error_message
 ORDER BY n DESC;
