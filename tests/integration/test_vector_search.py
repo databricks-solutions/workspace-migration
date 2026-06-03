@@ -40,9 +40,10 @@ errors: list[str] = []
 
 
 def _latest_status(fqn: str):
+    _safe = fqn.replace("'", "''")
     rows = spark.sql(  # noqa: F821
         "SELECT status FROM migration_tracking.cp_migration.migration_status "
-        f"WHERE object_type = 'vector_search_index' AND object_name = '{fqn}' "
+        f"WHERE object_type = 'vector_search_index' AND object_name = '{_safe}' "
         "ORDER BY migrated_at DESC LIMIT 1"
     ).collect()
     return rows[0]["status"] if rows else None
@@ -59,12 +60,13 @@ def _exists_on_target(fqn: str) -> bool:
 # COMMAND ----------
 # --- Positive case: Delta Sync ---
 if _has_delta == "true":
+    _n = len(errors)
     _status = _latest_status(_delta_fqn)
     if _status != "created_resync_pending":
         errors.append(f"POSITIVE: {_delta_fqn} status={_status!r}, expected 'created_resync_pending'")
     if not _exists_on_target(_delta_fqn):
         errors.append(f"POSITIVE: {_delta_fqn} not found on target — migration did not create the index")
-    else:
+    if len(errors) == _n:
         print(f"[test-vs] POSITIVE ok: {_delta_fqn} created_resync_pending + present on target")
 else:
     print("[test-vs] POSITIVE skipped — seed did not create the Delta Sync index (VS unavailable?)")
@@ -72,12 +74,13 @@ else:
 # COMMAND ----------
 # --- Negative case: Direct Access ---
 if _has_direct == "true":
+    _n = len(errors)
     _status = _latest_status(_direct_fqn)
     if _status != "skipped_direct_access_unsupported":
         errors.append(f"NEGATIVE: {_direct_fqn} status={_status!r}, expected 'skipped_direct_access_unsupported'")
     if _exists_on_target(_direct_fqn):
         errors.append(f"NEGATIVE: {_direct_fqn} unexpectedly EXISTS on target — Direct Access must not be migrated")
-    else:
+    if len(errors) == _n:
         print(f"[test-vs] NEGATIVE ok: {_direct_fqn} skipped + absent on target")
 else:
     print("[test-vs] NEGATIVE skipped — seed did not create the Direct Access index (VS unavailable?)")
