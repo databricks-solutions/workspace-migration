@@ -43,3 +43,47 @@ class TestScaffold:
     def test_safe_passes_through_on_success(self):
         explorer = StatefulExplorer(MagicMock())
         assert explorer._safe("x", lambda: [1, 2]) == [1, 2]
+
+
+class TestVectorSearch:
+    def test_lists_indexes_across_endpoints_with_full_spec(self):
+        auth = MagicMock()
+        client = auth.source_client
+        client.vector_search_endpoints.list_endpoints.return_value = [
+            _sdk_obj(name="ep1")
+        ]
+        client.vector_search_indexes.list_indexes.return_value = [
+            _sdk_obj(name="cat.sch.idx")
+        ]
+        client.vector_search_indexes.get_index.return_value = _sdk_obj(
+            as_dict={"name": "cat.sch.idx", "primary_key": "id",
+                     "delta_sync_index_spec": {"source_table": "cat.sch.src"}},
+            name="cat.sch.idx",
+        )
+
+        rows = StatefulExplorer(auth).list_vector_search_indexes()
+
+        assert len(rows) == 1
+        assert rows[0]["index_name"] == "cat.sch.idx"
+        assert rows[0]["endpoint_name"] == "ep1"
+        assert rows[0]["definition"]["delta_sync_index_spec"]["source_table"] == "cat.sch.src"
+        client.vector_search_indexes.list_indexes.assert_called_once_with(endpoint_name="ep1")
+
+    def test_falls_back_to_mini_when_get_index_fails(self):
+        auth = MagicMock()
+        client = auth.source_client
+        client.vector_search_endpoints.list_endpoints.return_value = [_sdk_obj(name="ep1")]
+        client.vector_search_indexes.list_indexes.return_value = [
+            _sdk_obj(as_dict={"name": "cat.sch.idx"}, name="cat.sch.idx")
+        ]
+        client.vector_search_indexes.get_index.side_effect = RuntimeError("boom")
+
+        rows = StatefulExplorer(auth).list_vector_search_indexes()
+        assert rows[0]["definition"] == {"name": "cat.sch.idx"}
+
+    def test_returns_empty_and_warns_when_vs_not_enabled(self, capsys):
+        auth = MagicMock()
+        auth.source_client.vector_search_endpoints.list_endpoints.side_effect = Exception("404")
+        rows = StatefulExplorer(auth).list_vector_search_indexes()
+        assert rows == []
+        assert "vector search" in capsys.readouterr().out

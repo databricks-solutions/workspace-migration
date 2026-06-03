@@ -52,3 +52,29 @@ class StatefulExplorer:
                 f"skipping ({type(exc).__name__}: {exc})"
             )
             return []
+
+    def list_vector_search_indexes(self) -> list[dict]:
+        """VS indexes across all endpoints. list_indexes returns a *mini*
+        view without the source table, so fetch the full index via get_index
+        (best-effort) to capture the source-table dependency in the spec."""
+
+        def _run() -> list[dict]:
+            client = self._client()
+            results: list[dict] = []
+            for ep in client.vector_search_endpoints.list_endpoints():
+                for idx in client.vector_search_indexes.list_indexes(endpoint_name=ep.name):
+                    try:
+                        full = client.vector_search_indexes.get_index(index_name=idx.name)
+                        definition = _as_dict(full)
+                    except Exception:  # noqa: BLE001
+                        definition = _as_dict(idx)
+                    results.append(
+                        {
+                            "index_name": idx.name,
+                            "endpoint_name": ep.name,
+                            "definition": definition,
+                        }
+                    )
+            return results
+
+        return self._safe("vector search", _run)
