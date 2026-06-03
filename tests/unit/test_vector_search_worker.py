@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from unittest.mock import MagicMock
 
 from migrate.vector_search_worker import _build_delta_sync_spec, _is_delta_sync
@@ -111,7 +112,6 @@ class TestEnsureEndpoint:
 
 class TestMigrateIndex:
     def _row(self, definition):
-        import json
         return {"object_name": "cat.sch.idx", "object_type": "vector_search_index",
                 "metadata_json": json.dumps({"definition": definition})}
 
@@ -185,8 +185,6 @@ class TestMigrateIndex:
         assert "boom" in res["error_message"]
 
     def test_missing_definition_is_failed(self):
-        import json
-
         from migrate.vector_search_worker import migrate_index
         client = MagicMock()
         row = {"object_name": "cat.sch.idx", "object_type": "vector_search_index",
@@ -194,3 +192,46 @@ class TestMigrateIndex:
         res = migrate_index(client, row, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res["status"] == "failed"
         client.vector_search_indexes.create_index.assert_not_called()
+
+
+class TestRun:
+    def test_run_reads_list_migrates_and_records(self, monkeypatch):
+        import migrate.vector_search_worker as w
+
+        monkeypatch.setattr(w.MigrationConfig, "from_workspace_file", staticmethod(lambda: MagicMock()))
+        fake_auth = MagicMock()
+        monkeypatch.setattr(w, "AuthManager", lambda *a, **k: fake_auth)
+        tracker = MagicMock()
+        monkeypatch.setattr(w, "TrackingManager", lambda *a, **k: tracker)
+
+        definition = {"index_type": "DELTA_SYNC", "endpoint_name": "ep1", "primary_key": "id",
+                      "delta_sync_index_spec": {"source_table": "cat.sch.src", "pipeline_type": "TRIGGERED"}}
+        row = {"object_name": "cat.sch.idx", "object_type": "vector_search_index",
+               "metadata_json": json.dumps({"definition": definition})}
+        dbutils = MagicMock()
+        dbutils.jobs.taskValues.get.return_value = json.dumps([row])
+
+        ep = MagicMock()
+        ep.endpoint_status.state = "ONLINE"
+        fake_auth.target_client.vector_search_endpoints.get_endpoint.return_value = ep
+
+        monkeypatch.setattr(w.time, "sleep", lambda s: None)
+
+        w.run(dbutils, MagicMock())
+
+        recorded = tracker.append_migration_status.call_args.args[0]
+        assert len(recorded) == 1
+        assert recorded[0]["object_name"] == "cat.sch.idx"
+        assert recorded[0]["status"] == "created_resync_pending"
+
+    def test_run_empty_list_records_nothing(self, monkeypatch):
+        import migrate.vector_search_worker as w
+        monkeypatch.setattr(w.MigrationConfig, "from_workspace_file", staticmethod(lambda: MagicMock()))
+        monkeypatch.setattr(w, "AuthManager", lambda *a, **k: MagicMock())
+        tracker = MagicMock()
+        monkeypatch.setattr(w, "TrackingManager", lambda *a, **k: tracker)
+        dbutils = MagicMock()
+        dbutils.jobs.taskValues.get.return_value = json.dumps([])
+
+        w.run(dbutils, MagicMock())
+        tracker.append_migration_status.assert_not_called()

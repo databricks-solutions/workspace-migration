@@ -32,9 +32,9 @@ from databricks.sdk.service.vectorsearch import (
     VectorIndexType,
 )
 
-from common.auth import AuthManager  # noqa: F401
-from common.config import MigrationConfig  # noqa: F401
-from common.tracking import TrackingManager  # noqa: F401
+from common.auth import AuthManager
+from common.config import MigrationConfig
+from common.tracking import TrackingManager
 
 # COMMAND ----------
 
@@ -166,3 +166,31 @@ def migrate_index(
         return _result("failed", f"create_index failed: {exc}")
 
     return _result("created_resync_pending", None)
+
+
+# COMMAND ----------
+
+
+def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for worker-signature uniformity
+    config = MigrationConfig.from_workspace_file()
+    auth = AuthManager(config, dbutils)
+    tracker = TrackingManager(spark, config)
+
+    rows_json = dbutils.jobs.taskValues.get(  # type: ignore[union-attr]
+        taskKey="orchestrator", key="vector_search_index_list", debugValue="[]"
+    )
+    rows = json.loads(rows_json) if rows_json else []
+    print(f"[vector_search] {len(rows)} index(es) to migrate")
+
+    results = [migrate_index(auth.target_client, row) for row in rows]
+
+    if results:
+        tracker.append_migration_status(results)
+    for r in results:
+        print(f"  {r['object_name']}: {r['status']}")
+
+
+# COMMAND ----------
+
+if _is_notebook():
+    run(dbutils, spark)  # type: ignore[name-defined]  # noqa: F821
