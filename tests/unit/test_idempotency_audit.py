@@ -606,13 +606,14 @@ class TestForeignCatalogsIdempotency:
 # ============================================================================
 # online_tables_worker
 # ============================================================================
-# Real migration: ``migrate_online_table`` calls target_client.online_tables.create.
+# Real migration: ``migrate_online_table`` calls create_synced_database_table.
 # Idempotency is handled by AlreadyExists → skipped_target_exists (terminal).
 
 class TestOnlineTablesIdempotency:
     def test_already_exists_is_idempotent(self):
-        """Second run (target exists) → skipped_target_exists; create is still
-        called (the SDK raises AlreadyExists) but no error is surfaced."""
+        """Second run (target synced table exists) → skipped_target_exists; the
+        SDK raises AlreadyExists from create_synced_database_table on both
+        calls, but no error is surfaced."""
         import json
 
         from databricks.sdk.errors import AlreadyExists
@@ -620,7 +621,14 @@ class TestOnlineTablesIdempotency:
         from migrate.online_tables_worker import migrate_online_table
 
         client = MagicMock()
-        client.online_tables.create.side_effect = AlreadyExists("already exists")
+        ready_inst = MagicMock()
+        ready_inst.state = "AVAILABLE"
+        client.database.get_database_instance.return_value = ready_inst
+        client.database.create_synced_database_table.side_effect = AlreadyExists("already exists")
+        config = MagicMock()
+        config.lakebase_instance_name = "lb1"
+        config.lakebase_logical_database = "ldb"
+        config.lakebase_capacity = "CU_1"
         definition = {
             "name": "c.s.ot",
             "spec": {"source_table_full_name": "c.s.src", "primary_key_columns": ["id"], "run_triggered": {}},
@@ -630,10 +638,10 @@ class TestOnlineTablesIdempotency:
             "object_type": "online_table",
             "metadata_json": json.dumps({"definition": definition}),
         }
-        res1 = migrate_online_table(client, row)
-        res2 = migrate_online_table(client, row)
+        res1 = migrate_online_table(client, row, config, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
+        res2 = migrate_online_table(client, row, config, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res1["status"] == res2["status"] == "skipped_target_exists"
-        assert client.online_tables.create.call_count == 2
+        assert client.database.create_synced_database_table.call_count == 2
 
 
 # ============================================================================

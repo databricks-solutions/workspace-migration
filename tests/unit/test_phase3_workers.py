@@ -656,10 +656,9 @@ class TestForeignCatalogsWorker:
 
 
 class TestOnlineTablesWorker:
-    """Real migration: ``migrate_online_table`` reconstructs the OnlineTableSpec
-    from the discovery row and calls target_client.online_tables.create, which
-    triggers a fresh re-sync on the target. object_name is the plain FQN (no
-    ONLINE_TABLE_ prefix), fixing the idempotency bug from the old worker."""
+    """Real migration: ``migrate_online_table`` converts the online table into a
+    Lakebase synced table via create_synced_database_table. object_name is the
+    plain FQN; a shared Lakebase instance is ensured before creation."""
 
     def test_migrate_online_table_created_resync_pending(self):
         import json
@@ -667,6 +666,13 @@ class TestOnlineTablesWorker:
         from migrate.online_tables_worker import migrate_online_table
 
         client = MagicMock()
+        ready_inst = MagicMock()
+        ready_inst.state = "AVAILABLE"
+        client.database.get_database_instance.return_value = ready_inst
+        config = MagicMock()
+        config.lakebase_instance_name = "lb1"
+        config.lakebase_logical_database = "ldb"
+        config.lakebase_capacity = "CU_1"
         definition = {
             "name": "c.s.online_t",
             "spec": {"source_table_full_name": "c.s.t", "primary_key_columns": ["id"], "run_triggered": {}},
@@ -676,11 +682,11 @@ class TestOnlineTablesWorker:
             "object_type": "online_table",
             "metadata_json": json.dumps({"definition": definition}),
         }
-        res = migrate_online_table(client, row)
+        res = migrate_online_table(client, row, config, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res["status"] == "created_resync_pending"
         assert res["object_name"] == "c.s.online_t"
-        ot_arg = client.online_tables.create.call_args.args[0]
-        assert ot_arg.spec.source_table_full_name == "c.s.t"
+        st_arg = client.database.create_synced_database_table.call_args.args[0]
+        assert st_arg.spec.source_table_full_name == "c.s.t"
 
 
 # ---------------------------------------------------- Sharing ---------
