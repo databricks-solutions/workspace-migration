@@ -90,6 +90,27 @@ class TestVectorSearch:
         assert rows == []
         assert "vector search" in capsys.readouterr().out
 
+    def test_one_bad_endpoint_does_not_zero_other_endpoints(self, capsys):
+        auth = MagicMock()
+        client = auth.source_client
+        client.vector_search_endpoints.list_endpoints.return_value = [
+            _sdk_obj(name="bad_ep"), _sdk_obj(name="good_ep")
+        ]
+
+        def _list_indexes(endpoint_name):
+            if endpoint_name == "bad_ep":
+                raise RuntimeError("endpoint unhealthy")
+            return [_sdk_obj(name="cat.s.idx")]
+
+        client.vector_search_indexes.list_indexes.side_effect = _list_indexes
+        client.vector_search_indexes.get_index.return_value = _sdk_obj(
+            as_dict={"name": "cat.s.idx"}, name="cat.s.idx"
+        )
+
+        rows = StatefulExplorer(auth).list_vector_search_indexes()
+        assert [r["index_name"] for r in rows] == ["cat.s.idx"]
+        assert "bad_ep" in capsys.readouterr().out
+
 
 class TestApps:
     def test_lists_apps_with_full_spec(self):
@@ -145,6 +166,24 @@ class TestLakebase:
         assert StatefulExplorer(auth).list_database_instances() == []
         assert StatefulExplorer(auth).list_synced_tables() == []
         assert "lakebase" in capsys.readouterr().out
+
+    def test_one_bad_instance_does_not_zero_other_instances(self, capsys):
+        auth = MagicMock()
+        client = auth.source_client
+        client.database.list_database_instances.return_value = [
+            _sdk_obj(name="bad_lb"), _sdk_obj(name="good_lb")
+        ]
+
+        def _list_synced(instance_name):
+            if instance_name == "bad_lb":
+                raise RuntimeError("instance unhealthy")
+            return [_sdk_obj(as_dict={"name": "cat.s.syn"}, name="cat.s.syn")]
+
+        client.database.list_synced_database_tables.side_effect = _list_synced
+
+        rows = StatefulExplorer(auth).list_synced_tables()
+        assert [r["synced_table_name"] for r in rows] == ["cat.s.syn"]
+        assert "bad_lb" in capsys.readouterr().out
 
 
 class TestServing:

@@ -62,7 +62,12 @@ class StatefulExplorer:
             client = self._client()
             results: list[dict] = []
             for ep in client.vector_search_endpoints.list_endpoints():
-                for idx in client.vector_search_indexes.list_indexes(endpoint_name=ep.name):
+                try:
+                    indexes = list(client.vector_search_indexes.list_indexes(endpoint_name=ep.name))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[stateful][warn] vector search endpoint {ep.name} list_indexes failed — skipping ({exc})")
+                    continue
+                for idx in indexes:
                     try:
                         full = client.vector_search_indexes.get_index(index_name=idx.name)
                         definition = _as_dict(full)
@@ -111,7 +116,15 @@ class StatefulExplorer:
             client = self._client()
             results: list[dict] = []
             for inst in client.database.list_database_instances():
-                for t in client.database.list_synced_database_tables(instance_name=inst.name):
+                try:
+                    synced = list(client.database.list_synced_database_tables(instance_name=inst.name))
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        f"[stateful][warn] lakebase instance {inst.name} "
+                        f"list_synced_database_tables failed — skipping ({exc})"
+                    )
+                    continue
+                for t in synced:
                     results.append(
                         {
                             "synced_table_name": t.name,
