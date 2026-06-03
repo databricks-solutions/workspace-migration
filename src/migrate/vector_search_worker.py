@@ -23,6 +23,7 @@ except NameError:
 
 import contextlib
 import json
+import logging
 import time
 
 from databricks.sdk.errors import AlreadyExists
@@ -35,6 +36,9 @@ from databricks.sdk.service.vectorsearch import (
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("vector_search_worker")
 
 # COMMAND ----------
 
@@ -180,14 +184,14 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         taskKey="orchestrator", key="vector_search_index_list", debugValue="[]"
     )
     rows = json.loads(rows_json) if rows_json else []
-    print(f"[vector_search] {len(rows)} index(es) to migrate")
+    logger.info("[vector_search] %d index(es) to migrate", len(rows))
 
     results = [migrate_index(auth.target_client, row) for row in rows]
 
     if results:
         tracker.append_migration_status(results)
     for r in results:
-        print(f"  {r['object_name']}: {r['status']}")
+        logger.info("  %s: %s", r["object_name"], r["status"])
 
 
 # COMMAND ----------

@@ -235,3 +235,35 @@ class TestRun:
 
         w.run(dbutils, MagicMock())
         tracker.append_migration_status.assert_not_called()
+
+    def test_run_isolates_per_index_outcomes(self, monkeypatch):
+        import migrate.vector_search_worker as w
+
+        monkeypatch.setattr(w.MigrationConfig, "from_workspace_file", staticmethod(lambda: MagicMock()))
+        fake_auth = MagicMock()
+        monkeypatch.setattr(w, "AuthManager", lambda *a, **k: fake_auth)
+        tracker = MagicMock()
+        monkeypatch.setattr(w, "TrackingManager", lambda *a, **k: tracker)
+
+        delta = {"index_type": "DELTA_SYNC", "endpoint_name": "ep1", "primary_key": "id",
+                 "delta_sync_index_spec": {"source_table": "cat.sch.src", "pipeline_type": "TRIGGERED"}}
+        direct = {"index_type": "DIRECT_ACCESS"}
+        rows = [
+            {"object_name": "cat.sch.direct", "object_type": "vector_search_index",
+             "metadata_json": json.dumps({"definition": direct})},
+            {"object_name": "cat.sch.delta", "object_type": "vector_search_index",
+             "metadata_json": json.dumps({"definition": delta})},
+        ]
+        dbutils = MagicMock()
+        dbutils.jobs.taskValues.get.return_value = json.dumps(rows)
+        ep = MagicMock()
+        ep.endpoint_status.state = "ONLINE"
+        fake_auth.target_client.vector_search_endpoints.get_endpoint.return_value = ep
+        monkeypatch.setattr(w.time, "sleep", lambda s: None)
+
+        w.run(dbutils, MagicMock())
+
+        recorded = tracker.append_migration_status.call_args.args[0]
+        by_name = {r["object_name"]: r["status"] for r in recorded}
+        assert by_name["cat.sch.direct"] == "skipped_direct_access_unsupported"
+        assert by_name["cat.sch.delta"] == "created_resync_pending"
