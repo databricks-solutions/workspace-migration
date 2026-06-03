@@ -14,10 +14,15 @@ except NameError:
     pass
 
 # COMMAND ----------
-# Live Online Tables migration assertion (positive case).
-#   migration_status == created_resync_pending AND the online table exists on
-#   the TARGET (online_tables.get succeeds). Skipped (not failed) if the seed
-#   could not create the source online table (preview unavailable).
+# Live Online Tables → Synced Tables migration assertion.
+#
+# The seed injected a synthetic online_table discovery row (no real online table
+# on source). The migrate_online_tables job converts it to a Lakebase synced table.
+#
+# Expected outcomes:
+#   created_resync_pending  — synced table created on target (happy path)
+#   skipped_instance_not_ready — Lakebase instance did not become AVAILABLE within
+#                                 the wait budget; not a test failure, printed as info.
 
 import json
 
@@ -30,11 +35,12 @@ _config = MigrationConfig.from_workspace_file()
 _auth = AuthManager(_config, dbutils)  # noqa: F821
 _target = _auth.target_client
 
-_has_ot = dbutils.jobs.taskValues.get(taskKey="seed_online_tables", key="has_online_table", debugValue="false")  # noqa: F821
-_ot_fqn = dbutils.jobs.taskValues.get(taskKey="seed_online_tables", key="online_table_fqn", debugValue="")  # noqa: F821
+_OT_FQN = dbutils.jobs.taskValues.get(  # noqa: F821
+    taskKey="seed_online_tables", key="online_table_fqn", debugValue=""
+)
 
 errors: list[str] = []
-summary: dict = {}
+summary: str = ""
 
 
 def _latest_status(fqn: str):
@@ -47,30 +53,32 @@ def _latest_status(fqn: str):
     return rows[0]["status"] if rows else None
 
 
-def _exists_on_target(fqn: str) -> bool:
+def _synced_exists(fqn: str) -> bool:
     try:
-        _target.online_tables.get(fqn)
+        _target.database.get_synced_database_table(fqn)
         return True
     except NotFound:
         return False
 
 
 # COMMAND ----------
-if _has_ot == "true":
-    _n = len(errors)
-    _status = _latest_status(_ot_fqn)
-    if _status != "created_resync_pending":
-        errors.append(f"POSITIVE: {_ot_fqn} status={_status!r}, expected 'created_resync_pending'")
-    if not _exists_on_target(_ot_fqn):
-        errors.append(f"POSITIVE: {_ot_fqn} not found on target — migration did not create the online table")
-    if len(errors) == _n:
-        summary["online_table"] = "asserted_ok"
-        print(f"[test-ot] POSITIVE ok: {_ot_fqn} created_resync_pending + present on target")
-    else:
-        summary["online_table"] = "FAILED"
+_status = _latest_status(_OT_FQN)
+
+if _status == "skipped_instance_not_ready":
+    summary = "skipped_instance_not_ready"
+    print(
+        f"[test-ot] skipped — Lakebase instance not ready within wait budget "
+        f"(status={_status!r}); not a test failure"
+    )
+elif _status == "created_resync_pending" and _synced_exists(_OT_FQN):
+    summary = "asserted_ok"
+    print(f"[test-ot] PASS: {_OT_FQN} created_resync_pending + synced table present on target")
 else:
-    summary["online_table"] = "skipped_no_seed"
-    print("[test-ot] skipped — seed did not create the online table (preview unavailable?)")
+    summary = "FAILED"
+    if _status != "created_resync_pending":
+        errors.append(f"{_OT_FQN} status={_status!r}, expected 'created_resync_pending'")
+    if not _synced_exists(_OT_FQN):
+        errors.append(f"{_OT_FQN} synced table not found on target — migration did not create it")
 
 # COMMAND ----------
 _result = json.dumps({"summary": summary, "errors": errors})

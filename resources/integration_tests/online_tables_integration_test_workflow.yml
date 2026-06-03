@@ -3,10 +3,12 @@ resources:
     online_tables_integration_test:
       name: "${var.job_prefix}-online-tables-integration-test"
       description: |
-        Online Tables integration test: runs discovery, invokes the
-        migrate_online_tables job, then asserts migration_status rows are
-        in a known terminal OT state. Zero online_table rows is a pass
-        (OT preview may be disabled in the test workspace).
+        Online Tables → Synced Tables integration test: seeds a synthetic
+        online_table discovery row (no real online table required), invokes the
+        migrate_online_tables job to create a real Lakebase synced table on
+        target, then asserts migration_status is created_resync_pending and
+        the synced table exists. skipped_instance_not_ready is treated as a
+        non-failure (Lakebase may not be available in the test workspace).
       run_as:
         service_principal_name: ${var.migration_spn_id}
       tasks:
@@ -14,9 +16,8 @@ resources:
           notebook_task:
             notebook_path: ../../tests/integration/setup_test_config.py
             # OT integration test: no Iceberg DDL replay, no RLS/CM staging,
-            # no Hive DBFS-root migration. catalog_filter scopes discovery to
-            # the OT fixture catalog so the UC/Hive fixtures seeded in
-            # parallel runs are ignored.
+            # no Hive DBFS-root migration. catalog_filter scopes the synthetic
+            # discovery row to the OT fixture catalog.
             base_parameters:
               iceberg_strategy: ""
               rls_cm_strategy: ""
@@ -30,15 +31,9 @@ resources:
           notebook_task:
             notebook_path: ../../tests/integration/seed_online_tables_test_data.py
 
-        - task_key: discovery
-          depends_on:
-            - task_key: seed_online_tables
-          notebook_task:
-            notebook_path: ../../src/discovery/discovery.py
-
         - task_key: migrate_online_tables
           depends_on:
-            - task_key: discovery
+            - task_key: seed_online_tables
           run_job_task:
             job_id: ${resources.jobs.migrate_online_tables.id}
 
@@ -52,7 +47,6 @@ resources:
           depends_on:
             - task_key: setup_test_config
             - task_key: seed_online_tables
-            - task_key: discovery
             - task_key: migrate_online_tables
             - task_key: test_online_tables
           run_if: ALL_DONE

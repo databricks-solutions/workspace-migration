@@ -14,24 +14,23 @@ except NameError:
     pass
 
 # COMMAND ----------
-# Seed for the live Online Tables integration test.
-# SOURCE: a PK'd Delta table + a Triggered online table (the positive case).
-# TARGET: the same-named PK'd Delta table only (stands in for migrate_uc, so the
-# migrate_online_tables pre-check finds the source table). No online table on target.
+# Seed for the live Online Tables → Synced Tables integration test.
+#
+# Legacy online tables cannot be created any more, so this seed:
+#   1. Creates a PK'd source table on TARGET (the pre-check requires it there).
+#   2. Injects a synthetic `online_table` row into discovery_inventory so the
+#      migrate_online_tables orchestrator picks it up and creates a real Lakebase
+#      synced table.
+# There is NO real online table on source — the integration workflow has no
+# `discovery` task; the row is injected directly here.
 
-import contextlib
 import json
-
-from databricks.sdk import WorkspaceClient
-from databricks.sdk.service.catalog import (
-    OnlineTable,
-    OnlineTableSpec,
-    OnlineTableSpecTriggeredSchedulingPolicy,
-)
+from datetime import datetime, timezone
 
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
+from common.tracking import TrackingManager, discovery_row, discovery_schema
 
 _CATALOG = "integration_test_src"
 _SCHEMA = "ot_test"
@@ -39,56 +38,57 @@ _TABLE = f"{_CATALOG}.{_SCHEMA}.ot_source"
 _OT_FQN = f"{_CATALOG}.{_SCHEMA}.ot_online"
 
 # COMMAND ----------
-# --- SOURCE: PK'd Delta table ---
-spark.sql(f"CREATE CATALOG IF NOT EXISTS {_CATALOG}")  # noqa: F821
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {_CATALOG}.{_SCHEMA}")  # noqa: F821
-spark.sql(  # noqa: F821
-    f"CREATE OR REPLACE TABLE {_TABLE} (id INT NOT NULL, text STRING, "
-    "CONSTRAINT ot_pk PRIMARY KEY(id))"
-)
-spark.sql(f"INSERT INTO {_TABLE} VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')")  # noqa: F821
-print(f"[seed-ot] source table {_TABLE} created (PK on id)")
-
-# COMMAND ----------
-# --- TARGET: same-named PK'd table so the pre-check passes ---
+# --- TARGET: PK'd Delta table so the pre-check finds the source table ---
 _config = MigrationConfig.from_workspace_file()
 _auth = AuthManager(_config, dbutils)  # noqa: F821
 _tgt_wh = find_warehouse(_auth)
+
 for _sql in (
     f"CREATE CATALOG IF NOT EXISTS {_CATALOG}",
     f"CREATE SCHEMA IF NOT EXISTS {_CATALOG}.{_SCHEMA}",
-    f"CREATE OR REPLACE TABLE {_TABLE} (id INT NOT NULL, text STRING, CONSTRAINT ot_pk PRIMARY KEY(id))",
-    f"INSERT INTO {_TABLE} VALUES (1, 'alpha'), (2, 'beta')",
+    (
+        f"CREATE OR REPLACE TABLE {_TABLE} "
+        "(id INT NOT NULL, text STRING, CONSTRAINT ot_pk PRIMARY KEY(id))"
+    ),
+    f"INSERT INTO {_TABLE} VALUES (1, 'alpha'), (2, 'beta'), (3, 'gamma')",
 ):
     _res = execute_and_poll(_auth, _tgt_wh, _sql)
     if _res.get("state") != "SUCCEEDED":
-        raise RuntimeError(f"[seed-ot] target setup SQL failed: {_sql} -> {_res}")
+        raise RuntimeError(f"[seed-ot] target setup SQL failed: {_sql!r} -> {_res}")
 print(f"[seed-ot] target table {_TABLE} created (PK on id)")
 
 # COMMAND ----------
-# --- SOURCE: Triggered online table (positive case) ---
-_w = WorkspaceClient()
-_has_online_table = False
-try:
-    with contextlib.suppress(Exception):
-        _w.online_tables.delete(_OT_FQN)
-    _w.online_tables.create(
-        OnlineTable(
-            name=_OT_FQN,
-            spec=OnlineTableSpec(
-                source_table_full_name=_TABLE,
-                primary_key_columns=["id"],
-                run_triggered=OnlineTableSpecTriggeredSchedulingPolicy(),
-            ),
-        )
-    )
-    _has_online_table = True
-    print(f"[seed-ot] source online table {_OT_FQN} created")
-except Exception as _exc:  # noqa: BLE001
-    print(f"[seed-ot] online table seed failed (preview may be unavailable): {_exc}")
+# --- TRACKING: ensure tracking tables exist, then inject a synthetic online_table row ---
+TrackingManager(spark, _config).init_tracking_tables()  # noqa: F821
+
+_now = datetime.now(tz=timezone.utc)
+_row = discovery_row(
+    source_type="stateful",
+    object_type="online_table",
+    object_name=_OT_FQN,
+    catalog_name=None,
+    schema_name=None,
+    discovered_at=_now,
+    metadata={
+        "capability": "online_store",
+        "online_table_fqn": _OT_FQN,
+        "source_table_fqn": _TABLE,
+        "definition": {
+            "name": _OT_FQN,
+            "spec": {
+                "source_table_full_name": _TABLE,
+                "primary_key_columns": ["id"],
+                "run_triggered": {},
+            },
+        },
+    },
+)
+
+spark.createDataFrame([_row], schema=discovery_schema()).write.mode("append").saveAsTable(  # noqa: F821
+    f"{_config.tracking_catalog}.{_config.tracking_schema}.discovery_inventory"
+)
+print(f"[seed-ot] synthetic online_table row injected for {_OT_FQN}")
 
 # COMMAND ----------
-dbutils.jobs.taskValues.set(key="has_online_table", value="true" if _has_online_table else "false")  # noqa: F821
 dbutils.jobs.taskValues.set(key="online_table_fqn", value=_OT_FQN)  # noqa: F821
-print(f"[seed-ot] flags: online_table={_has_online_table}")
-dbutils.notebook.exit(json.dumps({"has_online_table": _has_online_table}))  # noqa: F821
+dbutils.notebook.exit(json.dumps({"seeded": True, "online_table_fqn": _OT_FQN}))  # noqa: F821
