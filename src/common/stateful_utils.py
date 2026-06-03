@@ -122,3 +122,15 @@ class StatefulExplorer:
             return results
 
         return self._safe("lakebase synced tables", _run)
+
+    def list_model_serving_endpoints(self) -> list[dict]:
+        """Model Serving endpoints. config.served_entities carries the served
+        model dependency — preserved in definition."""
+
+        def _run() -> list[dict]:
+            return [
+                {"endpoint_name": e.name, "definition": _as_dict(e)}
+                for e in self._client().serving_endpoints.list()
+            ]
+
+        return self._safe("serving endpoints", _run)

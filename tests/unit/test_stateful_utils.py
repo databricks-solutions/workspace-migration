@@ -145,3 +145,24 @@ class TestLakebase:
         assert StatefulExplorer(auth).list_database_instances() == []
         assert StatefulExplorer(auth).list_synced_tables() == []
         assert "lakebase" in capsys.readouterr().out
+
+
+class TestServing:
+    def test_lists_serving_endpoints_with_full_config(self):
+        auth = MagicMock()
+        auth.source_client.serving_endpoints.list.return_value = [
+            _sdk_obj(
+                as_dict={"name": "ep", "config": {"served_entities": [{"entity_name": "cat.sch.model"}]}},
+                name="ep",
+            )
+        ]
+        rows = StatefulExplorer(auth).list_model_serving_endpoints()
+        assert len(rows) == 1
+        assert rows[0]["endpoint_name"] == "ep"
+        assert rows[0]["definition"]["config"]["served_entities"][0]["entity_name"] == "cat.sch.model"
+
+    def test_returns_empty_and_warns_when_unavailable(self, capsys):
+        auth = MagicMock()
+        auth.source_client.serving_endpoints.list.side_effect = Exception("403")
+        assert StatefulExplorer(auth).list_model_serving_endpoints() == []
+        assert "serving" in capsys.readouterr().out
