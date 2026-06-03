@@ -79,3 +79,15 @@ class StatefulExplorer:
             return results
 
         return self._safe("vector search", _run)
+
+    def list_apps(self) -> list[dict]:
+        """Databricks Apps. App.resources carries dependencies (Lakebase,
+        SQL warehouse, serving endpoint, secrets) — preserved in definition."""
+
+        def _run() -> list[dict]:
+            return [
+                {"app_name": a.name, "definition": _as_dict(a)}
+                for a in self._client().apps.list()
+            ]
+
+        return self._safe("apps", _run)

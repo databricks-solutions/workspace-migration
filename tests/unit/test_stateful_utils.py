@@ -89,3 +89,24 @@ class TestVectorSearch:
         rows = StatefulExplorer(auth).list_vector_search_indexes()
         assert rows == []
         assert "vector search" in capsys.readouterr().out
+
+
+class TestApps:
+    def test_lists_apps_with_full_spec(self):
+        auth = MagicMock()
+        auth.source_client.apps.list.return_value = [
+            _sdk_obj(
+                as_dict={"name": "myapp", "resources": [{"database": {"instance_name": "lb1"}}]},
+                name="myapp",
+            )
+        ]
+        rows = StatefulExplorer(auth).list_apps()
+        assert len(rows) == 1
+        assert rows[0]["app_name"] == "myapp"
+        assert rows[0]["definition"]["resources"][0]["database"]["instance_name"] == "lb1"
+
+    def test_returns_empty_and_warns_when_apps_unavailable(self, capsys):
+        auth = MagicMock()
+        auth.source_client.apps.list.side_effect = Exception("403")
+        assert StatefulExplorer(auth).list_apps() == []
+        assert "apps" in capsys.readouterr().out
