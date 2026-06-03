@@ -110,12 +110,6 @@ resources:
           notebook_task:
             notebook_path: ../../src/migrate/models_worker.py
 
-        - task_key: migrate_online_tables
-          depends_on:
-            - task_key: migrate_grants
-          notebook_task:
-            notebook_path: ../../src/migrate/online_tables_worker.py
-
         - task_key: cleanup_staging
           run_if: ALL_DONE
           notebook_task:
@@ -135,7 +129,6 @@ resources:
           run_if: ALL_DONE
           depends_on:
             - task_key: migrate_models
-            - task_key: migrate_online_tables
             - task_key: cleanup_staging
           notebook_task:
             notebook_path: ../../src/migrate/summary.py
@@ -143,4 +136,4 @@ resources:
               # WS-2: Per-workflow filter — only UC object types.
               # Values match what UC workers actually emit into
               # migration_status. mv_st_worker emits "mv" and "st".
-              object_types: "managed_table,external_table,view,function,volume,mv,st,registered_model,online_table,grant"
+              object_types: "managed_table,external_table,view,function,volume,mv,st,registered_model,grant"
