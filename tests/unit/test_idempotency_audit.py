@@ -606,24 +606,34 @@ class TestForeignCatalogsIdempotency:
 # ============================================================================
 # online_tables_worker
 # ============================================================================
-# Phase 4: online tables are hard-excluded. ``apply_online_table`` short-
-# circuits to ``skipped_by_stateful_service_migration`` — idempotent by
-# construction because no target-side mutation occurs.
-
+# Real migration: ``migrate_online_table`` calls target_client.online_tables.create.
+# Idempotency is handled by AlreadyExists → skipped_target_exists (terminal).
 
 class TestOnlineTablesIdempotency:
-    def test_hard_exclude_is_idempotent(self):
-        """Re-running on the same row produces the same skip status; the
-        target POST endpoint is never called."""
-        from migrate.online_tables_worker import apply_online_table
+    def test_already_exists_is_idempotent(self):
+        """Second run (target exists) → skipped_target_exists; create is still
+        called (the SDK raises AlreadyExists) but no error is surfaced."""
+        import json
 
-        auth = MagicMock()
-        obj = {"online_table_fqn": "c.s.ot", "definition": {"spec": {}}}
-        res1 = apply_online_table(obj, auth=auth, dry_run=False)
-        res2 = apply_online_table(obj, auth=auth, dry_run=False)
-        assert res1["status"] == res2["status"] == "skipped_by_stateful_service_migration"
-        assert "Stateful Services Phase" in (res1["error_message"] or "")
-        auth.target_client.api_client.do.assert_not_called()
+        from databricks.sdk.errors import AlreadyExists
+
+        from migrate.online_tables_worker import migrate_online_table
+
+        client = MagicMock()
+        client.online_tables.create.side_effect = AlreadyExists("already exists")
+        definition = {
+            "name": "c.s.ot",
+            "spec": {"source_table_full_name": "c.s.src", "primary_key_columns": ["id"], "run_triggered": {}},
+        }
+        row = {
+            "object_name": "c.s.ot",
+            "object_type": "online_table",
+            "metadata_json": json.dumps({"definition": definition}),
+        }
+        res1 = migrate_online_table(client, row)
+        res2 = migrate_online_table(client, row)
+        assert res1["status"] == res2["status"] == "skipped_target_exists"
+        assert client.online_tables.create.call_count == 2
 
 
 # ============================================================================

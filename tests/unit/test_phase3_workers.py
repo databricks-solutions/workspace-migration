@@ -656,30 +656,31 @@ class TestForeignCatalogsWorker:
 
 
 class TestOnlineTablesWorker:
-    """Phase 4: online tables are hard-excluded from the core migration
-    tool. ``apply_online_table`` short-circuits to
-    ``skipped_by_stateful_service_migration`` without touching the
-    target — index state is runtime state that the Stateful Services
-    Phase (separate future job) handles via proper sync-rebuild
-    semantics. See ``docs/stateful_services_phase.md``."""
+    """Real migration: ``migrate_online_table`` reconstructs the OnlineTableSpec
+    from the discovery row and calls target_client.online_tables.create, which
+    triggers a fresh re-sync on the target. object_name is the plain FQN (no
+    ONLINE_TABLE_ prefix), fixing the idempotency bug from the old worker."""
 
-    @patch("migrate.online_tables_worker.time")
-    def test_apply_online_table_hard_excludes(self, mock_time):
-        from migrate.online_tables_worker import apply_online_table
+    def test_migrate_online_table_created_resync_pending(self):
+        import json
 
-        mock_time.time.side_effect = [100.0, 100.1]
-        auth = MagicMock()
+        from migrate.online_tables_worker import migrate_online_table
 
-        res = apply_online_table(
-            {"online_table_fqn": "c.s.online_t", "definition": {"spec": {"source_table_full_name": "c.s.t"}}},
-            auth=auth,
-            dry_run=False,
-        )
-        assert res["status"] == "skipped_by_stateful_service_migration"
-        assert res["object_name"] == "ONLINE_TABLE_c.s.online_t"
-        assert "Stateful Services Phase" in res["error_message"]
-        # No POST issued — that's the entire point of hard-exclusion.
-        auth.target_client.api_client.do.assert_not_called()
+        client = MagicMock()
+        definition = {
+            "name": "c.s.online_t",
+            "spec": {"source_table_full_name": "c.s.t", "primary_key_columns": ["id"], "run_triggered": {}},
+        }
+        row = {
+            "object_name": "c.s.online_t",
+            "object_type": "online_table",
+            "metadata_json": json.dumps({"definition": definition}),
+        }
+        res = migrate_online_table(client, row)
+        assert res["status"] == "created_resync_pending"
+        assert res["object_name"] == "c.s.online_t"
+        ot_arg = client.online_tables.create.call_args.args[0]
+        assert ot_arg.spec.source_table_full_name == "c.s.t"
 
 
 # ---------------------------------------------------- Sharing ---------
