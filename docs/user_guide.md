@@ -508,10 +508,11 @@ planning; decommission the instance manually if it is no longer needed.
 
 **Precondition:** run `migrate_uc` first (Step 4). The job performs an
 up-front pre-check that verifies every online table's source Delta
-table exists on the target **with a primary key** — synced-table
-creation fails without a primary key and the object is recorded
-`failed`. Ensure the source Delta table was migrated with its primary
-key intact.
+table **exists on the target** — it fails loudly if the source table is
+missing. The primary-key requirement is enforced at runtime: if the
+migrated source table lacks a primary key, synced-table creation fails
+and the object is recorded `failed`. Ensure the source Delta table was
+migrated with its primary key intact.
 
 **Consumer repoint is operator-owned.** Once a synced table is
 created, consumer applications must be updated to connect to the new
