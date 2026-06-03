@@ -1,0 +1,46 @@
+resources:
+  jobs:
+    migrate_vector_search:
+      name: "${var.job_prefix}-migrate-vector-search"
+      description: |
+        Vector Search index migration: discovers all VS indexes registered
+        in discovery_inventory, re-creates endpoint associations and index
+        configurations on the target workspace, and validates sync status.
+        Trust-the-operator: target catalog/schema/table objects must already
+        exist on target (run migrate_uc first). pre_check_vector_search
+        validates that discovery_inventory has vector_search rows.
+        Standalone-runnable for vector search refresh.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: pre_check_vector_search
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check_vector_search.py
+
+        # The orchestrator publishes per-object-type lists via taskValues
+        # that the vector search worker consumes. Workers look for these
+        # under taskKey="orchestrator", so the orchestrator task must run
+        # inside the same job.
+        - task_key: orchestrator
+          depends_on:
+            - task_key: pre_check_vector_search
+          notebook_task:
+            notebook_path: ../../src/migrate/orchestrator.py
+
+        - task_key: migrate_vector_search
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/vector_search_worker.py
+
+        - task_key: summary_vector_search
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_vector_search
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              # WS-2: Per-workflow filter — only vector search object types.
+              # Values match what the vector search worker emits into
+              # migration_status.
+              object_types: "vector_search_endpoint,vector_search_index"
