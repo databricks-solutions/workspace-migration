@@ -3,13 +3,16 @@ resources:
     migrate_online_tables:
       name: "${var.job_prefix}-migrate-online-tables"
       description: |
-        Online Table migration: discovers all online tables registered
-        in discovery_inventory, re-creates online table configurations
-        on the target workspace, and validates sync status.
-        Trust-the-operator: target catalog/schema/table objects must already
-        exist on target (run migrate_uc first). pre_check_online_tables
-        validates that discovery_inventory has online_table rows.
-        Standalone-runnable for online table refresh.
+        Online Table migration: discovers all legacy online tables registered
+        in discovery_inventory and converts each into a Lakebase synced table
+        on the target workspace (legacy online tables are deprecated and
+        uncreatable; Lakebase synced tables are the Databricks-recommended
+        replacement). Ensures a Lakebase database instance exists on target
+        (creates it if missing) then creates each synced table to re-sync from
+        its source Delta table. Trust-the-operator: source Delta tables must
+        already exist on target (run migrate_uc first). pre_check_online_tables
+        validates that each online table's source Delta table exists on target.
+        Standalone-runnable for online table conversion.
       run_as:
         service_principal_name: ${var.migration_spn_id}
       tasks:

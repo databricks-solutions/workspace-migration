@@ -23,6 +23,8 @@ The doc offers two targets — **online feature store** (for model/feature servi
 | Synced table name | The synced table takes the **online table's FQN** on the target (free there — online tables can't exist on target). |
 | Statuses | Reuse `created_resync_pending` (on accept) + `skipped_target_exists`. Add non-terminal `skipped_instance_not_ready` (Lakebase instance still provisioning; re-run finishes it). |
 | Pre-check | Source Delta table exists on target **and has a primary key** (synced tables require it). Fail loud up-front. |
+
+> **Implementation note:** the PK requirement is enforced at synced-table create time (row recorded `failed`), not in the pre-check — the pre-check is source-existence only.
 | Testing | Unit tests cover all worker logic (CI gate). Live integration validates the **real synced-table mechanics** via a synthetic injected online-table discovery row (legacy online tables can no longer be created to seed). Honest boundary documented. |
 
 ## Architecture & components

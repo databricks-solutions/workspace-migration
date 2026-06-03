@@ -16,8 +16,8 @@ except NameError:
     pass
 
 # COMMAND ----------
-# Online Tables pre-check: an online table can only be recreated if its source
-# Delta table already exists on target. Fail the job up-front if any are missing.
+# Online Tables pre-check: an online table can only be converted to a synced table
+# if its source Delta table already exists on target. Fail the job up-front if any are missing.
 
 import json
 import logging
