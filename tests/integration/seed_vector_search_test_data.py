@@ -77,7 +77,9 @@ for _sql in (
     "TBLPROPERTIES (delta.enableChangeDataFeed = true)",
     f"INSERT INTO {_TABLE} VALUES (1, 'red running shoes'), (2, 'blue cotton shirt')",
 ):
-    execute_and_poll(_auth, _tgt_wh, _sql)
+    _res = execute_and_poll(_auth, _tgt_wh, _sql)
+    if _res["state"] != "SUCCEEDED":
+        raise RuntimeError(f"[seed-vs] target setup SQL failed: {_sql} -> {_res}")
 print(f"[seed-vs] target table {_TABLE} created (CDF enabled)")
 
 # COMMAND ----------
@@ -94,52 +96,61 @@ def _endpoint_online(name: str) -> bool:
 
 _has_delta_index = False
 _has_direct_index = False
+_endpoint_ready = False
 try:
     if not _endpoint_online(_ENDPOINT):
         with contextlib.suppress(Exception):
             _w.vector_search_endpoints.create_endpoint(name=_ENDPOINT, endpoint_type=EndpointType.STANDARD)
-        for _ in range(80):
+        for _ in range(120):
             if _endpoint_online(_ENDPOINT):
                 break
             time.sleep(15)
     if not _endpoint_online(_ENDPOINT):
         raise RuntimeError(f"source VS endpoint {_ENDPOINT} did not reach ONLINE")
     print(f"[seed-vs] source endpoint {_ENDPOINT} ONLINE")
-
-    with contextlib.suppress(Exception):
-        _w.vector_search_indexes.delete_index(_DELTA_IDX)
-    _w.vector_search_indexes.create_index(
-        name=_DELTA_IDX,
-        endpoint_name=_ENDPOINT,
-        primary_key="id",
-        index_type=VectorIndexType.DELTA_SYNC,
-        delta_sync_index_spec=DeltaSyncVectorIndexSpecRequest(
-            source_table=_TABLE,
-            pipeline_type=PipelineType.TRIGGERED,
-            embedding_source_columns=[
-                EmbeddingSourceColumn(name="text", embedding_model_endpoint_name=_EMBED_ENDPOINT)
-            ],
-        ),
-    )
-    _has_delta_index = True
-    print(f"[seed-vs] source Delta Sync index {_DELTA_IDX} created")
-
-    with contextlib.suppress(Exception):
-        _w.vector_search_indexes.delete_index(_DIRECT_IDX)
-    _w.vector_search_indexes.create_index(
-        name=_DIRECT_IDX,
-        endpoint_name=_ENDPOINT,
-        primary_key="id",
-        index_type=VectorIndexType.DIRECT_ACCESS,
-        direct_access_index_spec=DirectAccessVectorIndexSpec(
-            schema_json='{"id": "integer", "text": "string", "text_vector": "array<float>"}',
-            embedding_vector_columns=[EmbeddingVectorColumn(name="text_vector", embedding_dimension=_EMBED_DIM)],
-        ),
-    )
-    _has_direct_index = True
-    print(f"[seed-vs] source Direct Access index {_DIRECT_IDX} created")
+    _endpoint_ready = True
 except Exception as _exc:  # noqa: BLE001
-    print(f"[seed-vs] VS seeding incomplete (VS may be unavailable): {_exc}")
+    print(f"[seed-vs] VS endpoint not ONLINE — skipping both index seeds: {_exc}")
+
+if _endpoint_ready:
+    try:
+        with contextlib.suppress(Exception):
+            _w.vector_search_indexes.delete_index(_DELTA_IDX)
+        _w.vector_search_indexes.create_index(
+            name=_DELTA_IDX,
+            endpoint_name=_ENDPOINT,
+            primary_key="id",
+            index_type=VectorIndexType.DELTA_SYNC,
+            delta_sync_index_spec=DeltaSyncVectorIndexSpecRequest(
+                source_table=_TABLE,
+                pipeline_type=PipelineType.TRIGGERED,
+                embedding_source_columns=[
+                    EmbeddingSourceColumn(name="text", embedding_model_endpoint_name=_EMBED_ENDPOINT)
+                ],
+            ),
+        )
+        _has_delta_index = True
+        print(f"[seed-vs] source Delta Sync index {_DELTA_IDX} created")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[seed-vs] Delta Sync index seed failed: {_exc}")
+
+    try:
+        with contextlib.suppress(Exception):
+            _w.vector_search_indexes.delete_index(_DIRECT_IDX)
+        _w.vector_search_indexes.create_index(
+            name=_DIRECT_IDX,
+            endpoint_name=_ENDPOINT,
+            primary_key="id",
+            index_type=VectorIndexType.DIRECT_ACCESS,
+            direct_access_index_spec=DirectAccessVectorIndexSpec(
+                schema_json='{"id": "integer", "text": "string", "text_vector": "array<float>"}',
+                embedding_vector_columns=[EmbeddingVectorColumn(name="text_vector", embedding_dimension=_EMBED_DIM)],
+            ),
+        )
+        _has_direct_index = True
+        print(f"[seed-vs] source Direct Access index {_DIRECT_IDX} created")
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[seed-vs] Direct Access index seed failed: {_exc}")
 
 # COMMAND ----------
 dbutils.jobs.taskValues.set(key="has_delta_index", value="true" if _has_delta_index else "false")  # noqa: F821
