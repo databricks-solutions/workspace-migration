@@ -21,9 +21,11 @@ except NameError:
 # (re-syncing from the same-named source table); skips Direct Access indexes.
 # See docs/superpowers/specs/2026-06-03-vector-search-migration-design.md.
 
+import contextlib
 import json  # noqa: F401
 import time
 
+from databricks.sdk.errors import AlreadyExists
 from databricks.sdk.service.vectorsearch import (
     DeltaSyncVectorIndexSpecRequest,
     EndpointType,
@@ -88,7 +90,9 @@ def _ensure_endpoint(
             return True
     except Exception:  # noqa: BLE001 — absent (or transient); fall through to create/poll
         et = EndpointType(endpoint_type) if endpoint_type else EndpointType.STANDARD
-        target_client.vector_search_endpoints.create_endpoint(name=endpoint_name, endpoint_type=et)
+        # another agent may have created it between our get and create — tolerate the race
+        with contextlib.suppress(AlreadyExists):
+            target_client.vector_search_endpoints.create_endpoint(name=endpoint_name, endpoint_type=et)
 
     for _ in range(max_attempts):
         try:

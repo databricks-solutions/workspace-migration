@@ -81,6 +81,29 @@ class TestEnsureEndpoint:
         from migrate.vector_search_worker import _ensure_endpoint
 
         client = MagicMock()
-        client.vector_search_endpoints.get_endpoint.side_effect = [Exception("nf")] + [self._ep("PROVISIONING")] * 5
+        client.vector_search_endpoints.get_endpoint.side_effect = [Exception("nf")] + [self._ep("PROVISIONING")] * 3
         ready = _ensure_endpoint(client, "ep1", "STANDARD", max_attempts=3, sleep_seconds=0, sleep_fn=lambda s: None)
         assert ready is False
+
+    def test_already_exists_on_create_falls_through_to_poll(self):
+        from databricks.sdk.errors import AlreadyExists
+
+        from migrate.vector_search_worker import _ensure_endpoint
+
+        client = MagicMock()
+        # get fails first (transient), create races into AlreadyExists, then polls ONLINE
+        client.vector_search_endpoints.get_endpoint.side_effect = [Exception("nf"), self._ep("ONLINE")]
+        client.vector_search_endpoints.create_endpoint.side_effect = AlreadyExists("exists")
+        ready = _ensure_endpoint(client, "ep1", "STANDARD", max_attempts=2, sleep_seconds=0, sleep_fn=lambda s: None)
+        assert ready is True
+
+    def test_blank_endpoint_type_defaults_to_standard(self):
+        from databricks.sdk.service.vectorsearch import EndpointType
+
+        from migrate.vector_search_worker import _ensure_endpoint
+
+        client = MagicMock()
+        client.vector_search_endpoints.get_endpoint.side_effect = [Exception("nf"), self._ep("ONLINE")]
+        _ensure_endpoint(client, "ep1", "", max_attempts=2, sleep_seconds=0, sleep_fn=lambda s: None)
+        kwargs = client.vector_search_endpoints.create_endpoint.call_args.kwargs
+        assert kwargs["endpoint_type"] == EndpointType.STANDARD
