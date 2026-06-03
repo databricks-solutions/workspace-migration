@@ -1,0 +1,27 @@
+resources:
+  jobs:
+    vector_search_integration_test:
+      name: "${var.job_prefix}-vector-search-integration-test"
+      description: |
+        Vector Search integration test: runs discovery, invokes the
+        migrate_vector_search job, then asserts migration_status rows are
+        in a known terminal VS state. Zero vector_search_index rows is a
+        pass (VS preview may be disabled in the test workspace).
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: discovery
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+
+        - task_key: migrate_vector_search
+          depends_on:
+            - task_key: discovery
+          run_job_task:
+            job_id: "${resources.jobs.migrate_vector_search.id}"
+
+        - task_key: test_vector_search
+          depends_on:
+            - task_key: migrate_vector_search
+          notebook_task:
+            notebook_path: ../../tests/integration/test_vector_search.py
