@@ -32,14 +32,27 @@ _ENDPOINT = "cp_migration_vs_it"
 _DELTA_IDX = f"{_CATALOG}.vs_test.vs_delta_idx"
 _DIRECT_IDX = f"{_CATALOG}.vs_test.vs_direct_idx"
 
-_config = MigrationConfig.from_workspace_file()
-_auth = AuthManager(_config, dbutils)  # noqa: F821
-_src = WorkspaceClient()
-_tgt = _auth.target_client
+# COMMAND ----------
+# Lazily build each workspace's client only when that side is being cleaned, so
+# a broken target config can never prevent source-side (paid endpoint) cleanup.
+
+
+def _source_client():
+    return WorkspaceClient()
+
+
+def _target_client():
+    return AuthManager(MigrationConfig.from_workspace_file(), dbutils).target_client  # noqa: F821
+
 
 # COMMAND ----------
-# --- Delete indexes + endpoint on BOTH workspaces ---
-for _client, _label in ((_src, "source"), (_tgt, "target")):
+# --- Delete indexes + endpoint on BOTH workspaces (each side independent) ---
+for _make_client, _label in ((_source_client, "source"), (_target_client, "target")):
+    try:
+        _client = _make_client()
+    except Exception as _exc:  # noqa: BLE001
+        print(f"[teardown-vs] could not build {_label} client — skipping {_label} cleanup: {_exc}")
+        continue
     for _idx in (_DELTA_IDX, _DIRECT_IDX):
         with contextlib.suppress(Exception):
             _client.vector_search_indexes.delete_index(_idx)
@@ -56,6 +69,7 @@ with contextlib.suppress(Exception):
 
 # --- Drop the target test catalog (created by the seed) ---
 with contextlib.suppress(Exception):
+    _auth = AuthManager(MigrationConfig.from_workspace_file(), dbutils)  # noqa: F821
     _wh = find_warehouse(_auth)
     execute_and_poll(_auth, _wh, f"DROP CATALOG IF EXISTS {_CATALOG} CASCADE")
     print(f"[teardown-vs] dropped target catalog {_CATALOG}")
