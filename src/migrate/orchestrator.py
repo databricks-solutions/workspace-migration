@@ -173,6 +173,9 @@ if _is_notebook():
         "recipient",
         "provider",
         "online_table",
+        # Stateful Services Phase — consumed by the migrate_vector_search job's
+        # worker. Harmless for other jobs; they ignore the published list.
+        "vector_search_index",
     )
 
     batch_output: dict[str, list[str]] = {}

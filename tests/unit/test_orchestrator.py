@@ -336,3 +336,20 @@ class TestOrchestratorCollisionGate:
         )
         with pytest.raises(RuntimeError):
             check_collision_gate(spark, self._mock_config())
+
+
+def test_vector_search_index_is_a_list_type():
+    # The shared orchestrator must publish a vector_search_index_list task value
+    # for the migrate_vector_search job's worker to consume.
+    import re
+    from pathlib import Path
+
+    src_path = Path(__file__).resolve().parents[2] / "src/migrate/orchestrator.py"
+    src = src_path.read_text()
+    m = re.search(r"LIST_TYPES\s*=\s*\(([^)]*)\)", src, re.DOTALL)
+    assert m, "LIST_TYPES tuple not found in orchestrator.py"
+    body = m.group(1)
+    assert '"vector_search_index"' in body or "'vector_search_index'" in body, (
+        "``vector_search_index`` must be in LIST_TYPES so the orchestrator "
+        "publishes vector_search_index_list for the migrate_vector_search job."
+    )

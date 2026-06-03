@@ -124,7 +124,8 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
-            "'failed_batch_oversize')"
+            "'failed_batch_oversize', 'created_resync_pending', "
+            "'skipped_direct_access_unsupported')"
             in sql_arg
         )
         # object_type is passed via args= (parameterized), not interpolated
@@ -269,7 +270,8 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
-            "'failed_batch_oversize')"
+            "'failed_batch_oversize', 'created_resync_pending', "
+            "'skipped_direct_access_unsupported')"
             in sql
         )
         # Guard against regression to the old LIKE filter that swept up
@@ -505,3 +507,13 @@ class TestStagingManifest:
         mock_spark.sql.return_value.collect.return_value = []
         result = tm.get_staging_for_original("`c`.`s`.`missing`")
         assert result is None
+
+
+def test_vector_search_terminal_statuses_present():
+    from common.tracking import _TERMINAL_STATUSES
+
+    # created index (re-embedding still running) and direct-access skip are
+    # terminal so re-runs don't recreate; endpoint-not-ready is NOT terminal.
+    assert "created_resync_pending" in _TERMINAL_STATUSES
+    assert "skipped_direct_access_unsupported" in _TERMINAL_STATUSES
+    assert "skipped_endpoint_not_ready" not in _TERMINAL_STATUSES

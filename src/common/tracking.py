@@ -103,6 +103,11 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     # batches. Re-picking it would just fail again — operator must trim
     # heavy metadata (or split the object) and clear the status row.
     "failed_batch_oversize",
+    # Vector Search (migrate_vector_search): index created on target, async
+    # re-embedding still in progress — terminal so re-runs don't recreate.
+    "created_resync_pending",
+    # Direct Access VS index — vectors are external app state, can't recreate.
+    "skipped_direct_access_unsupported",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
