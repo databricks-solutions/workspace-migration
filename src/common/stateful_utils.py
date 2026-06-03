@@ -9,7 +9,7 @@ later dependency-analysis step can parse edges without re-fetching.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 # capability subtype (runtime-state class) per stateful object_type.
 CAPABILITY: dict[str, str] = {
