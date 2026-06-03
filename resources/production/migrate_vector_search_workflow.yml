@@ -43,4 +43,4 @@ resources:
               # WS-2: Per-workflow filter — only vector search object types.
               # Values match what the vector search worker emits into
               # migration_status.
-              object_types: "vector_search_endpoint,vector_search_index"
+              object_types: "vector_search_index"
