@@ -47,3 +47,40 @@ class TestBuildSpec:
         )
         # round-tripping the request must not carry the response-only pipeline_id
         assert "pipeline_id" not in spec.as_dict()
+
+
+class TestEnsureEndpoint:
+    def _ep(self, state):
+        ep = MagicMock()
+        ep.endpoint_status.state = state
+        return ep
+
+    def test_existing_online_endpoint_is_ready_no_create(self):
+        from migrate.vector_search_worker import _ensure_endpoint
+
+        client = MagicMock()
+        client.vector_search_endpoints.get_endpoint.return_value = self._ep("ONLINE")
+        ready = _ensure_endpoint(client, "ep1", "STANDARD", max_attempts=1, sleep_seconds=0, sleep_fn=lambda s: None)
+        assert ready is True
+        client.vector_search_endpoints.create_endpoint.assert_not_called()
+
+    def test_missing_endpoint_is_created_then_becomes_ready(self):
+        from migrate.vector_search_worker import _ensure_endpoint
+
+        client = MagicMock()
+        client.vector_search_endpoints.get_endpoint.side_effect = [
+            Exception("not found"),
+            self._ep("PROVISIONING"),
+            self._ep("ONLINE"),
+        ]
+        ready = _ensure_endpoint(client, "ep1", "STANDARD", max_attempts=5, sleep_seconds=0, sleep_fn=lambda s: None)
+        assert ready is True
+        client.vector_search_endpoints.create_endpoint.assert_called_once()
+
+    def test_endpoint_never_ready_returns_false(self):
+        from migrate.vector_search_worker import _ensure_endpoint
+
+        client = MagicMock()
+        client.vector_search_endpoints.get_endpoint.side_effect = [Exception("nf")] + [self._ep("PROVISIONING")] * 5
+        ready = _ensure_endpoint(client, "ep1", "STANDARD", max_attempts=3, sleep_seconds=0, sleep_fn=lambda s: None)
+        assert ready is False

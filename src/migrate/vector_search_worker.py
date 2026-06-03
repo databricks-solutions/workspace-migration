@@ -22,11 +22,11 @@ except NameError:
 # See docs/superpowers/specs/2026-06-03-vector-search-migration-design.md.
 
 import json  # noqa: F401
-import time  # noqa: F401
+import time
 
 from databricks.sdk.service.vectorsearch import (
     DeltaSyncVectorIndexSpecRequest,
-    EndpointType,  # noqa: F401
+    EndpointType,
     VectorIndexType,  # noqa: F401
 )
 
@@ -60,3 +60,42 @@ def _build_delta_sync_spec(definition: dict) -> DeltaSyncVectorIndexSpecRequest:
     dss = dict(definition.get("delta_sync_index_spec") or {})
     dss.pop("pipeline_id", None)
     return DeltaSyncVectorIndexSpecRequest.from_dict(dss)
+
+
+def _endpoint_state_ready(state: object) -> bool:
+    """True when an endpoint's status state reads as ONLINE."""
+    return "ONLINE" in str(state).upper()
+
+
+def _ensure_endpoint(
+    target_client,
+    endpoint_name: str,
+    endpoint_type: str,
+    *,
+    max_attempts: int = 30,
+    sleep_seconds: float = 10.0,
+    sleep_fn=time.sleep,
+) -> bool:
+    """Ensure the target VS endpoint exists and is ONLINE.
+
+    If absent, create it (mirroring the source endpoint_type). Poll up to
+    ``max_attempts`` for it to reach ONLINE. Returns True if ready, False if it
+    is still provisioning when attempts are exhausted (caller defers the index).
+    """
+    try:
+        ep = target_client.vector_search_endpoints.get_endpoint(endpoint_name)
+        if _endpoint_state_ready(getattr(ep.endpoint_status, "state", None)):
+            return True
+    except Exception:  # noqa: BLE001 — absent (or transient); fall through to create/poll
+        et = EndpointType(endpoint_type) if endpoint_type else EndpointType.STANDARD
+        target_client.vector_search_endpoints.create_endpoint(name=endpoint_name, endpoint_type=et)
+
+    for _ in range(max_attempts):
+        try:
+            ep = target_client.vector_search_endpoints.get_endpoint(endpoint_name)
+            if _endpoint_state_ready(getattr(ep.endpoint_status, "state", None)):
+                return True
+        except Exception:  # noqa: BLE001 — keep polling
+            pass
+        sleep_fn(sleep_seconds)
+    return False
