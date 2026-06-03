@@ -60,7 +60,7 @@ rls_cm_strategy: ""
 
 # --- Online Tables -> Lakebase synced table migration (migrate_online_tables) ---
 # The job creates this Lakebase database instance if it does not exist.
-lakebase_instance_name: cp_migration_lakebase
+lakebase_instance_name: cp-migration-lakebase
 lakebase_logical_database: databricks_postgres
 lakebase_capacity: CU_1
 

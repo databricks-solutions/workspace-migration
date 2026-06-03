@@ -313,7 +313,7 @@ def test_lakebase_defaults_and_overrides(tmp_path):
     p = tmp_path / "config.yaml"
     p.write_text(yaml.safe_dump(base))
     cfg = MigrationConfig.from_workspace_file(str(p))
-    assert cfg.lakebase_instance_name == "cp_migration_lakebase"
+    assert cfg.lakebase_instance_name == "cp-migration-lakebase"
     assert cfg.lakebase_logical_database == "databricks_postgres"
     assert cfg.lakebase_capacity == "CU_1"
 

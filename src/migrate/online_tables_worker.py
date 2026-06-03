@@ -140,10 +140,13 @@ def migrate_online_table(
     except Exception as exc:  # noqa: BLE001
         return _result("failed", f"synced-table spec rebuild failed: {exc}")
 
-    ready = _ensure_lakebase_instance(
-        target_client, config.lakebase_instance_name, config.lakebase_capacity,
-        max_attempts=max_attempts, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn,
-    )
+    try:
+        ready = _ensure_lakebase_instance(
+            target_client, config.lakebase_instance_name, config.lakebase_capacity,
+            max_attempts=max_attempts, sleep_seconds=sleep_seconds, sleep_fn=sleep_fn,
+        )
+    except Exception as exc:  # noqa: BLE001 — instance setup error (e.g. bad name/quota) fails THIS row only
+        return _result("failed", f"Lakebase instance setup failed: {exc}")
     if not ready:
         return _result(
             "skipped_instance_not_ready",

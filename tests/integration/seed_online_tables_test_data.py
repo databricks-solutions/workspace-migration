@@ -59,7 +59,8 @@ print(f"[seed-ot] target table {_TABLE} created (PK on id)")
 
 # COMMAND ----------
 # --- TRACKING: ensure tracking tables exist, then inject a synthetic online_table row ---
-TrackingManager(spark, _config).init_tracking_tables()  # noqa: F821
+_tracker = TrackingManager(spark, _config)  # noqa: F821
+_tracker.init_tracking_tables()
 
 _now = datetime.now(tz=timezone.utc)
 _row = discovery_row(
@@ -84,9 +85,11 @@ _row = discovery_row(
     },
 )
 
-spark.createDataFrame([_row], schema=discovery_schema()).write.mode("append").saveAsTable(  # noqa: F821
-    f"{_config.tracking_catalog}.{_config.tracking_schema}.discovery_inventory"
-)
+# Use the tracker's own writer (MERGE into discovery_inventory) — the exact path
+# discovery.py uses and get_pending_objects reads from. A raw saveAsTable(append)
+# can land the row outside the orchestrator's read path.
+_df = spark.createDataFrame([_row], schema=discovery_schema())  # noqa: F821
+_tracker.write_discovery_inventory(_df)
 print(f"[seed-ot] synthetic online_table row injected for {_OT_FQN}")
 
 # COMMAND ----------

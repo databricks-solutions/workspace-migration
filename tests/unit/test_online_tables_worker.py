@@ -109,6 +109,20 @@ class TestMigrate:
         assert res["status"] == "failed"
         assert "primary key" in res["error_message"]
 
+    def test_instance_setup_error_is_failed_not_raised(self):
+        # A non-AlreadyExists error from instance setup (e.g. a non-DNS-compliant
+        # name) must fail THIS row, not crash the batch.
+        client = MagicMock()
+        client.database.get_database_instance.side_effect = Exception("nf")
+        client.database.create_database_instance.side_effect = Exception(
+            "InvalidParameterValue: DatabaseInstance name must be DNS compliant"
+        )
+        res = migrate_online_table(client, _row(_definition()), _config(),
+                                   sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
+        assert res["status"] == "failed"
+        assert "DNS compliant" in res["error_message"]
+        client.database.create_synced_database_table.assert_not_called()
+
     def test_missing_source_is_failed(self):
         client = MagicMock()
         row = {"object_name": "cat.sch.ot", "object_type": "online_table",
