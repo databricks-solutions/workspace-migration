@@ -66,7 +66,8 @@ class StatefulExplorer:
                     try:
                         full = client.vector_search_indexes.get_index(index_name=idx.name)
                         definition = _as_dict(full)
-                    except Exception:  # noqa: BLE001
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[stateful][debug] get_index({idx.name}) failed, using mini-view ({exc})")
                         definition = _as_dict(idx)
                     results.append(
                         {

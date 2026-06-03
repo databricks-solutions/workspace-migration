@@ -80,6 +80,8 @@ class TestVectorSearch:
 
         rows = StatefulExplorer(auth).list_vector_search_indexes()
         assert rows[0]["definition"] == {"name": "cat.sch.idx"}
+        assert rows[0]["index_name"] == "cat.sch.idx"
+        assert rows[0]["endpoint_name"] == "ep1"
 
     def test_returns_empty_and_warns_when_vs_not_enabled(self, capsys):
         auth = MagicMock()
