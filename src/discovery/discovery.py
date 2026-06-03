@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
+from common.stateful_utils import CAPABILITY, StatefulExplorer
 from common.tracking import TrackingManager, discovery_row, discovery_schema
 
 # COMMAND ----------
@@ -323,15 +324,17 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
         )
 
     for ot in explorer.list_online_tables():
+        ot_meta = dict(ot)
+        ot_meta["capability"] = CAPABILITY["online_table"]
         rows.append(
             discovery_row(
-                source_type="uc",
+                source_type="stateful",
                 object_type="online_table",
                 object_name=ot["online_table_fqn"],
                 catalog_name=None,
                 schema_name=None,
                 discovered_at=now,
-                metadata=ot,
+                metadata=ot_meta,
             )
         )
 
@@ -502,6 +505,45 @@ def _discover_hive(config, explorer, now) -> list[dict]:
 # COMMAND ----------
 
 
+def _discover_stateful(config, stateful, now) -> list[dict]:
+    """Discover stateful-service objects (source_type='stateful').
+
+    Each surface's list_* returns dicts with a name key + a "definition" raw
+    spec. We tag every row source_type='stateful' and stash the capability
+    subtype alongside the raw spec in metadata_json. Dependency analysis is a
+    later step that reads these rows; discovery only enumerates + persists.
+    """
+    # (object_type, list_fn, name_key)
+    surfaces = [
+        ("vector_search_index", stateful.list_vector_search_indexes, "index_name"),
+        ("app", stateful.list_apps, "app_name"),
+        ("database_instance", stateful.list_database_instances, "instance_name"),
+        ("synced_table", stateful.list_synced_tables, "synced_table_name"),
+        ("model_serving_endpoint", stateful.list_model_serving_endpoints, "endpoint_name"),
+        ("lfc_pipeline", stateful.list_lfc_pipelines, "pipeline_name"),
+    ]
+    rows: list[dict] = []
+    for obj_type, list_fn, name_key in surfaces:
+        for item in list_fn():
+            meta = dict(item)
+            meta["capability"] = CAPABILITY[obj_type]
+            rows.append(
+                discovery_row(
+                    source_type="stateful",
+                    object_type=obj_type,
+                    object_name=item[name_key],
+                    catalog_name=None,
+                    schema_name=None,
+                    discovered_at=now,
+                    metadata=meta,
+                )
+            )
+    return rows
+
+
+# COMMAND ----------
+
+
 def run(dbutils, spark):  # noqa: D103
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
@@ -521,6 +563,10 @@ def run(dbutils, spark):  # noqa: D103
 
     print("[hive] Scanning hive_metastore...")
     inventory.extend(_discover_hive(config, explorer, now))
+
+    print("[stateful] Scanning stateful-service surfaces...")
+    stateful_explorer = StatefulExplorer(auth)
+    inventory.extend(_discover_stateful(config, stateful_explorer, now))
 
     print(f"\nTotal objects discovered: {len(inventory)}")
 
