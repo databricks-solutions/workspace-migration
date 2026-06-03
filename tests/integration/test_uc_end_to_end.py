@@ -2,6 +2,7 @@
 
 # COMMAND ----------
 
+import json  # noqa: E402
 import sys  # noqa: E402
 
 try:
@@ -1248,5 +1249,71 @@ else:
 if error_messages:
     raise AssertionError(
         f"UC integration test failed with {len(error_messages)} error(s):\n" + "\n".join(error_messages)
+    )
+
+# COMMAND ----------
+
+# Task 8: Tolerant stateful-inventory assertion.
+# Reads discovery_inventory rows with source_type='stateful' and validates
+# each row's object_type and metadata_json["capability"].  Zero rows is a
+# pass (stateful discovery may not have run yet in every environment).
+
+_VALID_STATEFUL_TYPES = {
+    "vector_search_index",
+    "app",
+    "database_instance",
+    "synced_table",
+    "model_serving_endpoint",
+    "lfc_pipeline",
+    "online_table",
+}
+_VALID_CAPABILITIES = {"vector", "lakebase", "online_store", "compute", "ingestion"}
+
+try:
+    _stateful_rows = spark.sql(  # noqa: F821
+        "SELECT object_name, object_type, source_type, metadata_json "
+        "FROM migration_tracking.cp_migration.discovery_inventory "
+        "WHERE source_type = 'stateful'"
+    ).collect()
+except Exception as _exc:  # noqa: BLE001
+    error_messages.append(f"Task-8 stateful inventory: discovery_inventory lookup failed: {_exc}")
+    _stateful_rows = []
+
+if not _stateful_rows:
+    print("Task-8 stateful inventory: 0 stateful rows found — treating as pass.")
+else:
+    print(f"Task-8 stateful inventory: {len(_stateful_rows)} stateful row(s) found — validating.")
+    for _srow in _stateful_rows:
+        _name = _srow["object_name"]
+        _otype = _srow["object_type"]
+        _meta_raw = _srow["metadata_json"]
+        if not _name:
+            error_messages.append(
+                f"Task-8 stateful inventory: row has falsy object_name (type={_otype!r})."
+            )
+        if _otype not in _VALID_STATEFUL_TYPES:
+            error_messages.append(
+                f"Task-8 stateful inventory: unexpected object_type {_otype!r} "
+                f"for {_name!r}. Expected one of {sorted(_VALID_STATEFUL_TYPES)}."
+            )
+        try:
+            _cap = json.loads(_meta_raw)["capability"]
+        except Exception as _exc:  # noqa: BLE001
+            error_messages.append(
+                f"Task-8 stateful inventory: {_name!r} metadata_json parse failed: {_exc}"
+            )
+        else:
+            if _cap not in _VALID_CAPABILITIES:
+                error_messages.append(
+                    f"Task-8 stateful inventory: {_name!r} capability={_cap!r} "
+                    f"not in {sorted(_VALID_CAPABILITIES)}."
+                )
+            else:
+                print(f"  OK: {_name!r} type={_otype!r} capability={_cap!r}")
+
+if error_messages:
+    raise AssertionError(
+        f"Task-8 stateful inventory assertions failed "
+        f"({len(error_messages)} error(s)):\n" + "\n".join(error_messages)
     )
 print("UC integration tests passed (Phase 1/2 + Phase 2.5 + Phase 3).")
