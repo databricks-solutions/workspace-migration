@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -19,6 +21,7 @@ except NameError:
 
 import json
 import logging
+import threading as _threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -28,6 +31,7 @@ from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
 from common.validation import Validator
+from migrate.reconciliation import maybe_kill
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("managed_table_worker")
@@ -49,6 +53,29 @@ def _is_notebook() -> bool:
 
 
 # COMMAND ----------
+# X.1 kill-injection counter (test only). Module-level so the ThreadPool
+# workers share it; safe to reset between test cases via _reset_kill_counter.
+
+_kill_lock = _threading.Lock()
+_kill_counter = 0
+
+
+def _bump_kill_counter() -> int:
+    """Atomically increment and return the post-increment counter value."""
+    global _kill_counter
+    with _kill_lock:
+        _kill_counter += 1
+        return _kill_counter
+
+
+def _reset_kill_counter() -> None:
+    """Reset the counter (test helper)."""
+    global _kill_counter
+    with _kill_lock:
+        _kill_counter = 0
+
+
+# COMMAND ----------
 # Clone a single managed table
 
 
@@ -62,8 +89,20 @@ def clone_table(
     wh_id: str,
     share_name: str,
 ) -> dict:
-    """Deep clone a single managed table from delta share to target."""
+    """Deep clone a single managed table from delta share to target.
+
+    Path A staging_copy: tables with RLS/CM are CTAS'd into a staging
+    schema by ``setup_sharing`` and the staging FQN is added to the
+    share. ``tracker.get_staging_for_original`` returns the staging FQN
+    so this worker can DEEP CLONE the staging copy directly. Tables
+    without staging entries DEEP CLONE the original consumer-side path.
+    Row-count validation is identical for both paths.
+    """
     obj_name = table_info["object_name"]
+    # X.1 kill-injection: simulated mid-batch crash for integration tests.
+    # No-op in production (test_kill_after=None). See reconciliation.maybe_kill.
+    _n = _bump_kill_counter()
+    maybe_kill(config, _n, "managed_table_worker")
     parts = obj_name.strip("`").split("`.`")
     if len(parts) != 3:
         return {
@@ -106,10 +145,14 @@ def clone_table(
                 "Skipping Iceberg table %s — set config.iceberg_strategy='ddl_replay' to opt in.",
                 obj_name,
             )
+            # Use ``skipped_by_config`` rather than plain ``skipped`` so that a
+            # subsequent run with iceberg_strategy='ddl_replay' picks these
+            # tables back up — ``get_pending_objects`` excludes 'validated'
+            # and 'skipped' but not status suffixes.
             return {
                 "object_name": obj_name,
                 "object_type": "managed_table",
-                "status": "skipped",
+                "status": "skipped_by_config",
                 "error_message": (
                     "Iceberg migration not enabled. Set iceberg_strategy='ddl_replay' "
                     "in config to opt into Option A (loses snapshot history, time travel, "
@@ -118,7 +161,12 @@ def clone_table(
                 "duration_seconds": duration,
             }
 
+        # create_statement is stripped from for_each batch payloads to stay
+        # under Jobs' 3000-byte limit; re-hydrate from discovery_inventory.
         create_stmt = table_info.get("create_statement") or ""
+        if not create_stmt:
+            full_row = tracker.get_row("managed_table", obj_name)
+            create_stmt = (full_row or {}).get("create_statement") or ""
         if not create_stmt:
             return {
                 "object_name": obj_name,
@@ -128,10 +176,7 @@ def clone_table(
                 "duration_seconds": time.time() - start,
             }
 
-        insert_sql = (
-            f"INSERT INTO {target_fqn} "
-            f"SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
-        )
+        insert_sql = f"INSERT INTO {target_fqn} SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
 
         if config.dry_run:
             duration = time.time() - start
@@ -172,9 +217,10 @@ def clone_table(
         try:
             validation = validator.validate_row_count(obj_name, target_fqn)
             status = "validated" if validation["match"] else "validation_failed"
-            err = None if validation["match"] else (
-                f"Row count mismatch: source={validation['source_count']}, "
-                f"target={validation['target_count']}"
+            err = (
+                None
+                if validation["match"]
+                else (f"Row count mismatch: source={validation['source_count']}, target={validation['target_count']}")
             )
             return {
                 "object_name": obj_name,
@@ -194,9 +240,29 @@ def clone_table(
                 "duration_seconds": duration,
             }
 
-    # --- Delta (default) — existing DEEP CLONE path ---
-    sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE `{consumer_catalog}`.`{schema}`.`{table}`"
-    logger.info("Executing DEEP CLONE for %s", obj_name)
+    # --- Delta (default) — DEEP CLONE from staging consumer path if staging
+    #     exists (Path A staging_copy), else from the original consumer path.
+    consumer_fqn = f"`{consumer_catalog}`.`{schema}`.`{table}`"
+    staging_fqn = tracker.get_staging_for_original(obj_name) if tracker is not None else None
+    if staging_fqn:
+        # Path A: the staging table was CTAS'd from the source into the source
+        # workspace's `cp_migration_staging` schema, so it's a regular Delta
+        # table with full schema and properties preserved — DEEP CLONE works
+        # without a CTAS fallback. Build the consumer-side path:
+        #   `<consumer>.cp_migration_staging.<staging_table_name>`.
+        # `staging_fqn` looks like `tcat`.`cp_migration_staging`.`stg_abc...`;
+        # extract just the trailing identifier.
+        staging_table_name = staging_fqn.rstrip("`").split("`")[-1]
+        staging_consumer_fqn = (
+            f"`{consumer_catalog}`.`cp_migration_staging`.`{staging_table_name}`"
+        )
+        sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {staging_consumer_fqn}"
+        logger.info(
+            "Executing DEEP CLONE from staging for %s (staging=%s)", obj_name, staging_fqn
+        )
+    else:
+        sql = f"CREATE OR REPLACE TABLE {target_fqn} DEEP CLONE {consumer_fqn}"
+        logger.info("Executing DEEP CLONE for %s", obj_name)
 
     if config.dry_run:
         duration = time.time() - start

@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -29,7 +31,6 @@ from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
-from common.validation import Validator
 from migrate.hive_common import rewrite_hive_fqn, rewrite_hive_namespace
 
 logging.basicConfig(level=logging.INFO)
@@ -137,9 +138,7 @@ def migrate_hive_external_table(
             "object_name": source_fqn,
             "object_type": "hive_external",
             "status": status,
-            "error_message": None
-            if match
-            else (f"Row count mismatch: source={source_count}, target={target_count}"),
+            "error_message": None if match else (f"Row count mismatch: source={source_count}, target={target_count}"),
             "source_row_count": source_count,
             "target_row_count": target_count,
             "duration_seconds": duration,

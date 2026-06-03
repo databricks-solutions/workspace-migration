@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -119,17 +121,22 @@ def replay_grants(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping UC grants_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
     explorer = CatalogExplorer(spark_session, auth)
 
-    # Read discovery inventory for catalogs and schemas
+    # Read discovery inventory for catalogs, schemas, and granular objects.
+    #
+    # Object-type → UC securable-type mapping for SHOW GRANTS ON <type>:
+    #   managed_table, external_table, mv, st  -> TABLE
+    #   view                                    -> VIEW
+    #   volume                                  -> VOLUME
+    #   function                                -> FUNCTION
+    # (Function grants at securable level are a GA feature; keep them in
+    # scope so migrations don't silently lose EXECUTE permissions on UDFs.)
     inventory_df = spark_session.sql(
-        f"SELECT DISTINCT catalog_name, schema_name "
+        f"SELECT DISTINCT catalog_name, schema_name, object_name, object_type "
         f"FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
         f"WHERE source_type = 'uc'"
     )
@@ -137,36 +144,70 @@ def run(dbutils, spark) -> None:
 
     catalogs: set[str] = set()
     schemas: set[str] = set()  # set of "catalog.schema" FQNs
+    tables: set[str] = set()  # managed_table, external_table, mv, st
+    views: set[str] = set()
+    volumes: set[str] = set()
+    functions: set[str] = set()
 
     for row in inventory_rows:
         cat = row.catalog_name
         sch = row.schema_name
+        obj_name = row.object_name
+        obj_type = row.object_type
         if cat:
             catalogs.add(cat)
         if cat and sch:
             schemas.add(f"`{cat}`.`{sch}`")
+        if obj_name:
+            if obj_type in ("managed_table", "external_table", "mv", "st"):
+                tables.add(obj_name)
+            elif obj_type == "view":
+                views.add(obj_name)
+            elif obj_type == "volume":
+                volumes.add(obj_name)
+            elif obj_type == "function":
+                functions.add(obj_name)
 
-    logger.info("Found %d catalogs and %d schemas to process grants.", len(catalogs), len(schemas))
+    logger.info(
+        "Grants scope: %d catalog(s), %d schema(s), %d table(s), %d view(s), %d volume(s), %d function(s)",
+        len(catalogs),
+        len(schemas),
+        len(tables),
+        len(views),
+        len(volumes),
+        len(functions),
+    )
 
     wh_id = find_warehouse(auth)
 
-    # Process catalog grants
-
     all_results: list[dict] = []
 
-    for catalog_name in sorted(catalogs):
-        logger.info("Processing grants for CATALOG %s", catalog_name)
+    def _process(securable_type: str, fqn: str) -> None:
+        """Enumerate + replay grants for a single securable. Records
+        a ``failed`` row on enumeration error so the gap surfaces in
+        migration_status rather than being silently swallowed."""
         try:
-            grants = explorer.list_grants("CATALOG", f"`{catalog_name}`")
+            grants = explorer.list_grants(securable_type, fqn)
             grant_results = replay_grants(
-                "CATALOG", f"`{catalog_name}`", grants, auth=auth, wh_id=wh_id, dry_run=config.dry_run
+                securable_type,
+                fqn,
+                grants,
+                auth=auth,
+                wh_id=wh_id,
+                dry_run=config.dry_run,
             )
             all_results.extend(grant_results)
         except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to process grants for CATALOG %s: %s", catalog_name, exc)
+            logger.error(
+                "Failed to process grants for %s %s: %s",
+                securable_type,
+                fqn,
+                exc,
+                exc_info=True,
+            )
             all_results.append(
                 {
-                    "object_name": f"CATALOG_GRANTS_{catalog_name}",
+                    "object_name": f"{securable_type}_GRANTS_{fqn}",
                     "object_type": "grant",
                     "status": "failed",
                     "error_message": str(exc),
@@ -174,25 +215,29 @@ def run(dbutils, spark) -> None:
                 }
             )
 
-    # Process schema grants
+    # Process in CATALOG → SCHEMA → object order. UC evaluates grants
+    # at the object level first, falling back to schema then catalog,
+    # so the replay order doesn't affect correctness — this ordering
+    # just keeps logs easy to scan.
+    for catalog_name in sorted(catalogs):
+        logger.info("Processing grants for CATALOG %s", catalog_name)
+        _process("CATALOG", f"`{catalog_name}`")
 
     for schema_fqn in sorted(schemas):
         logger.info("Processing grants for SCHEMA %s", schema_fqn)
-        try:
-            grants = explorer.list_grants("SCHEMA", schema_fqn)
-            grant_results = replay_grants("SCHEMA", schema_fqn, grants, auth=auth, wh_id=wh_id, dry_run=config.dry_run)
-            all_results.extend(grant_results)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("Failed to process grants for SCHEMA %s: %s", schema_fqn, exc)
-            all_results.append(
-                {
-                    "object_name": f"SCHEMA_GRANTS_{schema_fqn}",
-                    "object_type": "grant",
-                    "status": "failed",
-                    "error_message": str(exc),
-                    "duration_seconds": 0.0,
-                }
-            )
+        _process("SCHEMA", schema_fqn)
+
+    for fqn in sorted(tables):
+        _process("TABLE", fqn)
+
+    for fqn in sorted(views):
+        _process("VIEW", fqn)
+
+    for fqn in sorted(volumes):
+        _process("VOLUME", fqn)
+
+    for fqn in sorted(functions):
+        _process("FUNCTION", fqn)
 
     # Record final statuses
 

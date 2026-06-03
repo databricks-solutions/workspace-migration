@@ -1,0 +1,105 @@
+resources:
+  jobs:
+    migrate_governance:
+      name: "${var.job_prefix}-migrate-governance"
+      description: |
+        Fine-grained governance migration: tags, comments, row filters,
+        column masks, customer-defined shares, policies, monitors,
+        foreign catalogs, connections. Trust-the-operator: target
+        catalog/schema/table/view/volume objects must already exist on
+        target (run migrate_uc + migrate_hive first). pre_check_governance
+        validates only that discovery_inventory has governance rows.
+        Standalone-runnable for governance refresh.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: pre_check_governance
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check_governance.py
+
+        # The orchestrator publishes per-object-type lists (tag_list,
+        # row_filter_list, column_mask_list, connection_list,
+        # monitor_list, share_list, recipient_list, provider_list) via
+        # taskValues that the governance workers consume. Workers look
+        # for these under taskKey="orchestrator", so the orchestrator
+        # task must run inside the same job. Its UC-batch outputs are
+        # ignored here (no UC for_each tasks in this job).
+        - task_key: orchestrator
+          depends_on:
+            - task_key: pre_check_governance
+          notebook_task:
+            notebook_path: ../../src/migrate/orchestrator.py
+
+        - task_key: migrate_tags
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/tags_worker.py
+
+        - task_key: migrate_row_filters
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/row_filters_worker.py
+
+        - task_key: migrate_column_masks
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/column_masks_worker.py
+
+        - task_key: migrate_policies
+          depends_on:
+            - task_key: migrate_tags
+          notebook_task:
+            notebook_path: ../../src/migrate/policies_worker.py
+
+        - task_key: migrate_comments
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/comments_worker.py
+
+        - task_key: migrate_monitors
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/monitors_worker.py
+
+        - task_key: migrate_connections
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/connections_worker.py
+
+        - task_key: migrate_foreign_catalogs
+          depends_on:
+            - task_key: migrate_connections
+          notebook_task:
+            notebook_path: ../../src/migrate/foreign_catalogs_worker.py
+
+        - task_key: migrate_sharing
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/sharing_worker.py
+
+        - task_key: summary_governance
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_tags
+            - task_key: migrate_row_filters
+            - task_key: migrate_column_masks
+            - task_key: migrate_policies
+            - task_key: migrate_comments
+            - task_key: migrate_monitors
+            - task_key: migrate_connections
+            - task_key: migrate_foreign_catalogs
+            - task_key: migrate_sharing
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              # WS-2: Per-workflow filter — only governance object types.
+              # Values match what governance workers emit into
+              # migration_status.
+              object_types: "tag,row_filter,column_mask,policy,comment,monitor,connection,foreign_catalog,share,provider,recipient"

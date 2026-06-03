@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -27,7 +29,6 @@ except NameError:
 #   4. Removing the volume from the share
 # Bytes copied + file count are recorded in migration_status.
 
-import base64
 import json
 import logging
 import time
@@ -36,14 +37,18 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
+from migrate.target_copy import (
+    ensure_copy_notebook_on_target as _shared_ensure_notebook,
+)
+from migrate.target_copy import (
+    run_target_file_copy as _shared_file_copy,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("volume_worker")
 
 SHARE_NAME = "cp_migration_share"
 CONSUMER_CATALOG = f"{SHARE_NAME}_consumer"
-# Path on target workspace where we upload the copy notebook on first use
-TARGET_COPY_NOTEBOOK_PATH = "/Shared/cp_migration_runtime/_volume_copy"
 
 
 # COMMAND ----------
@@ -56,38 +61,6 @@ def _is_notebook() -> bool:
         return True
     except NameError:
         return False
-
-
-# Target-side notebook source — uploaded once per migration run and reused for
-# every managed volume. Emits JSON with bytes_copied/file_count via notebook exit.
-_TARGET_COPY_NOTEBOOK = '''# Databricks notebook source
-# Target-side helper: recursively copies files from a source volume path to a
-# destination volume path. Invoked by volume_worker for each MANAGED volume.
-import json
-
-dbutils.widgets.text("src", "")
-dbutils.widgets.text("dst", "")
-src = dbutils.widgets.get("src")
-dst = dbutils.widgets.get("dst")
-
-total_bytes = 0
-total_files = 0
-
-def _copy_recursive(s, d):
-    global total_bytes, total_files
-    for f in dbutils.fs.ls(s):
-        target = d.rstrip("/") + "/" + f.name.rstrip("/")
-        if f.isDir():
-            dbutils.fs.mkdirs(target)
-            _copy_recursive(f.path, target)
-        else:
-            dbutils.fs.cp(f.path, target)
-            total_bytes += f.size
-            total_files += 1
-
-_copy_recursive(src, dst)
-dbutils.notebook.exit(json.dumps({"bytes_copied": total_bytes, "file_count": total_files}))
-'''
 
 
 def _parse_fqn(fqn: str) -> tuple[str, str, str]:
@@ -103,9 +76,7 @@ def _parse_fqn(fqn: str) -> tuple[str, str, str]:
 # Share add/remove (source-side SQL)
 
 
-def add_volume_to_share(
-    source_spark, share_name: str, volume_fqn: str, *, dry_run: bool = False
-) -> None:
+def add_volume_to_share(source_spark, share_name: str, volume_fqn: str, *, dry_run: bool = False) -> None:
     """Add a volume to the migration share on source via SQL."""
     sql = f"ALTER SHARE {share_name} ADD VOLUME {volume_fqn}"
     if dry_run:
@@ -121,9 +92,7 @@ def add_volume_to_share(
             raise
 
 
-def remove_volume_from_share(
-    source_spark, share_name: str, volume_fqn: str, *, dry_run: bool = False
-) -> None:
+def remove_volume_from_share(source_spark, share_name: str, volume_fqn: str, *, dry_run: bool = False) -> None:
     """Remove a volume from the migration share on source. Best-effort."""
     sql = f"ALTER SHARE {share_name} REMOVE VOLUME {volume_fqn}"
     if dry_run:
@@ -140,71 +109,53 @@ def remove_volume_from_share(
 
 
 def _ensure_copy_notebook_on_target(auth: AuthManager) -> None:
-    """Idempotently upload the copy-helper notebook to the target workspace."""
-    target = auth.target_client
-    # Ensure parent dir exists
-    try:
-        target.workspace.mkdirs("/Shared/cp_migration_runtime")
-    except Exception:  # noqa: BLE001
-        pass  # mkdirs is idempotent; swallow errors
-    target.workspace.import_(
-        path=TARGET_COPY_NOTEBOOK_PATH,
-        content=base64.b64encode(_TARGET_COPY_NOTEBOOK.encode()).decode(),
-        format="SOURCE",  # type: ignore[arg-type]
-        language="PYTHON",  # type: ignore[arg-type]
-        overwrite=True,
-    )
+    """Back-compat wrapper — delegates to ``migrate.target_copy``."""
+    _shared_ensure_notebook(auth)
 
 
 def _run_target_volume_copy(
     auth: AuthManager, src_path: str, dst_path: str, run_name: str, *, timeout_s: int = 3600
 ) -> dict:
-    """Submit the copy notebook on target as a serverless job and wait for it.
+    """Back-compat wrapper — delegates to ``migrate.target_copy.run_target_file_copy``."""
+    return _shared_file_copy(auth, src_path, dst_path, run_name, timeout_s=timeout_s)
 
-    Returns a dict with ``bytes_copied`` and ``file_count`` on success.
-    Raises RuntimeError on failure or timeout.
+
+# COMMAND ----------
+# Cleanup hook (X.1 reconciliation)
+#
+# Called by ``migrate.reconciliation`` when a volume row is found with
+# status=in_progress from a prior run. Managed volumes need this because
+# ``dbutils.fs.cp`` may have copied some files but not all; dropping the
+# partial target volume lets the retry start from a clean slate. External
+# volumes need no cleanup (no data was copied), but dropping is still safe
+# and re-running ``CREATE EXTERNAL VOLUME IF NOT EXISTS`` is idempotent.
+
+
+def cleanup_partial_target(
+    object_name: str, *, auth: AuthManager, spark=None, config=None
+) -> None:
+    """Drop the target volume so the retry can recreate it cleanly.
+
+    Best-effort: swallow ``NOT_FOUND`` errors (common when the prior run
+    crashed before the CREATE VOLUME succeeded). Any other error
+    propagates so the reconciler can log it and continue to reset the
+    row regardless.
     """
-    target = auth.target_client
-    submit_tasks = [
-        {
-            "task_key": "copy",
-            "notebook_task": {
-                "notebook_path": TARGET_COPY_NOTEBOOK_PATH,
-                "base_parameters": {"src": src_path, "dst": dst_path},
-            },
-            # Serverless: no new_cluster / existing_cluster_id — Databricks picks
-            # serverless compute automatically when neither is supplied.
-            "environment_key": "default",
-        }
-    ]
-    environments = [{"environment_key": "default", "spec": {"client": "2"}}]
-
-    run = target.jobs.submit(
-        run_name=run_name,
-        tasks=submit_tasks,  # type: ignore[arg-type]
-        environments=environments,  # type: ignore[arg-type]
-    )
-    run_id = run.run_id  # may be None on the submit response; re-fetch by waiter
-    # Poll
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        run_obj = target.jobs.get_run(run_id)
-        life_cycle = getattr(run_obj.state, "life_cycle_state", None)
-        if life_cycle and str(life_cycle).endswith(("TERMINATED", "SKIPPED", "INTERNAL_ERROR")):
-            break
-        time.sleep(5)
-    else:
-        raise RuntimeError(f"Target volume-copy job timed out after {timeout_s}s (run_id={run_id})")
-
-    result_state = getattr(run_obj.state, "result_state", None)
-    if str(result_state).endswith("SUCCESS"):
-        # Pull notebook exit value
-        task_run_id = run_obj.tasks[0].run_id if run_obj.tasks else run_id
-        out = target.jobs.get_run_output(task_run_id)
-        payload = out.notebook_output.result if out.notebook_output else "{}"
-        return json.loads(payload or "{}")
-    msg = getattr(run_obj.state, "state_message", "") or str(result_state)
-    raise RuntimeError(f"Target volume-copy job failed: {msg}")
+    # Discovery stores volumes as the same FQN on source + target, so the
+    # object_name is both the source FQN and the target FQN (backticked).
+    target_fqn = object_name.strip("`").replace("`.`", ".")
+    try:
+        auth.target_client.volumes.delete(name=target_fqn)
+        logger.info("Reconciliation cleanup: dropped partial target volume %s", target_fqn)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "not" in msg and ("exist" in msg or "found" in msg):
+            logger.info(
+                "Reconciliation cleanup: target volume %s already absent; nothing to drop.",
+                target_fqn,
+            )
+            return
+        raise
 
 
 # COMMAND ----------
@@ -230,17 +181,21 @@ def migrate_volume(
     src_cat, src_sch, src_vol = _parse_fqn(obj_name)
     target_fqn = obj_name  # same catalog.schema.name on target
 
-    tracker.append_migration_status([{
-        "object_name": obj_name,
-        "object_type": "volume",
-        "status": "in_progress",
-        "error_message": None,
-        "job_run_id": None,
-        "task_run_id": None,
-        "source_row_count": None,
-        "target_row_count": None,
-        "duration_seconds": None,
-    }])
+    tracker.append_migration_status(
+        [
+            {
+                "object_name": obj_name,
+                "object_type": "volume",
+                "status": "in_progress",
+                "error_message": None,
+                "job_run_id": None,
+                "task_run_id": None,
+                "source_row_count": None,
+                "target_row_count": None,
+                "duration_seconds": None,
+            }
+        ]
+    )
 
     start = time.time()
 
@@ -314,16 +269,28 @@ def migrate_volume(
         logger.info("Creating managed volume on target: %s", target_fqn)
         result = execute_and_poll(auth, wh_id, create_sql)
         if result["state"] != "SUCCEEDED":
-            raise RuntimeError(
-                f"CREATE VOLUME failed: {result.get('error', result['state'])}"
-            )
+            raise RuntimeError(f"CREATE VOLUME failed: {result.get('error', result['state'])}")
 
         # 3. Submit target-side copy job
         shared_path = f"/Volumes/{CONSUMER_CATALOG}/{src_sch}/{src_vol}"
         target_path = f"/Volumes/{src_cat}/{src_sch}/{src_vol}"
         run_name = f"cp_migration_volcopy_{src_cat}_{src_sch}_{src_vol}"
         logger.info("Copying volume data: %s -> %s", shared_path, target_path)
-        copy_result = _run_target_volume_copy(auth, shared_path, target_path, run_name)
+        try:
+            copy_result = _run_target_volume_copy(auth, shared_path, target_path, run_name)
+        except Exception:
+            # Copy failed mid-execution — drop the partially-populated target volume
+            # so a re-run can recreate it cleanly. Best-effort: swallow cleanup errors.
+            try:
+                auth.target_client.volumes.delete(name=target_fqn.strip("`").replace("`.`", "."))
+                logger.info("Dropped partial target volume %s after copy failure", target_fqn)
+            except Exception as cleanup_exc:  # noqa: BLE001
+                logger.warning(
+                    "Could not drop partial target volume %s after copy failure: %s",
+                    target_fqn,
+                    cleanup_exc,
+                )
+            raise
 
         duration = time.time() - start
         return {
@@ -341,7 +308,7 @@ def migrate_volume(
             "object_name": obj_name,
             "object_type": "volume",
             "status": "failed",
-            "error_message": str(exc),
+            "error_message": f"{type(exc).__name__}: {exc}",
             "duration_seconds": time.time() - start,
         }, notebook_uploaded
     finally:
@@ -379,11 +346,12 @@ def run(dbutils, spark) -> None:
                 notebook_uploaded=notebook_uploaded,
             )
         except Exception as exc:  # noqa: BLE001
+            logger.exception("Volume migration failed for %s", vol.get("object_name"))
             res = {
                 "object_name": vol["object_name"],
                 "object_type": "volume",
                 "status": "failed",
-                "error_message": str(exc),
+                "error_message": f"{type(exc).__name__}: {exc}",
                 "duration_seconds": 0.0,
             }
         results.append(res)

@@ -3,4 +3,4 @@ resources:
     migration_dashboard:
       display_name: "${var.job_prefix}-migration-dashboard"
       file_path: ../dashboards/migration_dashboard.lvdash.json
-      warehouse_id: cdd0fbc04fa10291
+      warehouse_id: ${var.dashboard_warehouse_id}

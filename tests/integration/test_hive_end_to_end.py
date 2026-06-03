@@ -3,12 +3,16 @@
 # COMMAND ----------
 
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
-    _src = "/Workspace" + _nb.split("/files/")[0] + "/files/src"
-    if _src not in sys.path:
-        sys.path.insert(0, _src)
+    _files_root = "/Workspace" + _nb.split("/files/")[0] + "/files"
+    # /files/src for ``common.*`` resolution; /files for ``tests.integration.*``
+    # shared helpers (matches setup_test_config bootstrap).
+    for _p in (f"{_files_root}/src", _files_root):
+        if _p not in sys.path:
+            sys.path.insert(0, _p)
 except NameError:
     pass
 
@@ -19,12 +23,20 @@ except NameError:
 
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from tests.integration._assertion_helpers import expect_validated  # type: ignore[import-not-found]
 
 config = MigrationConfig.from_workspace_file()
 tracker = TrackingManager(spark, config)  # noqa: F821
 
 status_df = tracker.get_latest_migration_status()
-hive_types = ("hive_view", "hive_function", "hive_managed_dbfs_root", "hive_managed_nondbfs", "hive_external", "hive_grant")
+hive_types = (
+    "hive_view",
+    "hive_function",
+    "hive_managed_dbfs_root",
+    "hive_managed_nondbfs",
+    "hive_external",
+    "hive_grant",
+)
 status_df = status_df.filter(status_df.object_type.isin(list(hive_types)))
 
 total = status_df.count()
@@ -33,7 +45,17 @@ assert total > 0, "No Hive migration status records found."
 
 error_messages: list[str] = []
 
-counts = {row["status"]: row["n"] for row in status_df.groupBy("status").count().withColumnRenamed("count", "n").collect()}
+
+def _expect_validated(row, label: str) -> bool:  # type: ignore[no-untyped-def]
+    """Thin wrapper binding the shared helper to this notebook's
+    ``error_messages`` accumulator. See
+    ``tests/integration/_assertion_helpers.py``. Closes review H11."""
+    return expect_validated(row, label, error_messages)
+
+
+counts = {
+    row["status"]: row["n"] for row in status_df.groupBy("status").count().withColumnRenamed("count", "n").collect()
+}
 print(f"Hive status breakdown: {counts}")
 
 # Expected object types from seed_hive_test_data
@@ -52,9 +74,7 @@ for htype in expected_types:
     failed = [r for r in rows if r["status"] not in accepted]
     if failed:
         for row in failed:
-            error_messages.append(
-                f"Hive {htype}: {row['object_name']} [{row['status']}]: {row['error_message']}"
-            )
+            error_messages.append(f"Hive {htype}: {row['object_name']} [{row['status']}]: {row['error_message']}")
     else:
         print(f"Hive {htype}: {len(rows)} object(s) OK")
 
@@ -65,7 +85,9 @@ for htype in expected_types:
 if config.migrate_hive_dbfs_root:
     dbfs_rows = status_df.filter("object_type = 'hive_managed_dbfs_root' AND status = 'validated'").collect()
     if not dbfs_rows:
-        error_messages.append("No validated hive_managed_dbfs_root records (DBFS-root migration did not run or did not validate).")
+        error_messages.append(
+            "No validated hive_managed_dbfs_root records (DBFS-root migration did not run or did not validate)."
+        )
     else:
         for row in dbfs_rows:
             if row["source_row_count"] != row["target_row_count"]:
@@ -77,10 +99,238 @@ if config.migrate_hive_dbfs_root:
                 print(f"{row['object_name']}: src/tgt rows match ({row['source_row_count']})")
 
 # COMMAND ----------
+# --- Hive external + managed non-DBFS assertions ---
+# Both workers run on every Hive migration but had zero input before the
+# corresponding seed was added. Now we assert each seeded category is
+# validated and its row count matches across source and target.
+
+has_hive_external = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_hive_external", debugValue="false"
+)
+if str(has_hive_external).lower() == "true":
+    ext_rows = status_df.filter("object_type = 'hive_external' AND object_name LIKE '%external_invoices%'").collect()
+    if not ext_rows:
+        error_messages.append("hive_external: no migration_status row for external_invoices.")
+    else:
+        row = ext_rows[0]
+        if not _expect_validated(row, "hive_external external_invoices"):
+            pass  # error already appended
+        elif row["source_row_count"] != row["target_row_count"]:
+            error_messages.append(
+                f"hive_external: external_invoices row mismatch "
+                f"(src={row['source_row_count']}, tgt={row['target_row_count']})"
+            )
+        else:
+            print(f"hive_external validated: external_invoices rows match ({row['source_row_count']})")
+else:
+    print(
+        "hive_external: fixture not seeded (requires migrate_hive_dbfs_root + "
+        "hive_dbfs_target_path); skipping assertion."
+    )
+
+has_hive_nondbfs = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_hive_nondbfs", debugValue="false"
+)
+if str(has_hive_nondbfs).lower() == "true":
+    nd_rows = status_df.filter("object_type = 'hive_managed_nondbfs' AND object_name LIKE '%nondbfs_sales%'").collect()
+    if not nd_rows:
+        error_messages.append("hive_managed_nondbfs: no migration_status row for nondbfs_sales.")
+    else:
+        row = nd_rows[0]
+        if not _expect_validated(row, "hive_managed_nondbfs nondbfs_sales"):
+            pass  # error already appended
+        elif row["source_row_count"] != row["target_row_count"]:
+            error_messages.append(
+                f"hive_managed_nondbfs: nondbfs_sales row mismatch "
+                f"(src={row['source_row_count']}, tgt={row['target_row_count']})"
+            )
+        else:
+            print(f"hive_managed_nondbfs validated: nondbfs_sales rows match ({row['source_row_count']})")
+else:
+    print(
+        "hive_managed_nondbfs: fixture not seeded (requires migrate_hive_dbfs_root "
+        "+ hive_dbfs_target_path); skipping assertion."
+    )
+
+# COMMAND ----------
+# --- Hive grants assertion ---
+# Seed grants SELECT on managed_orders to ``account users``. Verify
+# hive_grants_worker migrated that grant.
+
+has_hive_grant = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_hive_grant", debugValue="false"
+)
+if str(has_hive_grant).lower() == "true":
+    full_status_hive = tracker.get_latest_migration_status()
+    hg_rows = full_status_hive.filter(
+        "object_type = 'hive_grant' AND status = 'validated' AND object_name LIKE '%account users%'"
+    ).collect()
+    if not hg_rows:
+        error_messages.append(
+            "hive_grants: no validated hive_grant row for `account users` — "
+            "SELECT on Hive schema did not migrate to target."
+        )
+    else:
+        print(f"hive_grants validated: {len(hg_rows)} hive_grant row(s) for 'account users' replayed.")
+else:
+    print("hive_grants: grant fixture not seeded; skipping assertion.")
+
+# COMMAND ----------
+# --- Phase 2 integration extras (items 2.10 – 2.15) ---
+# Each block gates on the seed's task value so partial fixtures don't
+# mask unrelated regressions.
+
+
+def _validated_hive_rows(object_type: str, name_like: str) -> list:
+    return status_df.filter(
+        f"object_type = '{object_type}' AND object_name LIKE '%{name_like}%'"
+    ).collect()
+
+
+# --- 2.10 multi-upstream view ---
+_has_multi_upstream = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_multi_upstream_view", debugValue="false"
+)
+if str(_has_multi_upstream).lower() == "true":
+    rows_mu = _validated_hive_rows("hive_view", "product_orders")
+    if not rows_mu:
+        error_messages.append("2.10: product_orders view row missing from migration_status.")
+    elif _expect_validated(rows_mu[0], "2.10 product_orders view"):
+        print("2.10 OK: multi-upstream view product_orders validated.")
+    rows_mp = _validated_hive_rows("hive_managed_dbfs_root", "managed_products")
+    if not rows_mp:
+        error_messages.append("2.10: managed_products upstream table missing from migration_status.")
+    else:
+        _expect_validated(rows_mp[0], "2.10 managed_products upstream")
+else:
+    print("2.10 skipped: seed did not create multi-upstream view.")
+
+# --- 2.11 cross-catalog view (references a UC catalog) ---
+_has_xcat = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_cross_catalog_view", debugValue="false"
+)
+if str(_has_xcat).lower() == "true":
+    rows_xc = _validated_hive_rows("hive_view", "mixed_ref_view")
+    if not rows_xc:
+        error_messages.append("2.11: mixed_ref_view row missing from migration_status.")
+    elif _expect_validated(rows_xc[0], "2.11 mixed_ref_view"):
+        print("2.11 OK: cross-catalog view mixed_ref_view validated.")
+else:
+    print("2.11 skipped: seed did not create cross-catalog view.")
+
+# --- 2.12 partitioned DBFS-root ---
+_has_part_dbfs = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_partitioned_dbfs", debugValue="false"
+)
+if str(_has_part_dbfs).lower() == "true" and config.migrate_hive_dbfs_root:
+    rows_pd = _validated_hive_rows("hive_managed_dbfs_root", "partitioned_orders")
+    if not rows_pd:
+        error_messages.append("2.12: partitioned_orders row missing from migration_status.")
+    else:
+        row = rows_pd[0]
+        if not _expect_validated(row, "2.12 partitioned_orders"):
+            pass  # error already appended
+        elif row["source_row_count"] != row["target_row_count"]:
+            error_messages.append(
+                f"2.12: partitioned_orders row mismatch "
+                f"(src={row['source_row_count']}, tgt={row['target_row_count']})"
+            )
+        else:
+            print(f"2.12 OK: partitioned_orders rows match ({row['source_row_count']}).")
+elif str(_has_part_dbfs).lower() == "true":
+    print("2.12 skipped: migrate_hive_dbfs_root=false.")
+else:
+    print("2.12 skipped: seed did not create partitioned DBFS-root table.")
+
+# --- 2.13 partitioned external ---
+_has_part_ext = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_partitioned_external", debugValue="false"
+)
+if str(_has_part_ext).lower() == "true":
+    rows_pe = _validated_hive_rows("hive_external", "external_partitioned_sales")
+    if not rows_pe:
+        error_messages.append("2.13: external_partitioned_sales row missing from migration_status.")
+    else:
+        row = rows_pe[0]
+        if not _expect_validated(row, "2.13 external_partitioned_sales"):
+            pass  # error already appended
+        elif row["source_row_count"] != row["target_row_count"]:
+            error_messages.append(
+                f"2.13: external_partitioned_sales row mismatch "
+                f"(src={row['source_row_count']}, tgt={row['target_row_count']})"
+            )
+        else:
+            print(f"2.13 OK: external_partitioned_sales rows match ({row['source_row_count']}).")
+else:
+    print("2.13 skipped: seed did not create partitioned external table.")
+
+# --- 2.14 orchestrator batch sizing ---
+_batch_tables_seeded = int(  # noqa: B008
+    dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+        taskKey="seed_hive", key="batch_tables_seeded", debugValue="0"
+    )
+    or "0"
+)
+if _batch_tables_seeded > 0 and config.migrate_hive_dbfs_root:
+    batch_rows = [
+        r
+        for r in status_df.filter(
+            "object_type = 'hive_managed_dbfs_root' AND object_name LIKE '%batch_tbl_%'"
+        ).collect()
+    ]
+    # H11: "validated" means status=validated AND empty error_message.
+    # A worker recording ``validated`` with a warning in error_message
+    # would otherwise count here as a pass but is really a partial
+    # failure that needs operator attention.
+    clean_validated = [r for r in batch_rows if r["status"] == "validated" and not r["error_message"]]
+    if len(clean_validated) != _batch_tables_seeded:
+        missing = _batch_tables_seeded - len(clean_validated)
+        failures = [
+            f"{r['object_name']}[{r['status']}]: {r['error_message']}"
+            for r in batch_rows
+            if not (r["status"] == "validated" and not r["error_message"])
+        ]
+        error_messages.append(
+            f"2.14: expected {_batch_tables_seeded} batch_tbl_* clean-validated; "
+            f"got {len(clean_validated)} (missing or warning-tainted: {missing}). "
+            f"Non-clean rows: {failures}"
+        )
+    else:
+        print(f"2.14 OK: all {_batch_tables_seeded} batch_tbl_* tables validated.")
+elif _batch_tables_seeded > 0:
+    print("2.14 skipped: migrate_hive_dbfs_root=false.")
+else:
+    print("2.14 skipped: seed created no batch tables.")
+
+# --- 2.15 view dependency chain ---
+_has_chain = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="has_view_chain", debugValue="false"
+)
+if str(_has_chain).lower() == "true":
+    chain_names = ("view_level1", "view_level2", "view_level3")
+    missing = []
+    chain_ok = True
+    for nm in chain_names:
+        rows_cn = _validated_hive_rows("hive_view", nm)
+        if not rows_cn:
+            missing.append(nm)
+            chain_ok = False
+        elif not _expect_validated(rows_cn[0], f"2.15 view chain {nm}"):
+            # _expect_validated has already appended to error_messages with
+            # the chain-step label so a future failure points at the
+            # specific view that didn't migrate.
+            chain_ok = False
+    if missing:
+        error_messages.append(f"2.15: missing view chain rows: {missing}")
+    if not missing and chain_ok:
+        print("2.15 OK: view_level1 → view_level2 → view_level3 all validated.")
+else:
+    print("2.15 skipped: seed did not create view chain.")
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
-        f"Hive integration test failed with {len(error_messages)} error(s):\n"
-        + "\n".join(error_messages)
+        f"Hive integration test failed with {len(error_messages)} error(s):\n" + "\n".join(error_messages)
     )
 print("Hive integration tests passed.")

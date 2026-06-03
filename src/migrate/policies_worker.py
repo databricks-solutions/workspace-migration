@@ -3,7 +3,9 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -70,6 +72,17 @@ def apply_policy(definition: dict, *, auth: AuthManager, dry_run: bool) -> dict:
             "duration_seconds": time.time() - start,
         }
     except Exception as exc:  # noqa: BLE001
+        # Idempotency: POST /policies has no PUT-or-create variant. On retry
+        # the policy may already exist — treat "already exists" as validated.
+        err_text = str(exc).lower()
+        if "already" in err_text and "exists" in err_text:
+            return {
+                "object_name": obj_key,
+                "object_type": "policy",
+                "status": "validated",
+                "error_message": "already existed on target",
+                "duration_seconds": time.time() - start,
+            }
         return {
             "object_name": obj_key,
             "object_type": "policy",
@@ -81,9 +94,6 @@ def apply_policy(definition: dict, *, auth: AuthManager, dry_run: bool) -> dict:
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping policies_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

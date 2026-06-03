@@ -4,9 +4,6 @@ on: [push, pull_request]
 jobs:
   lint-and-test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tool
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -24,4 +21,6 @@ jobs:
       - name: Install Databricks CLI
         uses: databricks/setup-cli@main
       - name: Bundle validate
+        env:
+          BUNDLE_VAR_migration_spn_id: dummy-for-validate
         run: databricks bundle validate

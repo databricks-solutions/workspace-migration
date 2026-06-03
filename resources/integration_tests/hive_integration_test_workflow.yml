@@ -1,0 +1,78 @@
+resources:
+  jobs:
+    hive_integration_test:
+      name: "${var.job_prefix}-hive-integration-test"
+      description: "End-to-end integration test for the Hive migration workflow."
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # Hive integration test: DBFS-root migration on. iceberg_strategy
+            # stays empty — no Iceberg fixture on the Hive side.
+            # hive_dbfs_target_path is left empty so the operator-configured
+            # value in the workspace config.yaml (set once after deploy) is
+            # preserved — avoids baking an env-specific ADLS URL into the
+            # repo.
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "true"
+              hive_dbfs_target_path: ""
+              # batch_size=10 with 12 batch_tbl_* fixtures still forces
+              # the orchestrator to emit multiple DBFS-root batches
+              # (integration item 2.14). The orchestrator also self-
+              # caps each batch by JSON byte size so the operator-
+              # visible batch_size no longer has to be lowered for
+              # environments with sizable FQNs / storage_locations.
+              batch_size: "10"
+              # Restrict UC discovery to integration_test_src so the
+              # Hive cross-catalog-view fixture's parallel UC catalog
+              # (integration_test_hive_ucref) is NOT discovered and
+              # migrated. Hive integration doesn't seed integration_test_src
+              # on source, so UC discovery finds nothing — matches the
+              # pre-2.11 implicit behavior.
+              catalog_filter: "integration_test_src"
+
+        - task_key: seed_hive
+          depends_on:
+            - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_hive_test_data.py
+
+        - task_key: pre_check
+          depends_on:
+            - task_key: seed_hive
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check.py
+
+        - task_key: discovery
+          depends_on:
+            - task_key: pre_check
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+
+        - task_key: migrate_hive
+          depends_on:
+            - task_key: discovery
+          run_job_task:
+            job_id: ${resources.jobs.migrate_hive.id}
+
+        - task_key: test_hive
+          depends_on:
+            - task_key: migrate_hive
+          notebook_task:
+            notebook_path: ../../tests/integration/test_hive_end_to_end.py
+
+        - task_key: teardown_hive
+          depends_on:
+            - task_key: setup_test_config
+            - task_key: seed_hive
+            - task_key: pre_check
+            - task_key: discovery
+            - task_key: migrate_hive
+            - task_key: test_hive
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_hive.py

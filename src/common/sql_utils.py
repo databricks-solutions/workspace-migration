@@ -16,11 +16,19 @@ POLL_INTERVAL_SECONDS = 10
 DEFAULT_POLL_TIMEOUT_SECONDS = 3600
 
 
+def _state_name(state: object) -> str:
+    """Return a warehouse/run state as a string, handling SDK versions that
+    return either an Enum (with ``.value``) or a raw string."""
+    if state is None:
+        return ""
+    return getattr(state, "value", None) or str(state)
+
+
 def find_warehouse(auth_mgr: AuthManager) -> str:
     """Find the first available SQL warehouse on the target workspace."""
     warehouses = list(auth_mgr.target_client.warehouses.list())
     for wh in warehouses:
-        if wh.state and wh.state.value in ("RUNNING", "STARTING"):
+        if _state_name(wh.state) in ("RUNNING", "STARTING"):
             logger.info("Using warehouse '%s' (%s).", wh.name, wh.id)
             return wh.id  # type: ignore[return-value]
     if warehouses:

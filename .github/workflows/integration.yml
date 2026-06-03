@@ -7,9 +7,6 @@ on:
 jobs:
   connect-tests:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tool
     env:
       ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
       ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
@@ -27,14 +24,12 @@ jobs:
   integration-tests:
     needs: connect-tests
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: tool
     env:
       ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
       ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
       ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
       DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      BUNDLE_VAR_migration_spn_id: ${{ secrets.MIGRATION_SPN_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v4
@@ -45,8 +40,10 @@ jobs:
         uses: databricks/setup-cli@main
       - name: Deploy test bundle
         run: databricks bundle deploy -t test
-      - name: Run integration tests
-        run: databricks bundle run integration_test_workflow -t test
+      - name: Run UC integration test
+        run: databricks bundle run uc_integration_test -t test
+      - name: Run Hive integration test
+        run: databricks bundle run hive_integration_test -t test
       - name: Cleanup
         if: always()
         run: databricks bundle destroy -t test --auto-approve

@@ -29,6 +29,13 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "UP", "B", "SIM"]
 
+[tool.ruff.lint.per-file-ignores]
+# Integration notebooks carry long inline SQL strings; splitting them to
+# 120 cols hurts readability. Unit test_cross_cutting has long pattern
+# strings for source-scan assertions.
+"tests/integration/*.py" = ["E501", "E402"]
+"tests/unit/test_cross_cutting.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.10"
 mypy_path = "src"
@@ -49,6 +56,10 @@ ignore_missing_imports = true
 module = "pyspark.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = "yaml"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
@@ -57,4 +68,5 @@ addopts = "-v --tb=short"
 [dependency-groups]
 dev = [
     "databricks-sql-connector>=3.0",
+    "sqlglot>=25.0",
 ]

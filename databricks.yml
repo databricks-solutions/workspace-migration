@@ -4,6 +4,25 @@ bundle:
 variables:
   job_prefix:
     default: "uc-migration"
+  migration_spn_id:
+    description: |
+      SPN application ID (Azure AD App ID / AWS Databricks OAuth client_id)
+      that jobs run as. No default — operators must provide this per env
+      via ``--var migration_spn_id=<app-id>`` or environment variable
+      ``BUNDLE_VAR_migration_spn_id``. The SPN needs: workspace admin on
+      source + target, metastore-level CREATE_* privileges, USE_PROVIDER
+      on target, and READ/WRITE_FILES on any external location used for
+      Hive DBFS-root migration.
+  dashboard_warehouse_name:
+    description: |
+      Name of the SQL warehouse the migration dashboard reads from.
+      Resolved to an ID via ``dashboard_warehouse_id`` lookup below. If
+      you have a warehouse with a different name, override this var.
+    default: "cp-migration"
+  dashboard_warehouse_id:
+    description: "Resolved warehouse ID (do not set directly — override dashboard_warehouse_name instead)."
+    lookup:
+      warehouse: ${var.dashboard_warehouse_name}
 
 workspace:
   # Deploy to a Shared workspace path so the bundle is visible to all migration
@@ -11,6 +30,10 @@ workspace:
   # and is re-synced to ${workspace.file_path}/config.yaml on every
   # ``databricks bundle deploy``. Edit the file locally and redeploy.
   root_path: /Shared/cp_migration/${bundle.target}
+
+# Bundle-level run_as conflicts with dashboards (which must run as owner).
+# Each job sets run_as: ${var.migration_spn_id} individually in its resource
+# file instead — dashboards are left with default (deployer) ownership.
 
 # Acknowledge the shared path; operators should tighten to a dedicated
 # admin group in prod (replace 'users' with e.g. 'migration_admins').
@@ -20,6 +43,8 @@ permissions:
 
 include:
   - resources/*.yml
+  - resources/production/*.yml
+  - resources/integration_tests/*.yml
 
 targets:
   dev:
@@ -31,6 +56,10 @@ targets:
       name_prefix: "[dev-${workspace.current_user.short_name}] "
       tags:
         dev: "${workspace.current_user.userName}"
+    resources:
+      # Dashboards don't support run_as != owner, so skip in dev (SPN run_as).
+      dashboards:
+        migration_dashboard: null
 
   test:
     presets:

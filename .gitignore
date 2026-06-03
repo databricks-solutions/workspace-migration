@@ -7,3 +7,4 @@ __pycache__/
 *.egg-info/
 debug_dbconnect.py
 .coverage
+.claude/

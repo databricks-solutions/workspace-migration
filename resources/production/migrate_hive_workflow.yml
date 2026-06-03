@@ -1,0 +1,86 @@
+resources:
+  jobs:
+    migrate_hive:
+      name: "${var.job_prefix}-migrate-hive"
+      description: |
+        Hive (legacy) data plane: external + managed-nondbfs + managed-dbfs
+        tables, Hive functions/views, plus Hive ACLs replayed as UC grants
+        on the target catalog. Depends operationally on the discovery job;
+        run discovery first.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: hive_orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/hive_orchestrator.py
+
+        - task_key: migrate_hive_external_tables
+          depends_on:
+            - task_key: hive_orchestrator
+          for_each_task:
+            inputs: "{{tasks.hive_orchestrator.values.hive_external_batches}}"
+            task:
+              task_key: hive_external_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/hive_external_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_hive_managed_nondbfs
+          depends_on:
+            - task_key: hive_orchestrator
+          for_each_task:
+            inputs: "{{tasks.hive_orchestrator.values.hive_managed_nondbfs_batches}}"
+            task:
+              task_key: hive_managed_nondbfs_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/hive_managed_nondbfs_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_hive_managed_dbfs
+          depends_on:
+            - task_key: hive_orchestrator
+          for_each_task:
+            inputs: "{{tasks.hive_orchestrator.values.hive_managed_dbfs_root_batches}}"
+            task:
+              task_key: hive_managed_dbfs_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/hive_managed_dbfs_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_hive_functions
+          depends_on:
+            - task_key: migrate_hive_external_tables
+            - task_key: migrate_hive_managed_nondbfs
+            - task_key: migrate_hive_managed_dbfs
+          notebook_task:
+            notebook_path: ../../src/migrate/hive_functions_worker.py
+
+        - task_key: migrate_hive_views
+          depends_on:
+            - task_key: migrate_hive_external_tables
+            - task_key: migrate_hive_managed_nondbfs
+            - task_key: migrate_hive_managed_dbfs
+            - task_key: migrate_hive_functions
+          notebook_task:
+            notebook_path: ../../src/migrate/hive_views_worker.py
+
+        - task_key: migrate_hive_grants
+          depends_on:
+            - task_key: migrate_hive_views
+          notebook_task:
+            notebook_path: ../../src/migrate/hive_grants_worker.py
+
+        - task_key: summary_hive
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_hive_grants
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              # WS-2: Per-workflow filter — only Hive object types.
+              # Values match what Hive workers actually emit into
+              # migration_status.
+              object_types: "hive_external,hive_managed_nondbfs,hive_managed_dbfs_root,hive_function,hive_view,hive_grant"

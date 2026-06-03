@@ -3,7 +3,9 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -41,17 +43,22 @@ def _is_notebook() -> bool:
 
 
 def apply_row_filter(
-    rf: dict, *, auth: AuthManager, wh_id: str, dry_run: bool,
+    rf: dict,
+    *,
+    auth: AuthManager,
+    wh_id: str,
+    dry_run: bool,
 ) -> dict:
     table_fqn = rf["table_fqn"]
     filter_fqn = rf["filter_function_fqn"]
     cols = rf.get("filter_columns") or []
     cols_clause = ", ".join(f"`{c}`" for c in cols)
-    sql = (
-        f"ALTER TABLE {table_fqn} SET ROW FILTER {filter_fqn} "
-        f"ON ({cols_clause})"
-    )
-    obj_key = f"ROW_FILTER_{table_fqn}"
+    sql = f"ALTER TABLE {table_fqn} SET ROW FILTER {filter_fqn} ON ({cols_clause})"
+    # C6: object_name must match discovery's key (table_fqn) so
+    # ``get_pending_objects`` LEFT JOIN matches and the row is treated as
+    # terminal on re-run. The historical ``ROW_FILTER_`` prefix collapsed
+    # this LEFT JOIN to NULL — every run reprocessed every filter.
+    obj_key = table_fqn
 
     start = time.time()
     if dry_run:
@@ -86,9 +93,6 @@ def apply_row_filter(
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping row_filters_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 
@@ -111,7 +115,7 @@ def run(dbutils, spark) -> None:
             res = apply_row_filter(meta, auth=auth, wh_id=wh_id, dry_run=config.dry_run)
         except Exception as exc:  # noqa: BLE001
             res = {
-                "object_name": f"ROW_FILTER_{meta.get('table_fqn','?')}",
+                "object_name": meta.get("table_fqn", "?"),
                 "object_type": "row_filter",
                 "status": "failed",
                 "error_message": str(exc),

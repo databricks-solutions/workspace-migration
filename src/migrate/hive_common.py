@@ -1,4 +1,5 @@
 """Shared helpers for Hive-to-UC migration workers (Phase 2)."""
+
 from __future__ import annotations
 
 import re

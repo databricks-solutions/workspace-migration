@@ -3,7 +3,9 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -47,8 +49,10 @@ def apply_foreign_catalog(fc: dict, *, auth: AuthManager, dry_run: bool) -> dict
     if dry_run:
         logger.info("[DRY RUN] Would create foreign catalog %s", name)
         return {
-            "object_name": obj_key, "object_type": "foreign_catalog",
-            "status": "skipped", "error_message": "dry_run",
+            "object_name": obj_key,
+            "object_type": "foreign_catalog",
+            "status": "skipped",
+            "error_message": "dry_run",
             "duration_seconds": time.time() - start,
         }
     try:
@@ -59,30 +63,32 @@ def apply_foreign_catalog(fc: dict, *, auth: AuthManager, dry_run: bool) -> dict
             comment=fc.get("comment"),
         )
         return {
-            "object_name": obj_key, "object_type": "foreign_catalog",
-            "status": "validated", "error_message": None,
+            "object_name": obj_key,
+            "object_type": "foreign_catalog",
+            "status": "validated",
+            "error_message": None,
             "duration_seconds": time.time() - start,
         }
     except Exception as exc:  # noqa: BLE001
         if "already" in str(exc).lower() and "exists" in str(exc).lower():
             return {
-                "object_name": obj_key, "object_type": "foreign_catalog",
+                "object_name": obj_key,
+                "object_type": "foreign_catalog",
                 "status": "validated",
                 "error_message": "already existed on target",
                 "duration_seconds": time.time() - start,
             }
         return {
-            "object_name": obj_key, "object_type": "foreign_catalog",
-            "status": "failed", "error_message": str(exc),
+            "object_name": obj_key,
+            "object_type": "foreign_catalog",
+            "status": "failed",
+            "error_message": str(exc),
             "duration_seconds": time.time() - start,
         }
 
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping foreign_catalogs_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

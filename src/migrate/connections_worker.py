@@ -3,7 +3,9 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -44,10 +46,19 @@ def _is_notebook() -> bool:
 
 # Keys in connection.options that typically need to be re-entered by the
 # customer after migration — never returned by the GET API.
-_SECRET_KEYS = frozenset({
-    "password", "pwd", "client_secret", "access_token", "api_key",
-    "private_key", "private_key_password", "secret", "auth_token",
-})
+_SECRET_KEYS = frozenset(
+    {
+        "password",
+        "pwd",
+        "client_secret",
+        "access_token",
+        "api_key",
+        "private_key",
+        "private_key_password",
+        "secret",
+        "auth_token",
+    }
+)
 
 
 def _credential_gaps(options: dict) -> list[str]:
@@ -67,8 +78,10 @@ def apply_connection(conn: dict, *, auth: AuthManager, dry_run: bool) -> dict:
     if dry_run:
         logger.info("[DRY RUN] Would create connection %s (%s)", name, raw_type)
         return {
-            "object_name": obj_key, "object_type": "connection",
-            "status": "skipped", "error_message": "dry_run",
+            "object_name": obj_key,
+            "object_type": "connection",
+            "status": "skipped",
+            "error_message": "dry_run",
             "duration_seconds": time.time() - start,
         }
 
@@ -86,35 +99,36 @@ def apply_connection(conn: dict, *, auth: AuthManager, dry_run: bool) -> dict:
             comment=comment,
         )
     except Exception as exc:  # noqa: BLE001
-        return {
-            "object_name": obj_key, "object_type": "connection",
-            "status": "failed", "error_message": str(exc),
-            "duration_seconds": time.time() - start,
-        }
+        err_text = str(exc).lower()
+        if not ("already" in err_text and "exists" in err_text):
+            return {
+                "object_name": obj_key,
+                "object_type": "connection",
+                "status": "failed",
+                "error_message": str(exc),
+                "duration_seconds": time.time() - start,
+            }
 
     gaps = _credential_gaps(options)
     if gaps:
         return {
-            "object_name": obj_key, "object_type": "connection",
+            "object_name": obj_key,
+            "object_type": "connection",
             "status": "validation_failed",
-            "error_message": (
-                f"Connection created but credentials must be re-entered: "
-                f"{', '.join(gaps)}"
-            ),
+            "error_message": (f"Connection created but credentials must be re-entered: {', '.join(gaps)}"),
             "duration_seconds": time.time() - start,
         }
     return {
-        "object_name": obj_key, "object_type": "connection",
-        "status": "validated", "error_message": None,
+        "object_name": obj_key,
+        "object_type": "connection",
+        "status": "validated",
+        "error_message": None,
         "duration_seconds": time.time() - start,
     }
 
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping connections_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
 

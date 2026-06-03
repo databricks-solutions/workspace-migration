@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -94,6 +96,15 @@ def migrate_external_table(
             "error_message": f"Failed to get DDL: {exc}",
             "duration_seconds": duration,
         }
+
+    # Strip any row filter / column mask clauses — filter/mask functions
+    # aren't migrated yet at this stage (functions_worker runs after
+    # tables), so replaying the DDL with them inline would fail with
+    # ROUTINE_NOT_FOUND. row_filters_worker / column_masks_worker apply
+    # them later.
+    from common.catalog_utils import CatalogExplorer
+
+    ddl = CatalogExplorer.strip_filter_mask_clauses(ddl)
 
     # Replace CREATE TABLE with CREATE TABLE IF NOT EXISTS
     ddl = rewrite_ddl(ddl, r"CREATE\s+TABLE\b", "CREATE TABLE IF NOT EXISTS")

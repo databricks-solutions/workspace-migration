@@ -63,6 +63,20 @@ class TestFindWarehouse:
         with pytest.raises(RuntimeError, match="No SQL warehouse found"):
             find_warehouse(auth_mgr)
 
+    def test_find_warehouse_state_as_raw_string(self):
+        """Some SDK versions return wh.state as a raw string instead of an
+        Enum with .value. find_warehouse must tolerate both shapes."""
+        wh = MagicMock()
+        wh.name = "string-state-wh"
+        wh.id = "wh-999"
+        wh.state = "RUNNING"  # raw string, no .value attribute
+        auth_mgr = MagicMock()
+        auth_mgr.target_client.warehouses.list.return_value = [wh]
+
+        result = find_warehouse(auth_mgr)
+
+        assert result == "wh-999"
+
 
 # ---------------------------------------------------------------------------
 # execute_and_poll  — StatementState is imported inside the function body,

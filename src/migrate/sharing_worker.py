@@ -3,7 +3,9 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -27,6 +29,8 @@ except NameError:
 import json
 import logging
 import time
+
+from databricks.sdk.errors import AlreadyExists
 
 from common.auth import AuthManager
 from common.config import MigrationConfig
@@ -56,8 +60,47 @@ _SHARE_OBJECT_SQL = {
 }
 
 
+def cleanup_partial_share(
+    object_name: str, *, auth, spark=None, config=None
+) -> None:
+    """Cleanup hook (X.1 reconciliation) for an in-progress share.
+
+    ``apply_share`` iterates ``ALTER SHARE ADD`` per object. If the worker
+    dies after adding a subset, the next run's idempotency path (X.2)
+    treats the already-added objects as ``already_present`` and succeeds,
+    so no destructive cleanup is strictly required. But the share may
+    still carry objects that the *next* run has since dropped from the
+    source spec (rare, but possible when source was edited between runs).
+    For safety we drop the share entirely; ``apply_share`` will recreate
+    it on retry from the live spec.
+
+    Best-effort: swallow NOT_FOUND / "does not exist" errors. The
+    ``object_name`` here is the ``SHARE_<name>`` key stamped by
+    ``apply_share`` strip the prefix to get the real share name.
+    """
+    name = object_name
+    if name.startswith("SHARE_"):
+        name = name[len("SHARE_"):]
+    try:
+        auth.target_client.shares.delete(name=name)
+        logger.info("Reconciliation cleanup: dropped partial share %s", name)
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc).lower()
+        if "not" in msg and ("exist" in msg or "found" in msg):
+            logger.info(
+                "Reconciliation cleanup: share %s already absent; nothing to drop.",
+                name,
+            )
+            return
+        raise
+
+
 def apply_share(
-    share: dict, *, auth: AuthManager, wh_id: str, dry_run: bool,
+    share: dict,
+    *,
+    auth: AuthManager,
+    wh_id: str,
+    dry_run: bool,
 ) -> dict:
     share_name = share["share_name"]
     comment = share.get("comment")
@@ -68,25 +111,31 @@ def apply_share(
     if dry_run:
         logger.info("[DRY RUN] Would create share %s with %d object(s)", share_name, len(objects))
         return {
-            "object_name": obj_key, "object_type": "share",
-            "status": "skipped", "error_message": "dry_run",
+            "object_name": obj_key,
+            "object_type": "share",
+            "status": "skipped",
+            "error_message": "dry_run",
             "duration_seconds": time.time() - start,
         }
 
     # Create share shell (tolerate already-exists)
     try:
         auth.target_client.shares.create(name=share_name, comment=comment)
+    except AlreadyExists:
+        pass
     except Exception as exc:  # noqa: BLE001
-        if "already" not in str(exc).lower() or "exists" not in str(exc).lower():
-            return {
-                "object_name": obj_key, "object_type": "share",
-                "status": "failed", "error_message": str(exc),
-                "duration_seconds": time.time() - start,
-            }
+        return {
+            "object_name": obj_key,
+            "object_type": "share",
+            "status": "failed",
+            "error_message": str(exc),
+            "duration_seconds": time.time() - start,
+        }
 
     # Add objects via SQL ALTER SHARE (covers table/view/volume/schema/catalog)
     failures: list[str] = []
     added = 0
+    already_present = 0
     for o in objects:
         dot_raw = o.get("data_object_type", "")
         # Enum stringified: "SharedDataObjectDataObjectType.TABLE" → "TABLE"
@@ -104,18 +153,30 @@ def apply_share(
             if res["state"] == "SUCCEEDED":
                 added += 1
             else:
-                failures.append(f"{keyword} {fqn}: {res.get('error', res['state'])}")
+                err_text = str(res.get("error", res["state"])).lower()
+                # Idempotency: ALTER SHARE ADD errors if the object is already
+                # in the share. Treat as no-op on retry rather than a failure.
+                if "already" in err_text:
+                    already_present += 1
+                else:
+                    failures.append(f"{keyword} {fqn}: {res.get('error', res['state'])}")
         except Exception as exc:  # noqa: BLE001
-            failures.append(f"{keyword} {fqn}: {exc}")
+            if "already" in str(exc).lower():
+                already_present += 1
+            else:
+                failures.append(f"{keyword} {fqn}: {exc}")
 
     duration = time.time() - start
     status_msg = f"Added {added} object(s)"
+    if already_present:
+        status_msg += f"; {already_present} already present"
     if failures:
         status_msg += f"; {len(failures)} failed: " + "; ".join(failures[:3])
     return {
-        "object_name": obj_key, "object_type": "share",
+        "object_name": obj_key,
+        "object_type": "share",
         "status": "validated" if not failures else "validation_failed",
-        "error_message": status_msg if (failures or added == 0) else None,
+        "error_message": status_msg if (failures or (added == 0 and not already_present)) else None,
         "duration_seconds": duration,
     }
 
@@ -136,8 +197,10 @@ def apply_recipient(rc: dict, *, auth: AuthManager, dry_run: bool) -> dict:
     start = time.time()
     if dry_run:
         return {
-            "object_name": obj_key, "object_type": "recipient",
-            "status": "skipped", "error_message": "dry_run",
+            "object_name": obj_key,
+            "object_type": "recipient",
+            "status": "skipped",
+            "error_message": "dry_run",
             "duration_seconds": time.time() - start,
         }
     try:
@@ -151,20 +214,26 @@ def apply_recipient(rc: dict, *, auth: AuthManager, dry_run: bool) -> dict:
         if str(auth_type_enum).endswith("TOKEN"):
             note = "New activation token generated on target — redistribute to consumer."
         return {
-            "object_name": obj_key, "object_type": "recipient",
-            "status": "validated", "error_message": note,
+            "object_name": obj_key,
+            "object_type": "recipient",
+            "status": "validated",
+            "error_message": note,
             "duration_seconds": time.time() - start,
         }
     except Exception as exc:  # noqa: BLE001
         if "already" in str(exc).lower() and "exists" in str(exc).lower():
             return {
-                "object_name": obj_key, "object_type": "recipient",
-                "status": "validated", "error_message": "already existed",
+                "object_name": obj_key,
+                "object_type": "recipient",
+                "status": "validated",
+                "error_message": "already existed",
                 "duration_seconds": time.time() - start,
             }
         return {
-            "object_name": obj_key, "object_type": "recipient",
-            "status": "failed", "error_message": str(exc),
+            "object_name": obj_key,
+            "object_type": "recipient",
+            "status": "failed",
+            "error_message": str(exc),
             "duration_seconds": time.time() - start,
         }
 
@@ -184,34 +253,41 @@ def apply_provider(prov: dict, *, auth: AuthManager, dry_run: bool) -> dict:
     start = time.time()
     if dry_run:
         return {
-            "object_name": obj_key, "object_type": "provider",
-            "status": "skipped", "error_message": "dry_run",
+            "object_name": obj_key,
+            "object_type": "provider",
+            "status": "skipped",
+            "error_message": "dry_run",
             "duration_seconds": time.time() - start,
         }
     try:
         auth.target_client.providers.create(
-            name=name, authentication_type=auth_type_enum,
+            name=name,
+            authentication_type=auth_type_enum,
             comment=prov.get("comment"),
         )
         return {
-            "object_name": obj_key, "object_type": "provider",
+            "object_name": obj_key,
+            "object_type": "provider",
             "status": "validated",
             "error_message": (
-                "Provider shell created — recipient_profile_str must be "
-                "re-uploaded by customer on target."
+                "Provider shell created — recipient_profile_str must be re-uploaded by customer on target."
             ),
             "duration_seconds": time.time() - start,
         }
     except Exception as exc:  # noqa: BLE001
         if "already" in str(exc).lower() and "exists" in str(exc).lower():
             return {
-                "object_name": obj_key, "object_type": "provider",
-                "status": "validated", "error_message": "already existed",
+                "object_name": obj_key,
+                "object_type": "provider",
+                "status": "validated",
+                "error_message": "already existed",
                 "duration_seconds": time.time() - start,
             }
         return {
-            "object_name": obj_key, "object_type": "provider",
-            "status": "failed", "error_message": str(exc),
+            "object_name": obj_key,
+            "object_type": "provider",
+            "status": "failed",
+            "error_message": str(exc),
             "duration_seconds": time.time() - start,
         }
 
@@ -232,26 +308,19 @@ def _parse(rows: list[dict]) -> list[dict]:
 
 def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
-    if not config.include_uc:
-        logger.info("Skipping sharing_worker: scope.include_uc=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
     wh_id = find_warehouse(auth)
 
-    share_rows = _parse(json.loads(
-        dbutils.jobs.taskValues.get(taskKey="orchestrator", key="share_list")
-    ))
-    recipient_rows = _parse(json.loads(
-        dbutils.jobs.taskValues.get(taskKey="orchestrator", key="recipient_list")
-    ))
-    provider_rows = _parse(json.loads(
-        dbutils.jobs.taskValues.get(taskKey="orchestrator", key="provider_list")
-    ))
+    share_rows = _parse(json.loads(dbutils.jobs.taskValues.get(taskKey="orchestrator", key="share_list")))
+    recipient_rows = _parse(json.loads(dbutils.jobs.taskValues.get(taskKey="orchestrator", key="recipient_list")))
+    provider_rows = _parse(json.loads(dbutils.jobs.taskValues.get(taskKey="orchestrator", key="provider_list")))
 
     logger.info(
         "Received %d share, %d recipient, %d provider records.",
-        len(share_rows), len(recipient_rows), len(provider_rows),
+        len(share_rows),
+        len(recipient_rows),
+        len(provider_rows),
     )
 
     results: list[dict] = []

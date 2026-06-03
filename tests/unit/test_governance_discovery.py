@@ -4,6 +4,7 @@ Covers the 11 new list_* methods on CatalogExplorer. Each helper mocks
 either spark.sql or the source Databricks SDK client; REST-based helpers
 assert the try/except safety net returns [] on failure.
 """
+
 from __future__ import annotations
 
 from unittest.mock import MagicMock
@@ -27,26 +28,46 @@ class TestListTags:
         def sql_side_effect(query):
             result = MagicMock()
             if "catalog_tags" in query:
-                result.collect.return_value = [_row(
-                    catalog_name="c", tag_name="env", tag_value="prod",
-                )]
+                result.collect.return_value = [
+                    _row(
+                        catalog_name="c",
+                        tag_name="env",
+                        tag_value="prod",
+                    )
+                ]
             elif "schema_tags" in query:
-                result.collect.return_value = [_row(
-                    schema_name="s", tag_name="team", tag_value="data",
-                )]
+                result.collect.return_value = [
+                    _row(
+                        schema_name="s",
+                        tag_name="team",
+                        tag_value="data",
+                    )
+                ]
             elif "table_tags" in query:
-                result.collect.return_value = [_row(
-                    table_name="t", tag_name="owner", tag_value="alice",
-                )]
+                result.collect.return_value = [
+                    _row(
+                        table_name="t",
+                        tag_name="owner",
+                        tag_value="alice",
+                    )
+                ]
             elif "column_tags" in query:
-                result.collect.return_value = [_row(
-                    table_name="t", column_name="email",
-                    tag_name="pii", tag_value="true",
-                )]
+                result.collect.return_value = [
+                    _row(
+                        table_name="t",
+                        column_name="email",
+                        tag_name="pii",
+                        tag_value="true",
+                    )
+                ]
             elif "volume_tags" in query:
-                result.collect.return_value = [_row(
-                    volume_name="v", tag_name="purpose", tag_value="raw",
-                )]
+                result.collect.return_value = [
+                    _row(
+                        volume_name="v",
+                        tag_name="purpose",
+                        tag_value="raw",
+                    )
+                ]
             else:
                 result.collect.return_value = []
             return result
@@ -69,15 +90,18 @@ class TestListTags:
 
 
 class TestListRowFilters:
+    """list_row_filters uses the UC Tables API (source_client.tables.list)
+    for authoritative row-filter detection — information_schema doesn't
+    reliably surface ``row_filter_name`` on every runtime."""
+
     def test_returns_table_and_filter_metadata(self, mock_spark):
-        mock_spark.sql.return_value.collect.return_value = [
-            _row(
-                table_name="orders",
-                row_filter_name="c.s.region_filter",
-                row_filter_input_columns=["region"],
-            )
-        ]
-        explorer = _explorer(mock_spark, MagicMock())
+        auth = MagicMock()
+        t = MagicMock()
+        t.name = "orders"
+        t.row_filter.function_name = "c.s.region_filter"
+        t.row_filter.input_column_names = ["region"]
+        auth.source_client.tables.list.return_value = [t]
+        explorer = _explorer(mock_spark, auth)
         rfs = explorer.list_row_filters("c", "s")
 
         assert len(rfs) == 1
@@ -86,29 +110,39 @@ class TestListRowFilters:
         assert rfs[0]["filter_columns"] == ["region"]
 
     def test_handles_missing_input_columns(self, mock_spark):
-        mock_spark.sql.return_value.collect.return_value = [
-            _row(
-                table_name="orders",
-                row_filter_name="c.s.f",
-                row_filter_input_columns=None,
-            )
-        ]
-        explorer = _explorer(mock_spark, MagicMock())
+        auth = MagicMock()
+        t = MagicMock()
+        t.name = "orders"
+        t.row_filter.function_name = "c.s.f"
+        t.row_filter.input_column_names = None
+        auth.source_client.tables.list.return_value = [t]
+        explorer = _explorer(mock_spark, auth)
         rfs = explorer.list_row_filters("c", "s")
         assert rfs[0]["filter_columns"] == []
+
+    def test_skips_tables_without_filter(self, mock_spark):
+        """Tables whose .row_filter is None are not returned."""
+        auth = MagicMock()
+        t = MagicMock()
+        t.name = "orders"
+        t.row_filter = None
+        auth.source_client.tables.list.return_value = [t]
+        explorer = _explorer(mock_spark, auth)
+        assert explorer.list_row_filters("c", "s") == []
 
 
 class TestListColumnMasks:
     def test_returns_column_mask_metadata(self, mock_spark):
-        mock_spark.sql.return_value.collect.return_value = [
-            _row(
-                table_name="users",
-                column_name="ssn",
-                mask_name="c.s.redact_ssn",
-                mask_using_columns=["role"],
-            )
-        ]
-        explorer = _explorer(mock_spark, MagicMock())
+        auth = MagicMock()
+        t = MagicMock()
+        t.name = "users"
+        col = MagicMock()
+        col.name = "ssn"
+        col.mask.function_name = "c.s.redact_ssn"
+        col.mask.using_column_names = ["role"]
+        t.columns = [col]
+        auth.source_client.tables.list.return_value = [t]
+        explorer = _explorer(mock_spark, auth)
         masks = explorer.list_column_masks("c", "s")
 
         assert len(masks) == 1
@@ -118,26 +152,82 @@ class TestListColumnMasks:
 
 
 class TestListPolicies:
-    def test_parses_rest_response(self):
+    def test_parses_per_securable_responses(self):
+        """Each (type, full_name) pair triggers one API call; results
+        deduplicated by (securable_fqn, policy_name)."""
+        auth = MagicMock()
+
+        def do(method, path, query=None):
+            q = query or {}
+            sec = q.get("on_securable_fullname")
+            typ = q.get("on_securable_type")
+            if typ == "TABLE" and sec == "c.s.t":
+                return {
+                    "policies": [
+                        {"name": "p1", "on_securable_type": "TABLE", "on_securable_fullname": "c.s.t"},
+                    ]
+                }
+            if typ == "SCHEMA" and sec == "c.s":
+                return {
+                    "policies": [
+                        {"name": "p2", "on_securable_type": "SCHEMA", "on_securable_fullname": "c.s"},
+                    ]
+                }
+            return {"policies": []}
+
+        auth.source_client.api_client.do.side_effect = do
+        explorer = _explorer(MagicMock(), auth)
+        policies = explorer.list_policies([("CATALOG", "c"), ("SCHEMA", "c.s"), ("TABLE", "c.s.t")])
+
+        assert len(policies) == 2
+        names = {p["policy_name"] for p in policies}
+        assert names == {"p1", "p2"}
+
+    def test_returns_empty_when_no_securables(self):
+        """No securables → no API calls, empty result (no workspace-level endpoint)."""
+        auth = MagicMock()
+        explorer = _explorer(MagicMock(), auth)
+        assert explorer.list_policies([]) == []
+        auth.source_client.api_client.do.assert_not_called()
+
+    def test_swallows_per_securable_errors(self):
+        """One securable 404-ing (preview disabled, perms) doesn't block
+        collection from the other securables."""
+        auth = MagicMock()
+
+        def do(method, path, query=None):
+            q = query or {}
+            if q.get("on_securable_fullname") == "c.s.t":
+                raise Exception("404 Not Found")
+            return {
+                "policies": [
+                    {
+                        "name": "p1",
+                        "on_securable_type": "CATALOG",
+                        "on_securable_fullname": "c",
+                    }
+                ]
+            }
+
+        auth.source_client.api_client.do.side_effect = do
+        explorer = _explorer(MagicMock(), auth)
+        policies = explorer.list_policies([("CATALOG", "c"), ("TABLE", "c.s.t")])
+        assert len(policies) == 1
+        assert policies[0]["policy_name"] == "p1"
+
+    def test_deduplicates_across_inherited_returns(self):
+        """If two securables return the same (securable, policy) pair
+        (could happen if include_inherited is ever flipped on), it's
+        emitted only once."""
         auth = MagicMock()
         auth.source_client.api_client.do.return_value = {
             "policies": [
-                {"name": "p1", "on_securable_fullname": "c.s.t"},
-                {"name": "p2", "on_securable_fullname": "c.s"},
+                {"name": "shared", "on_securable_type": "CATALOG", "on_securable_fullname": "c"},
             ]
         }
         explorer = _explorer(MagicMock(), auth)
-        policies = explorer.list_policies()
-
-        assert len(policies) == 2
-        assert policies[0]["policy_name"] == "p1"
-        assert policies[0]["definition"]["on_securable_fullname"] == "c.s.t"
-
-    def test_returns_empty_on_404(self):
-        auth = MagicMock()
-        auth.source_client.api_client.do.side_effect = Exception("404 Not Found")
-        explorer = _explorer(MagicMock(), auth)
-        assert explorer.list_policies() == []
+        policies = explorer.list_policies([("CATALOG", "c"), ("SCHEMA", "c.s")])
+        assert len(policies) == 1
 
 
 class TestListMonitors:
@@ -152,9 +242,7 @@ class TestListMonitors:
         auth.source_client.api_client.do.side_effect = do
         explorer = _explorer(MagicMock(), auth)
 
-        monitors = explorer.list_monitors(
-            ["`c`.`s`.`orders`", "`c`.`s`.`no_monitor`"]
-        )
+        monitors = explorer.list_monitors(["`c`.`s`.`orders`", "`c`.`s`.`no_monitor`"])
         assert len(monitors) == 1
         assert monitors[0]["table_fqn"] == "`c`.`s`.`orders`"
 
@@ -230,6 +318,34 @@ class TestListForeignCatalogs:
         assert len(foreign) == 1
         assert foreign[0]["catalog_name"] == "snow_foreign"
         assert foreign[0]["connection_name"] == "snowflake_conn"
+
+    def test_list_foreign_catalog_names_returns_names_only(self):
+        """``list_foreign_catalog_names`` returns a set of FOREIGN catalog
+        names — used by discovery to exclude them from schema/table
+        iteration where ``information_schema.tables`` would be JDBC-routed
+        and fail on the ``data_source_format`` column."""
+        auth = MagicMock()
+
+        def _cat(name, ctype):
+            c = MagicMock()
+            c.name = name
+            c.catalog_type = ctype
+            c.connection_name = None
+            c.options = {}
+            c.comment = None
+            return c
+
+        auth.source_client.catalogs.list.return_value = [
+            _cat("managed_a", "MANAGED_CATALOG"),
+            _cat("foreign_sqlsrv", "FOREIGN_CATALOG"),
+            _cat("managed_b", "MANAGED_CATALOG"),
+            _cat("foreign_snowflake", "FOREIGN_CATALOG"),
+        ]
+        explorer = _explorer(MagicMock(), auth)
+        names = explorer.list_foreign_catalog_names()
+
+        assert names == {"foreign_sqlsrv", "foreign_snowflake"}
+        assert isinstance(names, set)
 
 
 class TestListOnlineTables:

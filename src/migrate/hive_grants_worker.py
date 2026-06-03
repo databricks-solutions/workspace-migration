@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -49,7 +51,12 @@ def _is_notebook() -> bool:
 
 
 _OBJECT_TYPE_TO_SECURABLE = {
+    # Hive discovery classifies managed/external tables by storage location
+    # (dbfs-root vs non-dbfs vs external); for grants they're all TABLE.
     "hive_table": "TABLE",
+    "hive_external": "TABLE",
+    "hive_managed_dbfs_root": "TABLE",
+    "hive_managed_nondbfs": "TABLE",
     "hive_view": "VIEW",
     "hive_function": "FUNCTION",
 }
@@ -178,9 +185,6 @@ def _process_show_grants_rows(
 def run(dbutils, spark) -> None:
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    if not config.include_hive:
-        logger.info("Skipping hive_grants_worker: scope.include_hive=false.")
-        return
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
     wh_id = find_warehouse(auth)
@@ -227,9 +231,7 @@ def run(dbutils, spark) -> None:
         if schema_name and schema_name not in schemas_seen:
             schemas_seen.add(schema_name)
             try:
-                rows = spark.sql(
-                    f"SHOW GRANTS ON SCHEMA hive_metastore.`{schema_name}`"
-                ).collect()
+                rows = spark.sql(f"SHOW GRANTS ON SCHEMA hive_metastore.`{schema_name}`").collect()
                 target_schema_fqn = f"`{target_catalog}`.`{schema_name}`"
                 results.extend(
                     _process_show_grants_rows(
@@ -251,15 +253,11 @@ def run(dbutils, spark) -> None:
         # Object-level grants
         securable = _OBJECT_TYPE_TO_SECURABLE.get(object_type)
         if not securable:
-            logger.info(
-                "Skipping unknown object_type %s for %s.", object_type, object_name
-            )
+            logger.info("Skipping unknown object_type %s for %s.", object_type, object_name)
             continue
 
         try:
-            rows = spark.sql(
-                f"SHOW GRANTS ON {securable} {object_name}"
-            ).collect()
+            rows = spark.sql(f"SHOW GRANTS ON {securable} {object_name}").collect()
             target_obj_fqn = rewrite_hive_fqn(object_name, target_catalog)
             results.extend(
                 _process_show_grants_rows(
@@ -272,9 +270,7 @@ def run(dbutils, spark) -> None:
                 )
             )
         except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "Failed to read grants on %s %s: %s", securable, object_name, exc
-            )
+            logger.warning("Failed to read grants on %s %s: %s", securable, object_name, exc)
 
     # 3. Record final statuses
     if results:

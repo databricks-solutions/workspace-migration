@@ -1,0 +1,144 @@
+resources:
+  jobs:
+    negative_paths_integration_test:
+      name: "${var.job_prefix}-negative-paths-integration-test"
+      description: |
+        Integration X.3: negative-path coverage. Three scenarios verify the
+        migration tool fails loud-and-safe (or succeeds cleanly as a no-op)
+        when misconfigured:
+
+          X.3.1  Invalid spn_client_id              -> pre_check FAILs
+          X.3.2  Unreachable target_workspace_url   -> pre_check FAILs
+          X.3.3  No discoverable source objects     -> migrate SUCCEEDs as no-op
+
+        All three chains rewrite the same workspace ``config.yaml``, so they
+        run sequentially (not in parallel) — otherwise one chain's config
+        write races another chain's read. A single ``teardown`` at the end
+        restores ``config.yaml`` from the backup ``setup_X31_config`` took
+        at the very start.
+
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+
+      tasks:
+        # ---------- Scenario X.3.1: Invalid SPN ----------
+
+        - task_key: setup_X31_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+              inject_bad_spn_id: "true"
+
+        - task_key: trigger_X31_pre_check
+          depends_on:
+            - task_key: setup_X31_config
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check.py
+
+        - task_key: assert_X31
+          depends_on:
+            - task_key: trigger_X31_pre_check
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/test_negative_paths.py
+            base_parameters:
+              scenario: "X.3.1"
+              trigger_task_key: "trigger_X31_pre_check"
+              parent_run_id: "{{job.run_id}}"
+
+        # ---------- Scenario X.3.2: Unreachable target ----------
+        # depends on assert_X31 (not trigger_X31) so the bad-SPN scenario
+        # has already been asserted before we rewrite the config for the
+        # next injection.
+
+        - task_key: setup_X32_config
+          depends_on:
+            - task_key: assert_X31
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+              inject_unreachable_target: "true"
+
+        - task_key: trigger_X32_pre_check
+          depends_on:
+            - task_key: setup_X32_config
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check.py
+
+        - task_key: assert_X32
+          depends_on:
+            - task_key: trigger_X32_pre_check
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/test_negative_paths.py
+            base_parameters:
+              scenario: "X.3.2"
+              trigger_task_key: "trigger_X32_pre_check"
+              parent_run_id: "{{job.run_id}}"
+
+        # ---------- Scenario X.3.3: Empty discovery (no-op) ----------
+        # Not an error path — migrate should complete as SUCCESS even when
+        # discovery finds no objects to migrate. After WS-10 the scope
+        # flags (``include_uc`` / ``include_hive``) were removed; this
+        # scenario now relies on the fact that nothing has been seeded
+        # for the negative-paths run, so discovery emits an empty
+        # inventory, the for_each workers receive [] batches and skip,
+        # and summary finishes cleanly.
+
+        - task_key: setup_X33_config
+          depends_on:
+            - task_key: assert_X32
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+
+        - task_key: trigger_X33_migrate
+          depends_on:
+            - task_key: setup_X33_config
+          run_job_task:
+            job_id: ${resources.jobs.migrate_uc.id}
+
+        - task_key: assert_X33
+          depends_on:
+            - task_key: trigger_X33_migrate
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/test_negative_paths.py
+            base_parameters:
+              scenario: "X.3.3"
+              trigger_task_key: "trigger_X33_migrate"
+              parent_run_id: "{{job.run_id}}"
+
+        # ---------- Teardown: always restore config.yaml ----------
+        # ``ALL_DONE`` so the backup is restored even when multiple
+        # assertion tasks failed. Depends on every leaf task so the
+        # restore happens after all chains are done writing to config.yaml.
+
+        - task_key: teardown_config
+          depends_on:
+            - task_key: setup_X31_config
+            - task_key: trigger_X31_pre_check
+            - task_key: assert_X31
+            - task_key: setup_X32_config
+            - task_key: trigger_X32_pre_check
+            - task_key: assert_X32
+            - task_key: setup_X33_config
+            - task_key: trigger_X33_migrate
+            - task_key: assert_X33
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_negative_paths.py

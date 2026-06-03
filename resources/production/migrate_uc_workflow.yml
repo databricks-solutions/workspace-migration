@@ -1,0 +1,139 @@
+resources:
+  jobs:
+    migrate_uc:
+      name: "${var.job_prefix}-migrate-uc"
+      description: |
+        UC data plane migration: managed/external tables, views, volumes,
+        functions, mv/st, models, plus UC grants. Depends
+        operationally on the discovery job populating discovery_inventory
+        beforehand — run discovery first.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: setup_sharing
+          notebook_task:
+            notebook_path: ../../src/migrate/setup_sharing.py
+
+        - task_key: orchestrator
+          depends_on:
+            - task_key: setup_sharing
+          notebook_task:
+            notebook_path: ../../src/migrate/orchestrator.py
+
+        - task_key: migrate_managed_tables
+          depends_on:
+            - task_key: orchestrator
+          for_each_task:
+            inputs: "{{tasks.orchestrator.values.managed_table_batches}}"
+            task:
+              task_key: managed_table_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/managed_table_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_external_tables
+          depends_on:
+            - task_key: orchestrator
+          for_each_task:
+            inputs: "{{tasks.orchestrator.values.external_table_batches}}"
+            task:
+              task_key: external_table_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/external_table_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_volumes
+          depends_on:
+            - task_key: orchestrator
+          for_each_task:
+            inputs: "{{tasks.orchestrator.values.volume_batches}}"
+            task:
+              task_key: volume_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/volume_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_functions
+          depends_on:
+            - task_key: migrate_managed_tables
+            - task_key: migrate_external_tables
+          notebook_task:
+            notebook_path: ../../src/migrate/functions_worker.py
+
+        - task_key: migrate_views
+          depends_on:
+            - task_key: migrate_managed_tables
+            - task_key: migrate_external_tables
+            - task_key: migrate_functions
+          notebook_task:
+            notebook_path: ../../src/migrate/views_worker.py
+
+        - task_key: migrate_mv_st
+          depends_on:
+            - task_key: migrate_views
+          for_each_task:
+            inputs: "{{tasks.orchestrator.values.mv_batches}}"
+            task:
+              task_key: mv_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/mv_st_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_st
+          depends_on:
+            - task_key: migrate_views
+          for_each_task:
+            inputs: "{{tasks.orchestrator.values.st_batches}}"
+            task:
+              task_key: st_batch
+              notebook_task:
+                notebook_path: ../../src/migrate/mv_st_worker.py
+                base_parameters:
+                  batch: "{{input}}"
+
+        - task_key: migrate_grants
+          depends_on:
+            - task_key: migrate_views
+            - task_key: migrate_volumes
+            - task_key: migrate_mv_st
+            - task_key: migrate_st
+          notebook_task:
+            notebook_path: ../../src/migrate/grants_worker.py
+
+        - task_key: migrate_models
+          depends_on:
+            - task_key: migrate_grants
+          notebook_task:
+            notebook_path: ../../src/migrate/models_worker.py
+
+        - task_key: cleanup_staging
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../src/migrate/cleanup_staging.py
+            source: WORKSPACE
+          depends_on:
+            # Path A staging_copy: drops the staging tables that
+            # setup_sharing CTAS'd into cp_migration_staging once all
+            # consumers (managed + external) have completed their DEEP
+            # CLONEs. ``ALL_DONE`` so cleanup still runs after a worker
+            # failure — orphaned staging tables would otherwise need
+            # manual cleanup.
+            - task_key: migrate_managed_tables
+            - task_key: migrate_external_tables
+
+        - task_key: summary_uc
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_models
+            - task_key: cleanup_staging
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              # WS-2: Per-workflow filter — only UC object types.
+              # Values match what UC workers actually emit into
+              # migration_status. mv_st_worker emits "mv" and "st".
+              object_types: "managed_table,external_table,view,function,volume,mv,st,registered_model,grant"

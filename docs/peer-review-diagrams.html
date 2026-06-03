@@ -1,0 +1,188 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>workspace-migration — Peer Review Diagrams</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    max-width: 1200px;
+    margin: 2rem auto;
+    padding: 0 2rem;
+    color: #24292f;
+    background: #fff;
+  }
+  h1 { border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }
+  h2 { margin-top: 2.5rem; border-bottom: 1px solid #eaecef; padding-bottom: 0.3em; }
+  h3 { margin-top: 2rem; }
+  .mermaid {
+    background: #f6f8fa;
+    border: 1px solid #d0d7de;
+    border-radius: 6px;
+    padding: 1.5rem;
+    margin: 1rem 0;
+    text-align: center;
+    overflow-x: auto;
+  }
+  table { border-collapse: collapse; margin: 1rem 0; width: 100%; }
+  th, td { border: 1px solid #d0d7de; padding: 0.5rem 0.75rem; text-align: left; }
+  th { background: #f6f8fa; }
+  code { background: #f6f8fa; padding: 0.1em 0.4em; border-radius: 3px; font-size: 0.9em; }
+  p.lede { color: #57606a; font-style: italic; }
+</style>
+</head>
+<body>
+
+<h1>workspace-migration — Peer Review Diagrams</h1>
+<p class="lede">Two-minute orientation for a reviewer landing on this repo for the first time.</p>
+
+<h2>1. System view — four jobs + shared tracking</h2>
+
+<div class="mermaid">
+flowchart LR
+    subgraph SRC["Source workspace"]
+        S_UC[("UC catalogs/schemas/tables<br/>volumes, views, funcs, models")]
+        S_HIVE[("Hive metastore")]
+    end
+
+    subgraph TGT["Target workspace (tool runs here)"]
+        DISC["discovery job<br/><i>scans source via Delta Sharing</i>"]
+        UC["migrate_uc job<br/><i>data plane: tables/volumes/views/funcs/grants/models</i>"]
+        HIVE["migrate_hive job<br/><i>Hive external + managed tables</i>"]
+        GOV["migrate_governance job<br/><i>tags, RLS, column masks, comments,<br/>monitors, connections, fcat, shares</i>"]
+        TRACK[("migration_tracking.cp_migration<br/>• discovery_inventory<br/>• migration_status<br/>• pre_check_results")]
+    end
+
+    SRC -- "Delta Sharing<br/>(cp_migration_share)" --> DISC
+    DISC --> TRACK
+    DISC -. "upstream of (operator runs first)" .-> UC
+    DISC -. "upstream of" .-> HIVE
+    DISC -. "upstream of" .-> GOV
+    UC --> TRACK
+    HIVE --> TRACK
+    GOV --> TRACK
+</div>
+
+<p><strong>Key contracts</strong></p>
+<ul>
+  <li><code>discovery</code> is the single source-of-truth scan — UC/Hive/Governance workflows all consume <code>discovery_inventory</code>.</li>
+  <li><code>migrate_uc</code>, <code>migrate_hive</code>, <code>migrate_governance</code> are <strong>independent jobs</strong>. Operator decides ordering. Governance trusts the operator: target tables must already exist.</li>
+  <li>Every worker writes its own per-object row into <code>migration_status</code> (status + error_message + run_id). Re-runs filter by <code>get_pending_objects()</code>.</li>
+  <li>All compute is serverless. Auth via migration SPN (OAuth).</li>
+</ul>
+
+<h2>2. Inside <code>migrate_uc</code> — Path A staging-copy + worker chain</h2>
+
+<div class="mermaid">
+flowchart TD
+    A["<b>setup_sharing</b><br/>Path A: CTAS RLS/CM tables<br/>into cp_migration_staging<br/>(source RLS/CM stays intact)"]
+    B["<b>orchestrator</b><br/>builds for_each batches<br/>by byte size"]
+
+    C1["<b>managed_table_worker</b><br/>DEEP CLONE from share<br/>(via staging for RLS/CM)"]
+    C2["<b>external_table_worker</b><br/>DDL replay"]
+    C3["<b>volume_worker</b><br/>ALTER SHARE ADD VOLUME<br/>+ target-side dbutils.fs.cp"]
+
+    D["<b>functions_worker</b><br/>SQL + Python UDF DDL"]
+    E["<b>views_worker</b>"]
+
+    F1["<b>mv_st_worker</b><br/>📌 hard-exclude<br/>→ skipped_by_stateful_service"]
+    F2["<b>grants_worker</b>"]
+
+    G1["<b>models_worker</b><br/>UC registered models<br/>+ aliases + artifacts"]
+    G2["<b>online_tables_worker</b><br/>📌 hard-exclude<br/>→ skipped_by_stateful_service"]
+
+    H["<b>cleanup_staging</b><br/><i>run_if: ALL_DONE</i><br/>drops cp_migration_staging tables"]
+    I["<b>summary_uc</b><br/>per-workflow report<br/>(UC object types only)"]
+
+    A --> B
+    B --> C1
+    B --> C2
+    B --> C3
+    C1 --> D
+    C2 --> D
+    D --> E
+    E --> F1
+    E --> F2
+    C3 --> F2
+    F1 --> F2
+    F2 --> G1
+    F2 --> G2
+    C1 --> H
+    C2 --> H
+    G1 --> I
+    G2 --> I
+    H --> I
+</div>
+
+<p><strong>Reviewer focus areas</strong></p>
+<table>
+  <tr><th>Area</th><th>File</th><th>Why it matters</th></tr>
+  <tr><td>Path A staging copy</td><td><code>src/migrate/setup_sharing.py</code>, <code>src/migrate/cleanup_staging.py</code></td><td>RLS/CM tables — source is never stripped. Replaced the old <code>drop_and_restore</code> risk class.</td></tr>
+  <tr><td>Worker idempotency</td><td><code>src/migrate/*_worker.py</code> + <code>src/common/tracking.py:get_pending_objects</code></td><td>Every worker re-runnable; status driven by <code>migration_status</code> LEFT JOIN on discovery.</td></tr>
+  <tr><td>Batching</td><td><code>src/migrate/batching.py</code></td><td>Byte-size for_each batches; oversize objects emit terminal-failed.</td></tr>
+  <tr><td>Path A target copy</td><td><code>src/migrate/target_copy.py</code></td><td>Share-propagation retry for volumes.</td></tr>
+  <tr><td>Hard-excluded types</td><td><code>mv_st_worker.py</code>, <code>online_tables_worker.py</code></td><td>Stateful services → out of scope, deliberate skip status.</td></tr>
+</table>
+
+<h2>3. Code layout (where things live)</h2>
+
+<div class="mermaid">
+flowchart LR
+    subgraph src["src/"]
+        subgraph common["common/ (cross-cutting)"]
+            CFG["config.py"]
+            AUTH["auth.py"]
+            CU["catalog_utils.py"]
+            TR["tracking.py<br/><i>migration_status I/O</i>"]
+            VAL["validation.py"]
+            SQL["sql_utils.py"]
+            REG["registry.py"]
+        end
+
+        DISC["discovery/<br/>discovery.py"]
+
+        subgraph pc["pre_check/"]
+            PC["pre_check.py"]
+            PCG["pre_check_governance.py"]
+            CD["collision_detection.py"]
+        end
+
+        subgraph mig["migrate/"]
+            ORCH["orchestrator.py<br/>hive_orchestrator.py<br/><i>build for_each batches</i>"]
+            UCW["UC workers (9)<br/>managed_table · external_table<br/>volume · views · functions<br/>mv_st · online_tables<br/>models · grants"]
+            HW["Hive workers (6)<br/>external · managed_dbfs<br/>managed_nondbfs · views<br/>functions · grants"]
+            GW["Governance workers (9)<br/>tags · row_filters · column_masks<br/>policies · comments · monitors<br/>connections · foreign_catalogs · sharing"]
+            SS["Path A scaffolding<br/>setup_sharing.py<br/>cleanup_staging.py<br/>rls_cm.py"]
+            HELP["Shared helpers<br/>batching.py · target_copy.py<br/>reconciliation.py · summary.py"]
+        end
+    end
+
+    UCW -.-> common
+    HW -.-> common
+    GW -.-> common
+    DISC -.-> common
+    PC -.-> common
+    ORCH -.-> common
+    SS -.-> common
+    HELP -.-> common
+</div>
+
+<h2>Glossary</h2>
+<ul>
+  <li><strong>Path A</strong> — staging-copy approach for RLS/CM tables: CTAS into <code>cp_migration_staging</code>, share the staging copy, never strip source.</li>
+  <li><strong>UC</strong> vs <strong>Hive</strong> vs <strong>Governance</strong> — three independent production jobs. No global <code>migrate_all</code> umbrella.</li>
+  <li><strong>for_each batches</strong> — Databricks workflow <code>for_each</code> task with byte-sized inputs from orchestrator task values.</li>
+  <li><strong>Stateful services</strong> — DLT, Lakebase, Vector Search, Model Serving, Apps, ST, MV, Online Tables. Out of scope; deliberate <code>skipped_by_stateful_service_migration</code> status.</li>
+</ul>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { curve: 'basis', useMaxWidth: true }
+  });
+</script>
+
+</body>
+</html>

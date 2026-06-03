@@ -3,8 +3,10 @@
 # COMMAND ----------
 
 from __future__ import annotations  # noqa: E402
+
 # Bootstrap: put the bundle's `src/` dir on sys.path so `from common...` imports resolve
 import sys  # noqa: E402
+
 try:
     _ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()  # noqa: F821
     _nb = _ctx.notebookPath().get()
@@ -17,7 +19,7 @@ except NameError:
 # COMMAND ----------
 # UC Orchestrator: reads discovery inventory (source_type='uc'), builds
 # batches per object type, and publishes them as task values for downstream
-# workers. Skipped when config.scope.include_uc is false.
+# workers.
 
 import json
 import logging
@@ -30,20 +32,65 @@ logger = logging.getLogger("orchestrator")
 
 
 # COMMAND ----------
-# Batching helper — importable for unit tests
+from migrate.batching import (  # noqa: E402
+    MAX_BATCH_BYTES,
+    _strip_heavy_fields,
+    build_batches,
+)
+from migrate.reconciliation import (  # noqa: E402
+    reconcile_stale_runs,
+    resolve_current_job_run_id,
+)
 
 
-def build_batches(objects: list[dict], batch_size: int) -> list[str]:
-    """Split a list of object dicts into JSON-encoded batch strings.
+def check_collision_gate(spark, config) -> None:
+    """Raise when the latest pre_check_results has any target_collision FAILs.
 
-    Each returned string is a JSON array of dicts, with at most *batch_size*
-    elements.
+    X.4 fail-fast gate. Looks only at the latest row per ``check_name`` in
+    ``pre_check_results`` so a prior run's FAIL that has since been
+    resolved (operator dropped the colliding target object and re-ran
+    pre_check) doesn't block this migrate.
+
+    No-op when:
+        - pre_check_results doesn't exist (fresh install, should be
+          impossible because tracking.init_tracking_tables() creates it,
+          but defensive: raise a clearer error than a metastore 404).
+        - No target_collision row exists (pre_check hasn't been run with
+          discovery, or discovery inventory was empty).
+        - Latest target_collision row is PASS or WARN (skip policy).
+
+    Raises:
+        RuntimeError: when the latest ``check_target_collisions`` pre_check
+            row is FAIL, instructing the operator to rerun pre_check after
+            resolving or flipping ``on_target_collision`` to ``skip``.
     """
-    batches: list[str] = []
-    for i in range(0, len(objects), batch_size):
-        chunk = objects[i : i + batch_size]
-        batches.append(json.dumps(chunk, default=str))
-    return batches
+    fqn = f"{config.tracking_catalog}.{config.tracking_schema}.pre_check_results"
+    try:
+        rows = spark.sql(
+            f"""
+            SELECT status, message
+            FROM (
+                SELECT *, ROW_NUMBER() OVER (
+                    PARTITION BY check_name ORDER BY checked_at DESC
+                ) AS rn
+                FROM {fqn}
+            )
+            WHERE rn = 1 AND check_name = 'check_target_collisions'
+            """
+        ).collect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read pre_check_results for collision gate: %s", exc)
+        return
+    for r in rows:
+        if (r.status or "").upper() == "FAIL":
+            msg = (
+                "Migrate refused to start: latest pre_check recorded a "
+                "target_collision FAIL. Resolve the colliding target "
+                "object(s), or flip on_target_collision to 'skip', then "
+                "rerun pre_check. Details: "
+                + (r.message or "(no message)")
+            )
+            raise RuntimeError(msg)
 
 
 # COMMAND ----------
@@ -58,92 +105,132 @@ def _is_notebook() -> bool:
         return False
 
 
-# Keys published by this orchestrator — declared up top so we can emit empty
-# task values when scope.include_uc is false (downstream for_each tasks
-# consume these and would block otherwise).
-_BATCH_KEYS = (
-    "managed_table_batches",
-    "external_table_batches",
-    "volume_batches",
-    "mv_batches",
-    "st_batches",
-)
-_LIST_KEYS = (
-    "function_list",
-    "view_list",
-    # Phase 3 Tier A
-    "tag_list",
-    "row_filter_list",
-    "column_mask_list",
-    "policy_list",
-    # Phase 3 Tier B
-    "comment_list",
-    # Phase 3 Tier C
-    "monitor_list",
-    "registered_model_list",
-    "connection_list",
-    "foreign_catalog_list",
-    # Phase 3 Tier D
-    "share_list",
-    "recipient_list",
-    "provider_list",
-    "online_table_list",
-)
-
-
-def _publish_empty_task_values(dbutils) -> None:
-    for key in _BATCH_KEYS:
-        dbutils.jobs.taskValues.set(key=key, value=json.dumps([]))
-    for key in _LIST_KEYS:
-        dbutils.jobs.taskValues.set(key=key, value=json.dumps([]))
-
-
 # COMMAND ----------
 # Notebook execution
 
 if _is_notebook():
     config = MigrationConfig.from_workspace_file()  # type: ignore[name-defined] # noqa: F821
-    if not config.include_uc:
-        logger.info("Skipping UC orchestrator: scope.include_uc=false.")
-        _publish_empty_task_values(dbutils)  # type: ignore[name-defined] # noqa: F821
-    else:
-        spark_session = spark  # type: ignore[name-defined] # noqa: F821
-        tracker = TrackingManager(spark_session, config)
+    # X.4: fail-fast when the latest pre_check flagged a target_collision.
+    # Hive-target collisions are covered by detect_collisions too, so the
+    # gate runs unconditionally here.
+    check_collision_gate(spark, config)  # type: ignore[name-defined] # noqa: F821
 
-        # Read discovery inventory and collect pending objects per type
-        BATCHED_TYPES = ("managed_table", "external_table", "volume", "mv", "st")
-        LIST_TYPES = (
-            "function", "view",
-            # Phase 3 governance object types — published even when counts
-            # are zero so downstream worker tasks always have a valid JSON
-            # payload to consume.
-            "tag", "row_filter", "column_mask", "policy",
-            "comment",
-            "monitor", "registered_model", "connection", "foreign_catalog",
-            "share", "recipient", "provider", "online_table",
+    # X.1: reconcile orphaned in_progress rows from a prior crashed run
+    # before dispatching workers. Runs ONCE here; workers themselves do
+    # not re-run reconciliation. Called after the collision gate so
+    # target-pre-existing-state failures fail-fast without triggering
+    # cleanup hooks. Reconciliation operates on UC + governance workers;
+    # the Hive chain has its own idempotency guarantees (audit:
+    # TestHive*Idempotency).
+    from common.auth import AuthManager  # noqa: E402 local import for notebook speed
+
+    _job_run_id = resolve_current_job_run_id(dbutils)  # type: ignore[name-defined] # noqa: F821
+    _auth = AuthManager(config, dbutils)  # type: ignore[name-defined] # noqa: F821
+    _tracker = TrackingManager(spark, config)  # type: ignore[name-defined] # noqa: F821
+    try:
+        _recon = reconcile_stale_runs(
+            spark=spark,  # type: ignore[name-defined] # noqa: F821
+            config=config,
+            tracker=_tracker,
+            auth=_auth,
+            current_job_run_id=_job_run_id,
         )
+        logger.info(
+            "Reconciliation complete: reset=%d validation_failed=%d cleanup_hooks=%d",
+            _recon["reset_count"],
+            _recon["validation_failed_count"],
+            _recon["cleanup_count"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Reconciliation failure must not block a migrate: the worst case is
+        # that workers re-pickup orphaned rows and their X.2 idempotency
+        # tolerates "already exists" on retry. Surface loudly and continue.
+        logger.warning("Reconciliation pass raised, continuing with migrate: %s", exc)
 
-        batch_output: dict[str, list[str]] = {}
-        list_output: dict[str, str] = {}
+    spark_session = spark  # type: ignore[name-defined] # noqa: F821
+    tracker = TrackingManager(spark_session, config)
 
-        for obj_type in BATCHED_TYPES:
-            pending = tracker.get_pending_objects(obj_type)
-            logger.info("Pending %s: %d objects", obj_type, len(pending))
-            batches = build_batches(pending, config.batch_size)
-            batch_output[f"{obj_type}_batches"] = batches
+    # Read discovery inventory and collect pending objects per type
+    BATCHED_TYPES = ("managed_table", "external_table", "volume", "mv", "st")
+    LIST_TYPES = (
+        "function",
+        "view",
+        # Phase 3 governance object types — published even when counts
+        # are zero so downstream worker tasks always have a valid JSON
+        # payload to consume. ``comment`` is intentionally excluded:
+        # comments_worker reads discovery_inventory directly because
+        # comments span table / view / column / volume / schema / catalog
+        # and a flat ``comment_list`` was never a natural fit.
+        "tag",
+        "row_filter",
+        "column_mask",
+        "policy",
+        "monitor",
+        "registered_model",
+        "connection",
+        "foreign_catalog",
+        "share",
+        "recipient",
+        "provider",
+        "online_table",
+        # Stateful Services Phase — consumed by the migrate_vector_search job's
+        # worker. Harmless for other jobs; they ignore the published list.
+        "vector_search_index",
+    )
 
-        for obj_type in LIST_TYPES:
-            pending = tracker.get_pending_objects(obj_type)
-            logger.info("Pending %s: %d objects", obj_type, len(pending))
-            list_output[f"{obj_type}_list"] = json.dumps(pending, default=str)
+    batch_output: dict[str, list[str]] = {}
+    list_output: dict[str, str] = {}
 
-        # Publish task values for downstream workers
-        for key, batches in batch_output.items():
-            dbutils.jobs.taskValues.set(key=key, value=json.dumps(batches))  # type: ignore[name-defined] # noqa: F821
-            logger.info("Published %s: %d batches", key, len(batches))
+    for obj_type in BATCHED_TYPES:
+        pending = tracker.get_pending_objects(obj_type)
+        logger.info("Pending %s: %d objects", obj_type, len(pending))
+        batches, oversize = build_batches(pending, config.batch_size)
+        batch_output[f"{obj_type}_batches"] = batches
+        if oversize:
+            # H6: objects whose stripped JSON exceeds MAX_BATCH_BYTES are
+            # skipped from batches (for_each would crash the whole batch).
+            # Record terminal-failed status so the operator sees the
+            # misconfiguration and get_pending_objects stops re-picking them.
+            tracker.append_migration_status(
+                [
+                    {
+                        "object_name": o["object_name"],
+                        "object_type": o["object_type"],
+                        "status": "failed_batch_oversize",
+                        "error_message": (
+                            f"Stripped object JSON exceeds MAX_BATCH_BYTES={MAX_BATCH_BYTES}. "
+                            "Trim heavy metadata (e.g. very long create_statement) or split the object."
+                        ),
+                        "job_run_id": str(_job_run_id),
+                        "task_run_id": None,
+                        "source_row_count": None,
+                        "target_row_count": None,
+                        "duration_seconds": None,
+                    }
+                    for o in oversize
+                ]
+            )
+            logger.error(
+                "Skipped %d %s object(s) from batches due to size cap: %s",
+                len(oversize),
+                obj_type,
+                [o.get("object_name") for o in oversize],
+            )
 
-        for key, value in list_output.items():
-            dbutils.jobs.taskValues.set(key=key, value=value)  # type: ignore[name-defined] # noqa: F821
-            logger.info("Published %s", key)
+    for obj_type in LIST_TYPES:
+        pending = tracker.get_pending_objects(obj_type)
+        logger.info("Pending %s: %d objects", obj_type, len(pending))
+        # Strip heavy fields for the same reason as batched types — the
+        # aggregated list is also subject to the 3000-byte task-value limit.
+        list_output[f"{obj_type}_list"] = json.dumps(_strip_heavy_fields(pending), default=str)
 
-        logger.info("Orchestrator complete.")
+    # Publish task values for downstream workers
+    for key, batches in batch_output.items():
+        dbutils.jobs.taskValues.set(key=key, value=json.dumps(batches))  # type: ignore[name-defined] # noqa: F821
+        logger.info("Published %s: %d batches", key, len(batches))
+
+    for key, value in list_output.items():
+        dbutils.jobs.taskValues.set(key=key, value=value)  # type: ignore[name-defined] # noqa: F821
+        logger.info("Published %s", key)
+
+    logger.info("Orchestrator complete.")

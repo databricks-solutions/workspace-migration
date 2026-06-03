@@ -23,13 +23,6 @@ spn_client_id: REPLACE_WITH_APPLICATION_ID
 spn_secret_scope: migration
 spn_secret_key: spn-secret
 
-# --- Scope: which source metastore domains to discover/migrate ---
-# Default: UC only. Set include_hive=true to also cover the legacy
-# hive_metastore catalog (discovery + migrate workflows will run Hive steps).
-scope:
-  include_uc: true
-  include_hive: false
-
 # --- Scoping ---
 # Comma-separated; leave empty to include everything.
 catalog_filter: ""
@@ -48,3 +41,42 @@ tracking_schema: cp_migration
 migrate_hive_dbfs_root: false
 hive_dbfs_target_path: ""
 hive_target_catalog: hive_upgraded
+
+# --- Iceberg managed tables (Phase 2.5.B) ---
+# Set to "ddl_replay" to opt into Option A (CREATE TABLE + INSERT INTO
+# via cp_migration_share). Loses snapshot history, time travel, branches
+# and tags. Leave empty to skip Iceberg tables.
+iceberg_strategy: ""
+
+# --- Row filter / column mask on managed tables ---
+# Delta Sharing refuses to share tables protected by legacy RLS/CM.
+# ""              — default: skip with status skipped_by_rls_cm_policy
+# "staging_copy"  — CTAS each affected table into the tracking catalog's
+#                   cp_migration_staging schema, share that copy, DEEP
+#                   CLONE on target, re-apply RLS/CM on target. Source
+#                   RLS/CM untouched. Requires the migration SPN to be
+#                   a workspace admin (admin-bypass in the source filter).
+rls_cm_strategy: ""
+
+# --- Online Tables -> Lakebase synced table migration (migrate_online_tables) ---
+# The job creates this Lakebase database instance if it does not exist.
+lakebase_instance_name: cp-migration-lakebase
+lakebase_logical_database: databricks_postgres
+lakebase_capacity: CU_1
+
+# --- Target pre-existing state / collision handling (X.4) ---
+# What to do when a discovered source object has the same FQN as an
+# object already on target, and no migration_status row says we
+# created it (someone else put it there: leftover dev fixture, manual
+# customer provisioning, prior tool run under a different tracking
+# catalog, etc.).
+#
+#   "fail"  (default) — pre_check emits a FAIL target_collision row
+#                       and migrate refuses to start. Operator must
+#                       rename, drop, or move the colliding object
+#                       off target, then rerun pre_check.
+#   "skip"  — pre_check emits a WARN row and seeds a
+#             skipped_target_exists migration_status row per collision
+#             so workers skip each one. Target object is left untouched.
+on_target_collision: "fail"
+
