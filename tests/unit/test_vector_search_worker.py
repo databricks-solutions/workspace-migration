@@ -160,12 +160,14 @@ class TestMigrateIndex:
         client.vector_search_indexes.create_index.assert_not_called()
 
     def test_already_exists_is_skipped_target_exists(self):
+        from databricks.sdk.errors import AlreadyExists
+
         from migrate.vector_search_worker import migrate_index
         client = MagicMock()
         ep = MagicMock()
         ep.endpoint_status.state = "ONLINE"
         client.vector_search_endpoints.get_endpoint.return_value = ep
-        client.vector_search_indexes.create_index.side_effect = Exception("RESOURCE_ALREADY_EXISTS: index exists")
+        client.vector_search_indexes.create_index.side_effect = AlreadyExists("index exists")
         res = migrate_index(client, self._row(self._delta_def()),
                             sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res["status"] == "skipped_target_exists"
@@ -181,3 +183,14 @@ class TestMigrateIndex:
                             sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res["status"] == "failed"
         assert "boom" in res["error_message"]
+
+    def test_missing_definition_is_failed(self):
+        import json
+
+        from migrate.vector_search_worker import migrate_index
+        client = MagicMock()
+        row = {"object_name": "cat.sch.idx", "object_type": "vector_search_index",
+               "metadata_json": json.dumps({})}  # no "definition"
+        res = migrate_index(client, row, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
+        assert res["status"] == "failed"
+        client.vector_search_indexes.create_index.assert_not_called()

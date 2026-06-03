@@ -105,11 +105,6 @@ def _ensure_endpoint(
     return False
 
 
-def _is_already_exists(exc: Exception) -> bool:
-    msg = str(exc).upper()
-    return "ALREADY_EXISTS" in msg or "ALREADY EXISTS" in msg
-
-
 def migrate_index(
     target_client,
     row: dict,
@@ -133,6 +128,9 @@ def migrate_index(
 
     meta = json.loads(row.get("metadata_json") or "{}")
     definition = meta.get("definition") or {}
+
+    if not definition:
+        return _result("failed", "discovery row has no 'definition' in metadata_json — cannot migrate index.")
 
     if not _is_delta_sync(definition):
         return _result(
@@ -162,9 +160,9 @@ def migrate_index(
             index_type=VectorIndexType.DELTA_SYNC,
             delta_sync_index_spec=_build_delta_sync_spec(definition),
         )
+    except AlreadyExists as exc:
+        return _result("skipped_target_exists", f"Index already exists on target: {exc}")
     except Exception as exc:  # noqa: BLE001
-        if _is_already_exists(exc):
-            return _result("skipped_target_exists", f"Index already exists on target: {exc}")
         return _result("failed", f"create_index failed: {exc}")
 
     return _result("created_resync_pending", None)
