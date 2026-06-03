@@ -79,7 +79,11 @@ _row = discovery_row(
             "spec": {
                 "source_table_full_name": _TABLE,
                 "primary_key_columns": ["id"],
-                "run_triggered": {},
+                # SNAPSHOT mode (perform_full_copy) → worker maps to
+                # SyncedTableSchedulingPolicy.SNAPSHOT, which does NOT require the
+                # auto_cdf preview. TRIGGERED/CONTINUOUS incremental sync needs the
+                # auto_cdf preview enabled on the target workspace (see user guide).
+                "perform_full_copy": True,
             },
         },
     },

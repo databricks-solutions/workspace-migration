@@ -550,6 +550,15 @@ ORDER BY status, object_name;
 - **Primary key mandatory.** If the source Delta table was migrated
   without a primary key, synced-table creation will fail. Verify the
   target table schema before running.
+- **Auto CDF preview for incremental sync.** Online tables in
+  **triggered** or **continuous** sync mode map to synced tables that
+  need incremental sync, which requires the **auto_cdf preview** enabled
+  on the target workspace. If it is not enabled, the synced-table
+  creation fails with a clear `failed` status (message: *"Incremental
+  sync ... requires Auto CDF ... Enable the auto_cdf preview for this
+  workspace or use snapshot scheduling policy"*). Enable the preview on
+  the target, or migrate those as **snapshot** mode. Snapshot-mode online
+  tables are unaffected.
 
 ### Step 9 — Verify
 

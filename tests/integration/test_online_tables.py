@@ -46,11 +46,13 @@ summary: str = ""
 def _latest_status(fqn: str):
     _safe = fqn.replace("'", "''")
     rows = spark.sql(  # noqa: F821
-        "SELECT status FROM migration_tracking.cp_migration.migration_status "
+        "SELECT status, error_message FROM migration_tracking.cp_migration.migration_status "
         f"WHERE object_type = 'online_table' AND object_name = '{_safe}' "
         "ORDER BY migrated_at DESC LIMIT 1"
     ).collect()
-    return rows[0]["status"] if rows else None
+    if not rows:
+        return None, None
+    return rows[0]["status"], rows[0]["error_message"]
 
 
 def _synced_exists(fqn: str) -> bool:
@@ -62,7 +64,7 @@ def _synced_exists(fqn: str) -> bool:
 
 
 # COMMAND ----------
-_status = _latest_status(_OT_FQN)
+_status, _err = _latest_status(_OT_FQN)
 
 if _status == "skipped_instance_not_ready":
     summary = "skipped_instance_not_ready"
@@ -76,7 +78,7 @@ elif _status == "created_resync_pending" and _synced_exists(_OT_FQN):
 else:
     summary = "FAILED"
     if _status != "created_resync_pending":
-        errors.append(f"{_OT_FQN} status={_status!r}, expected 'created_resync_pending'")
+        errors.append(f"{_OT_FQN} status={_status!r} (error_message={_err!r}), expected 'created_resync_pending'")
     if not _synced_exists(_OT_FQN):
         errors.append(f"{_OT_FQN} synced table not found on target — migration did not create it")
 
