@@ -123,3 +123,25 @@ class TestMigrate:
         res = migrate_online_table(client, row, _config(), sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
         assert res["status"] == "failed"
         client.database.create_synced_database_table.assert_not_called()
+
+    def test_already_exists_on_instance_create_falls_through_to_poll(self):
+        # Concurrency race: get() fails (absent), create_database_instance hits
+        # AlreadyExists (another worker beat us), then polling finds it AVAILABLE.
+        client = MagicMock()
+        client.database.get_database_instance.side_effect = [Exception("nf"), _ready_instance()]
+        client.database.create_database_instance.side_effect = AlreadyExists("race")
+        res = migrate_online_table(client, _row(_definition()), _config(),
+                                   sleep_fn=lambda s: None, max_attempts=3, sleep_seconds=0)
+        assert res["status"] == "created_resync_pending"
+
+    def test_existing_instance_not_available_polls_without_creating(self):
+        # Instance exists but is STARTING (not AVAILABLE): must NOT call create,
+        # poll until AVAILABLE, then create the synced table.
+        client = MagicMock()
+        starting = MagicMock()
+        starting.state = "STARTING"
+        client.database.get_database_instance.side_effect = [starting, _ready_instance()]
+        res = migrate_online_table(client, _row(_definition()), _config(),
+                                   sleep_fn=lambda s: None, max_attempts=3, sleep_seconds=0)
+        assert res["status"] == "created_resync_pending"
+        client.database.create_database_instance.assert_not_called()
