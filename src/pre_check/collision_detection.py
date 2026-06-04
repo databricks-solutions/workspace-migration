@@ -42,6 +42,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from databricks.sdk.errors import NotFound
+
 if TYPE_CHECKING:
     from databricks.sdk import WorkspaceClient
 
@@ -68,7 +70,7 @@ def _catalog_exists(client: WorkspaceClient, name: str) -> bool:
     try:
         client.catalogs.get(name=name)
         return True
-    except Exception:  # noqa: BLE001 — 404 / NotFound / RESOURCE_DOES_NOT_EXIST
+    except NotFound:  # 404 / RESOURCE_DOES_NOT_EXIST (covers ResourceDoesNotExist subclass)
         return False
 
 
@@ -76,7 +78,7 @@ def _schema_exists(client: WorkspaceClient, full_name: str) -> bool:
     try:
         client.schemas.get(full_name=full_name)
         return True
-    except Exception:  # noqa: BLE001
+    except NotFound:
         return False
 
 
@@ -84,7 +86,7 @@ def _table_exists(client: WorkspaceClient, full_name: str) -> bool:
     try:
         client.tables.get(full_name=full_name)
         return True
-    except Exception:  # noqa: BLE001
+    except NotFound:
         return False
 
 
@@ -92,7 +94,7 @@ def _function_exists(client: WorkspaceClient, full_name: str) -> bool:
     try:
         client.functions.get(name=full_name)
         return True
-    except Exception:  # noqa: BLE001
+    except NotFound:
         return False
 
 
@@ -100,7 +102,7 @@ def _volume_exists(client: WorkspaceClient, full_name: str) -> bool:
     try:
         client.volumes.read(name=full_name)
         return True
-    except Exception:  # noqa: BLE001
+    except NotFound:
         return False
 
 
@@ -221,13 +223,33 @@ def detect_collisions(
                 continue
             target_fqn = _normalize_full_name(object_name)
 
-        if probe(target_client, target_fqn):
+        # Fail CLOSED (review finding #10): the probe maps only a genuine
+        # NotFound to "absent". Any OTHER error (PermissionDenied, transient,
+        # auth) must NOT be silently read as "doesn't exist → safe" — we can't
+        # confirm the target is clear, so we emit a check-failure record that
+        # the caller turns into a FAIL (never a silent skip).
+        try:
+            exists = probe(target_client, target_fqn)
+        except Exception as exc:  # noqa: BLE001 — unexpected probe error → fail closed
             collisions.append(
                 {
                     "object_type": object_type,
                     "source_fqn": object_name,
                     "target_fqn": target_fqn,
                     "source_type": source_type,
+                    "check_failed": True,
+                    "error": str(exc),
+                }
+            )
+            continue
+        if exists:
+            collisions.append(
+                {
+                    "object_type": object_type,
+                    "source_fqn": object_name,
+                    "target_fqn": target_fqn,
+                    "source_type": source_type,
+                    "check_failed": False,
                 }
             )
     return collisions
@@ -240,6 +262,10 @@ def build_skip_status_rows(collisions: list[dict]) -> list[dict]:
     object_name) pair of the source object so ``get_pending_objects``
     filters the row out on the next migrate run, short-circuiting the
     worker before it touches the target object.
+
+    Check-failure records (``check_failed=True``) are NEVER turned into skip
+    rows — skipping an object whose target state we couldn't verify is exactly
+    the unsafe outcome. The caller surfaces those as a FAIL instead.
     """
     return [
         {
@@ -257,4 +283,5 @@ def build_skip_status_rows(collisions: list[dict]) -> list[dict]:
             "duration_seconds": None,
         }
         for c in collisions
+        if not c.get("check_failed")
     ]

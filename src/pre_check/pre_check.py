@@ -519,6 +519,27 @@ def run(dbutils, spark):  # noqa: D103
                 f"Target has no pre-existing object among {len(discovery_dicts)} discovered source objects.",
             )
         else:
+            # Fail CLOSED (review finding #10): records the probe couldn't
+            # verify (PermissionDenied / transient) are surfaced as a FAIL
+            # regardless of policy — we must never proceed against a target we
+            # couldn't confirm is clear, and must never silently skip it.
+            check_failures = [c for c in collisions if c.get("check_failed")]
+            collisions = [c for c in collisions if not c.get("check_failed")]
+            if check_failures:
+                cf_sample = [
+                    f"{c['object_type']} {c['target_fqn']}: {c.get('error', 'unknown error')}"
+                    for c in check_failures[:5]
+                ]
+                _add(
+                    "check_target_collisions",
+                    "FAIL",
+                    f"{len(check_failures)} target object(s) could not be collision-checked "
+                    f"(probe errored — failing closed). Sample: {cf_sample}",
+                    "The migration SPN likely lacks read access on the target, or a "
+                    "transient error occurred. Grant the SPN read on the target objects "
+                    "and re-run pre-check; do NOT migrate until collision detection completes.",
+                )
+        if collisions:
             policy = (config.on_target_collision or "fail").lower()
             grouped: dict[str, list[str]] = {}
             for c in collisions:
