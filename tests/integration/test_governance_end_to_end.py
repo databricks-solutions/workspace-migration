@@ -207,6 +207,43 @@ else:
     print(f"Phase 3 T32 validated: {len(comment_rows)} comment row(s) replayed.")
 
 # COMMAND ----------
+# --- Coverage guard: every governance-owned in-scope type must be EXERCISED ---
+# Makes "not tested" RED instead of a silent green. The governance suite
+# (migrate_governance) owns these types. A type is "exercised" when
+# migration_status has a row in its expected terminal state. Anything not
+# exercised and not explicitly exempted-with-reason fails the run, naming it.
+_GOV_EXPECTED = {
+    "tag": {"validated"},
+    "comment": {"validated"},
+    "row_filter": {"validated"},
+    "column_mask": {"validated"},
+    "policy": {"validated"},
+    "monitor": {"validated"},
+    "connection": {"validated"},
+    "foreign_catalog": {"validated"},
+    "share": {"validated"},
+    "recipient": {"validated"},
+    "provider": {"validated"},
+}
+# type -> reason (surfaced, never silent). Empty = enforce all.
+_GOV_COVERAGE_EXEMPT: dict[str, str] = {}
+_gov_cov = tracker.get_latest_migration_status()
+_gov_by_type: dict[str, set] = {}
+for _r in _gov_cov.select("object_type", "status").distinct().collect():
+    _gov_by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+for _t, _ok in _GOV_EXPECTED.items():
+    _got = _gov_by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _GOV_COVERAGE_EXEMPT:
+        print(f"COVERAGE EXEMPT '{_t}': {_GOV_COVERAGE_EXEMPT[_t]}")
+    else:
+        error_messages.append(
+            f"COVERAGE: in-scope governance type '{_t}' was NOT exercised — expected "
+            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested."
+        )
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
