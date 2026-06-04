@@ -20,6 +20,7 @@ except NameError:
 
 import logging
 
+from databricks.sdk.errors import NotFound
 from databricks.sdk.service.sharing import (
     AuthenticationType,
     PermissionsChange,
@@ -121,8 +122,15 @@ def add_tables_to_share(
     tables: list[dict],
     *,
     dry_run: bool = False,
-) -> None:
-    """Add tables to a delta share in batches of 100 (removes stale entries first)."""
+) -> list[str]:
+    """Add tables to a delta share in batches of 100 (removes stale entries first).
+
+    Returns the list of source object names that were SKIPPED because they no
+    longer exist on source (review finding #14). A stale ``discovery_inventory``
+    row (e.g. a table torn down by a prior test) must not abort the whole
+    migration: if a batch add fails with NotFound, we retry that batch
+    one-by-one and skip+warn the vanished objects.
+    """
     source = auth_mgr.source_client
     batch_size = 100
 
@@ -163,6 +171,7 @@ def add_tables_to_share(
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not pre-clean share: %s", exc, exc_info=True)
     existing_names: set[str] = set()
+    skipped_vanished: list[str] = []
 
     for i in range(0, len(tables), batch_size):
         batch = tables[i : i + batch_size]
@@ -202,13 +211,43 @@ def add_tables_to_share(
             )
             continue
 
-        source.shares.update(name=share_name, updates=updates)
-        logger.info(
-            "Added %d tables to share '%s' (batch %d).",
-            len(updates),
-            share_name,
-            i // batch_size + 1,
+        try:
+            source.shares.update(name=share_name, updates=updates)
+            logger.info(
+                "Added %d tables to share '%s' (batch %d).",
+                len(updates),
+                share_name,
+                i // batch_size + 1,
+            )
+        except NotFound as exc:
+            # A member of this batch vanished since discovery (stale inventory).
+            # Retry one-by-one so one missing object doesn't abort the migration.
+            logger.warning(
+                "Batch add to share '%s' hit NotFound (%s); retrying individually "
+                "to skip vanished source object(s).",
+                share_name,
+                exc,
+            )
+            for u in updates:
+                name = u.data_object.name
+                try:
+                    source.shares.update(name=share_name, updates=[u])
+                except NotFound as exc2:
+                    logger.warning(
+                        "Skipping vanished source object '%s' — not added to share "
+                        "(stale discovery_inventory row?): %s",
+                        name,
+                        exc2,
+                    )
+                    skipped_vanished.append(name)
+
+    if skipped_vanished:
+        logger.warning(
+            "Share setup skipped %d vanished source object(s): %s",
+            len(skipped_vanished),
+            skipped_vanished,
         )
+    return skipped_vanished
 
 
 # COMMAND ----------
