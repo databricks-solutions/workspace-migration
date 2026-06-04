@@ -32,6 +32,7 @@ from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
 from common.stateful_utils import CAPABILITY, StatefulExplorer
 from common.tracking import TrackingManager, discovery_row, discovery_schema
+from migrate.reconciliation import resolve_current_job_run_id
 
 # COMMAND ----------
 
@@ -550,6 +551,7 @@ def run(dbutils, spark):  # noqa: D103
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
     explorer = CatalogExplorer(spark, auth)
 
     tracker.init_tracking_tables()
