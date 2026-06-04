@@ -97,6 +97,48 @@ class TestSetupSharing:
             assert "`" not in n, f"Share object name must not contain backticks: {n!r}"
             assert n.count(".") == 2, f"Expected catalog.schema.table, got: {n!r}"
 
+    def test_add_tables_skips_vanished_source_object(self):
+        """Review finding #14: a single source object that vanished since
+        discovery (stale discovery_inventory) must NOT abort the whole share
+        setup. The batch add falls back to one-by-one, skips the vanished
+        object with a warning, and still adds the good ones."""
+        from databricks.sdk.errors import NotFound
+
+        auth = MagicMock()
+        auth.source_client.shares.get.return_value = MagicMock(objects=[])
+
+        def _update_side_effect(*args, **kwargs):
+            updates = kwargs.get("updates") or []
+            adds = [u for u in updates if getattr(u.action, "value", "") == "ADD"]
+            # Batch ADD (more than one) → fail as the real API does when one
+            # member is missing.
+            if len(adds) > 1:
+                raise NotFound("Table 'cat.sch.vanished' does not exist.")
+            # Individual retry: only the vanished one errors.
+            if len(adds) == 1 and adds[0].data_object.name == "cat.sch.vanished":
+                raise NotFound("Table 'cat.sch.vanished' does not exist.")
+            return MagicMock()
+
+        auth.source_client.shares.update.side_effect = _update_side_effect
+
+        tables = [
+            {"object_name": "`cat`.`sch`.`good`"},
+            {"object_name": "`cat`.`sch`.`vanished`"},
+        ]
+        # Must NOT raise.
+        skipped = add_tables_to_share(auth, "test_share", tables)
+
+        assert skipped == ["cat.sch.vanished"]
+        # The good table was still added individually.
+        add_calls = [
+            c for c in auth.source_client.shares.update.call_args_list
+            if c.kwargs.get("updates")
+            and len(c.kwargs["updates"]) == 1
+            and c.kwargs["updates"][0].data_object.name == "cat.sch.good"
+            and getattr(c.kwargs["updates"][0].action, "value", "") == "ADD"
+        ]
+        assert add_calls, "good table was not added in the individual fallback"
+
     def test_add_tables_skips_malformed_fqn(self):
         auth = MagicMock()
         tables = [
