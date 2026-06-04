@@ -1262,6 +1262,43 @@ else:
     )
 
 # COMMAND ----------
+# --- Coverage guard: every UC-owned in-scope type must be EXERCISED ---
+# Makes "not tested" RED instead of a silent green (the whole point: if a type
+# isn't exercised, you find out). The UC suite (migrate_uc) owns the types
+# below; governance/stateful types are enforced by their own suites. A type is
+# "exercised" when migration_status has a row in its expected terminal state
+# (validated for migrated types; the hard-exclude skip for mv/st). Anything not
+# exercised and not explicitly exempted-with-reason fails the run.
+_UC_EXPECTED = {
+    "managed_table": {"validated"},
+    "external_table": {"validated"},
+    "volume": {"validated"},
+    "function": {"validated"},
+    "view": {"validated"},
+    "grant": {"validated"},
+    "registered_model": {"validated"},
+    "mv": {"skipped_by_stateful_service_migration"},
+    "st": {"skipped_by_stateful_service_migration"},
+}
+# type -> reason. Surfaced (never silent). Empty = enforce all.
+_UC_COVERAGE_EXEMPT: dict[str, str] = {}
+_cov = tracker.get_latest_migration_status()
+_by_type: dict[str, set] = {}
+for _r in _cov.select("object_type", "status").distinct().collect():
+    _by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+for _t, _ok in _UC_EXPECTED.items():
+    _got = _by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _UC_COVERAGE_EXEMPT:
+        _skip(f"COVERAGE EXEMPT '{_t}': {_UC_COVERAGE_EXEMPT[_t]}")
+    else:
+        error_messages.append(
+            f"COVERAGE: in-scope UC type '{_t}' was NOT exercised — expected "
+            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested."
+        )
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
