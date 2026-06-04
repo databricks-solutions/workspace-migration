@@ -8,3 +8,7 @@ __pycache__/
 debug_dbconnect.py
 .coverage
 .claude/
+# config.yaml holds real workspace URLs + SPN client id — never commit it.
+# Operators copy config.example.yaml -> config.yaml and edit locally (review
+# finding #12). The bundle still deploys the local file via DAB sync.
+config.yaml

@@ -80,3 +80,15 @@ lakebase_capacity: CU_1
 #             so workers skip each one. Target object is left untouched.
 on_target_collision: "fail"
 
+# Overwrite protection (review finding #2). When false (default), workers that
+# issue destructive CREATE OR REPLACE / DEEP CLONE skip a target object that
+# already exists and validate it instead — protecting a post-cutover target
+# from being clobbered on a resume / re-trigger. Set true only for a
+# deliberate re-migration that should replace target data.
+overwrite_existing: false
+
+# Ownership transfer (review finding #5). When true (default), the grants
+# workers transfer each migrated object's ownership to its original owner via
+# ALTER ... OWNER TO (after the other grants). Set false to leave every
+# migrated object owned by the migration SPN.
+transfer_ownership: true

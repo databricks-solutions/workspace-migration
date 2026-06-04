@@ -23,6 +23,16 @@ variables:
     description: "Resolved warehouse ID (do not set directly — override dashboard_warehouse_name instead)."
     lookup:
       warehouse: ${var.dashboard_warehouse_name}
+  migration_admin_group:
+    description: |
+      Workspace group granted CAN_MANAGE on the migration jobs. Defaults to
+      the built-in ``admins`` group — always exists and is zero-escalation
+      (workspace admins already manage all jobs). For least privilege,
+      override with a dedicated group, e.g.
+      ``--var migration_admin_group=migration_admins`` (create that group and
+      add only the operators who should run these cross-workspace,
+      DROP/DEEP-CLONE-capable jobs).
+    default: "admins"
 
 workspace:
   # Deploy to a Shared workspace path so the bundle is visible to all migration
@@ -35,11 +45,15 @@ workspace:
 # Each job sets run_as: ${var.migration_spn_id} individually in its resource
 # file instead — dashboards are left with default (deployer) ownership.
 
-# Acknowledge the shared path; operators should tighten to a dedicated
-# admin group in prod (replace 'users' with e.g. 'migration_admins').
+# Least-privilege default (review finding #13): grant CAN_MANAGE to the
+# migration admin group (``admins`` by default), NOT the built-in ``users``
+# group (= every workspace user). These jobs run as a cross-workspace-admin
+# SPN that can DROP / DEEP CLONE across both workspaces, so management must
+# not be open to all users. Override migration_admin_group for a dedicated
+# group.
 permissions:
   - level: CAN_MANAGE
-    group_name: users
+    group_name: ${var.migration_admin_group}
 
 include:
   - resources/*.yml
