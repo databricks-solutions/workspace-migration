@@ -17,8 +17,9 @@ except NameError:
     pass  # not running under a Databricks notebook (e.g. pytest)
 
 # COMMAND ----------
-# Grants Worker: replays catalog and schema grants from source to target.
-# Skips OWNER grants (those must be set separately).
+# Grants Worker: replays catalog and schema grants from source to target, and
+# transfers ownership (OWN -> ALTER ... OWNER TO original owner) after the
+# other grants. Gated on config.transfer_ownership.
 
 import logging
 import time
@@ -58,16 +59,25 @@ def replay_grants(
     auth: AuthManager,
     wh_id: str,
     dry_run: bool = False,
+    transfer_ownership: bool = True,
 ) -> list[dict]:
-    """Replay a list of grants on the target, skipping OWNER grants."""
+    """Replay a list of grants on the target.
+
+    Non-OWN grants are replayed as ``GRANT``. OWN grants transfer ownership to
+    the original owner via ``ALTER <securable> OWNER TO`` (review finding #5) —
+    applied AFTER the non-OWN grants so the migration SPN keeps MANAGE while it
+    is still granting. Set ``transfer_ownership=False`` to leave ownership with
+    the SPN (the old skip behaviour).
+    """
     results: list[dict] = []
+    own_grants: list[dict] = []
     for grant in grants:
         principal = grant["principal"]
         action_type = grant["action_type"]
 
-        # Skip OWNER grants -- ownership is set differently
+        # Defer OWN to an ownership transfer applied after the other grants.
         if action_type.upper() == "OWN":
-            logger.info("Skipping OWNER grant for %s on %s %s.", principal, securable_type, securable_fqn)
+            own_grants.append(grant)
             continue
 
         sql = f"GRANT {action_type} ON {securable_type} {securable_fqn} TO `{principal}`"
@@ -108,6 +118,66 @@ def replay_grants(
                     "object_type": "grant",
                     "status": "failed",
                     "error_message": result.get("error", result["state"]),
+                    "duration_seconds": duration,
+                }
+            )
+
+    # Ownership transfer last (review finding #5).
+    if not transfer_ownership:
+        for grant in own_grants:
+            logger.info(
+                "transfer_ownership=False: leaving %s %s owned by the migration SPN "
+                "(original owner %s not restored).",
+                securable_type, securable_fqn, grant["principal"],
+            )
+        return results
+
+    for grant in own_grants:
+        principal = grant["principal"]
+        sql = f"ALTER {securable_type} {securable_fqn} OWNER TO `{principal}`"
+        obj_key = f"OWNER_{securable_type}_{securable_fqn}_{principal}"
+
+        if dry_run:
+            logger.info("[DRY RUN] Would execute: %s", sql)
+            results.append(
+                {
+                    "object_name": obj_key,
+                    "object_type": "grant",
+                    "status": "skipped",
+                    "error_message": "dry_run",
+                    "duration_seconds": 0.0,
+                }
+            )
+            continue
+
+        start = time.time()
+        logger.info("Transferring ownership: %s", sql)
+        result = execute_and_poll(auth, wh_id, sql)
+        duration = time.time() - start
+
+        if result["state"] == "SUCCEEDED":
+            results.append(
+                {
+                    "object_name": obj_key,
+                    "object_type": "grant",
+                    "status": "validated",
+                    "error_message": None,
+                    "duration_seconds": duration,
+                }
+            )
+        else:
+            # Fail loud per-row (e.g. original owner missing on target) — do
+            # not crash the batch, do not silently skip.
+            results.append(
+                {
+                    "object_name": obj_key,
+                    "object_type": "grant",
+                    "status": "failed",
+                    "error_message": (
+                        f"Ownership transfer to '{principal}' failed "
+                        f"(does the principal exist on target?): "
+                        f"{result.get('error', result['state'])}"
+                    ),
                     "duration_seconds": duration,
                 }
             )
@@ -197,6 +267,7 @@ def run(dbutils, spark) -> None:
                 auth=auth,
                 wh_id=wh_id,
                 dry_run=config.dry_run,
+                transfer_ownership=config.transfer_ownership,
             )
             all_results.extend(grant_results)
         except Exception as exc:  # noqa: BLE001

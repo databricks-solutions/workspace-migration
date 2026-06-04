@@ -106,6 +106,40 @@ def _volume_exists(client: WorkspaceClient, full_name: str) -> bool:
         return False
 
 
+# Global-namespace securables (review finding #6): a name clash here can hit
+# an unrelated pre-existing object owned by someone else, so they ARE probed.
+def _connection_exists(client: WorkspaceClient, name: str) -> bool:
+    try:
+        client.connections.get(name=name)
+        return True
+    except NotFound:
+        return False
+
+
+def _share_exists(client: WorkspaceClient, name: str) -> bool:
+    try:
+        client.shares.get(name=name)
+        return True
+    except NotFound:
+        return False
+
+
+def _recipient_exists(client: WorkspaceClient, name: str) -> bool:
+    try:
+        client.recipients.get(name=name)
+        return True
+    except NotFound:
+        return False
+
+
+def _registered_model_exists(client: WorkspaceClient, full_name: str) -> bool:
+    try:
+        client.registered_models.get(full_name=full_name)
+        return True
+    except NotFound:
+        return False
+
+
 # Map an object_type (as stored in discovery_inventory) to its probe fn.
 # ``view`` is a separate object_type in discovery but UC treats it as a
 # table for the purposes of ``tables.get``.
@@ -128,6 +162,31 @@ _PROBES: dict[str, Callable[[WorkspaceClient, str], bool]] = {
     "view": _table_exists,
     "function": _function_exists,
     "volume": _volume_exists,
+    # Global-namespace securables (review finding #6).
+    "connection": _connection_exists,
+    "share": _share_exists,
+    "recipient": _recipient_exists,
+    "registered_model": _registered_model_exists,
+}
+
+
+# Migrated object types that are intentionally NOT collision-probed, each with
+# a reason. Together with ``_PROBES``/``_HIVE_PROBES`` this must cover EVERY
+# migrated object type — the coverage guard test (review finding #6) enforces
+# that, so a newly-migrated type can't silently ship without a probe decision.
+_NOT_PROBED_TYPES: dict[str, str] = {
+    "mv": "hard-excluded from the core tool (skipped_by_stateful_service_migration)",
+    "st": "hard-excluded from the core tool (skipped_by_stateful_service_migration)",
+    "tag": "governance: applied idempotently to existing objects, not a collision",
+    "comment": "governance: applied idempotently to existing objects, not a collision",
+    "row_filter": "governance: idempotent re-apply via staging/reapply, not a collision",
+    "column_mask": "governance: idempotent re-apply via staging/reapply, not a collision",
+    "policy": "governance (ABAC): idempotent re-apply, not a collision",
+    "monitor": "quality monitor: bound to a table; worker tolerates pre-existing",
+    "foreign_catalog": "created from a connection; worker is create-if-missing",
+    "provider": "Delta Sharing inbound provider; worker tolerates pre-existing",
+    "online_table": "deprecated; migrated to Lakebase synced tables by a separate job",
+    "vector_search_index": "stateful; the VS worker create-if-missing handles the endpoint",
 }
 
 
@@ -161,6 +220,15 @@ def _rewrite_hive_fqn(fqn: str, hive_target_catalog: str) -> str:
     if len(parts) == 3 and parts[0] == "hive_metastore":
         return f"{hive_target_catalog}.{parts[1]}.{parts[2]}"
     return ".".join(parts)
+
+
+def unprobed_types_present(discovery_rows: list[dict]) -> list[str]:
+    """Return the sorted in-scope object types present in discovery that are
+    NOT collision-probed (review finding #6). pre_check surfaces these so the
+    operator knows exactly what wasn't checked, instead of assuming the clean
+    collision result covers everything."""
+    present = {(r.get("object_type") or "") for r in discovery_rows}
+    return sorted(t for t in present if t in _NOT_PROBED_TYPES)
 
 
 def detect_collisions(

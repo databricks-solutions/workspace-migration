@@ -12,9 +12,11 @@ import pytest
 from databricks.sdk.errors import NotFound, PermissionDenied
 
 from pre_check.collision_detection import (
+    _NOT_PROBED_TYPES,
     _PROBES,
     build_skip_status_rows,
     detect_collisions,
+    unprobed_types_present,
 )
 
 
@@ -26,11 +28,16 @@ def _not_found_client() -> MagicMock:
     not-found errors map to "absent"; any other error is a check failure.
     """
     c = MagicMock()
-    c.catalogs.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
-    c.schemas.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
-    c.tables.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
-    c.functions.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
-    c.volumes.read.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
+    nf = NotFound("RESOURCE_DOES_NOT_EXIST")
+    c.catalogs.get.side_effect = nf
+    c.schemas.get.side_effect = nf
+    c.tables.get.side_effect = nf
+    c.functions.get.side_effect = nf
+    c.volumes.read.side_effect = nf
+    c.connections.get.side_effect = nf
+    c.shares.get.side_effect = nf
+    c.recipients.get.side_effect = nf
+    c.registered_models.get.side_effect = nf
     return c
 
 
@@ -340,26 +347,26 @@ class TestCollisionHiveRewrite:
 
 
 class TestCollisionUnsupportedTypes:
-    """Phase 3 governance types are intentionally out of scope for v1 —
-    those workers already tolerate pre-existing target state per
-    docs/idempotency_audit.md. Detection returns nothing for them."""
+    """Types intentionally exempt from collision probing (review finding #6):
+    governance objects (idempotent re-apply), hard-excluded MV/ST, and types
+    whose worker tolerates pre-existing target state. Detection returns nothing
+    for them. NOTE: share / recipient / connection / registered_model are NOT
+    here — they are global-namespace securables and ARE probed now."""
 
     @pytest.mark.parametrize(
         "object_type",
         [
-            "share",
-            "recipient",
             "provider",
-            "connection",
             "foreign_catalog",
             "online_table",
             "monitor",
-            "registered_model",
             "tag",
             "row_filter",
             "column_mask",
             "comment",
             "policy",
+            "mv",
+            "st",
         ],
     )
     def test_phase3_types_do_not_probe(self, object_type):
@@ -497,3 +504,78 @@ class TestCollisionEdgeCases:
         )
         assert len(out) == 1
         assert out[0]["source_type"] == "uc"
+
+
+# ---------------------------------------------------------------------------
+# Review finding #6 — global-namespace probes, surfacing, coverage guard
+# ---------------------------------------------------------------------------
+
+
+class TestGlobalNamespaceProbes:
+    """connection / share / recipient / registered_model live in flat
+    namespaces where a clash can hit a stranger's object — they ARE probed."""
+
+    def _client_present(self, attr):
+        c = MagicMock()
+        getattr(c, attr).get.return_value = MagicMock()
+        return c
+
+    @pytest.mark.parametrize(
+        "object_type,name",
+        [
+            ("connection", "prod_sqlserver"),
+            ("share", "partner_share"),
+            ("recipient", "partner_recipient"),
+            ("registered_model", "`cat`.`sch`.`m`"),
+        ],
+    )
+    def test_present_global_object_emits_collision(self, object_type, name):
+        client = MagicMock()
+        # All SDK getters succeed → object exists.
+        out = detect_collisions(
+            target_client=client,
+            discovery_rows=[{"object_name": name, "object_type": object_type, "source_type": "uc"}],
+            existing_status_keys=set(),
+        )
+        assert len(out) == 1
+        assert out[0]["object_type"] == object_type
+        assert out[0]["check_failed"] is False
+
+    def test_connection_probe_fails_closed_on_permission_error(self):
+        from databricks.sdk.errors import PermissionDenied
+
+        client = MagicMock()
+        client.connections.get.side_effect = PermissionDenied("no access")
+        out = detect_collisions(
+            target_client=client,
+            discovery_rows=[{"object_name": "c", "object_type": "connection", "source_type": "uc"}],
+            existing_status_keys=set(),
+        )
+        assert out[0]["check_failed"] is True
+
+
+class TestCollisionCoverageGuard:
+    """Self-enforcing rule (#6): every migrated object type must be either
+    collision-probed or explicitly exempted, so a newly-migrated type can't
+    silently ship without a probe decision."""
+
+    def test_every_migrated_type_is_probed_or_exempt(self):
+        from migrate.orchestrator import BATCHED_TYPES, LIST_TYPES
+
+        migrated = set(BATCHED_TYPES) | set(LIST_TYPES)
+        covered = set(_PROBES) | set(_NOT_PROBED_TYPES)
+        missing = migrated - covered
+        assert not missing, (
+            f"Migrated object type(s) {sorted(missing)} are neither collision-probed "
+            f"(_PROBES) nor exempted (_NOT_PROBED_TYPES). Add a probe (preferred) or an "
+            f"exemption-with-reason in collision_detection.py."
+        )
+
+    def test_unprobed_types_present_surfaces_only_discovered(self):
+        rows = [
+            {"object_name": "c.s.t", "object_type": "managed_table", "source_type": "uc"},
+            {"object_name": "m", "object_type": "monitor", "source_type": "uc"},
+            {"object_name": "p", "object_type": "provider", "source_type": "uc"},
+        ]
+        # managed_table is probed (not surfaced); monitor + provider are exempt.
+        assert unprobed_types_present(rows) == ["monitor", "provider"]

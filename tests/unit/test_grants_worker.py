@@ -36,24 +36,82 @@ class TestReplayGrants:
         assert "GRANT SELECT ON CATALOG" in called_sql
         assert "`data_team`" in called_sql
 
+    @patch("migrate.grants_worker.time")
     @patch("migrate.grants_worker.execute_and_poll")
-    def test_replay_skips_own(self, mock_execute):
+    def test_own_grant_transfers_ownership(self, mock_execute, mock_time):
+        """Review finding #5: OWN must be applied as ALTER ... OWNER TO the
+        original owner, not silently dropped."""
         from migrate.grants_worker import replay_grants
 
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s-1"}
         auth = MagicMock()
         grants = [{"principal": "admin_user", "action_type": "OWN"}]
 
         results = replay_grants(
-            "SCHEMA",
-            "`cat`.`sch`",
-            grants,
-            auth=auth,
-            wh_id="wh-gr-2",
-            dry_run=False,
+            "SCHEMA", "`cat`.`sch`", grants,
+            auth=auth, wh_id="wh-gr-2", dry_run=False,
         )
 
+        assert len(results) == 1
+        assert results[0]["status"] == "validated"
+        sql = mock_execute.call_args[0][2]
+        assert sql == "ALTER SCHEMA `cat`.`sch` OWNER TO `admin_user`"
+
+    @patch("migrate.grants_worker.execute_and_poll")
+    def test_transfer_ownership_disabled_skips_own(self, mock_execute):
+        """transfer_ownership=False preserves the old skip behaviour."""
+        from migrate.grants_worker import replay_grants
+
+        auth = MagicMock()
+        grants = [{"principal": "admin_user", "action_type": "OWN"}]
+        results = replay_grants(
+            "SCHEMA", "`cat`.`sch`", grants,
+            auth=auth, wh_id="wh-gr-2", dry_run=False, transfer_ownership=False,
+        )
         assert len(results) == 0
         mock_execute.assert_not_called()
+
+    @patch("migrate.grants_worker.time")
+    @patch("migrate.grants_worker.execute_and_poll")
+    def test_ownership_applied_after_non_own_grants(self, mock_execute, mock_time):
+        """OWNER TO must run AFTER the securable's other grants so the SPN
+        keeps MANAGE while it is still granting."""
+        from migrate.grants_worker import replay_grants
+
+        mock_time.time.side_effect = [100.0, 101.0, 102.0, 103.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        auth = MagicMock()
+        grants = [
+            {"principal": "owner_user", "action_type": "OWN"},
+            {"principal": "data_team", "action_type": "SELECT"},
+        ]
+        replay_grants(
+            "TABLE", "`c`.`s`.`t`", grants,
+            auth=auth, wh_id="wh", dry_run=False,
+        )
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        assert "GRANT SELECT ON TABLE" in sqls[0]  # non-OWN first
+        assert sqls[1] == "ALTER TABLE `c`.`s`.`t` OWNER TO `owner_user`"  # OWN last
+
+    @patch("migrate.grants_worker.time")
+    @patch("migrate.grants_worker.execute_and_poll")
+    def test_ownership_failure_is_fail_loud_not_crash(self, mock_execute, mock_time):
+        """If the original owner doesn't exist on target, the ALTER fails —
+        recorded as failed with a clear message, batch continues."""
+        from migrate.grants_worker import replay_grants
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_execute.return_value = {"state": "FAILED", "error": "PRINCIPAL_DOES_NOT_EXIST"}
+        auth = MagicMock()
+        grants = [{"principal": "ghost_user", "action_type": "OWN"}]
+        results = replay_grants(
+            "SCHEMA", "`cat`.`sch`", grants,
+            auth=auth, wh_id="wh", dry_run=False,
+        )
+        assert len(results) == 1
+        assert results[0]["status"] == "failed"
+        assert "ghost_user" in results[0]["error_message"] or "PRINCIPAL" in results[0]["error_message"]
 
     @patch("migrate.grants_worker.execute_and_poll")
     def test_replay_dry_run(self, mock_execute):
@@ -137,9 +195,9 @@ class TestGrantsWorkerSecurableCoverage:
         # The mapping block lists mv, st alongside managed_table / external_table
         assert '"managed_table", "external_table", "mv", "st"' in src
 
-    def test_replay_grants_skips_owner_grants(self):
-        """OWNER grants are set differently (ALTER ... OWNER TO) — the
-        grants_worker has an explicit skip for them. Lock this in."""
+    def test_replay_grants_transfers_owner_grants(self):
+        """OWNER grants are applied as ALTER ... OWNER TO the original owner
+        (review finding #5) — SELECT grant + ownership transfer both run."""
         from migrate.grants_worker import replay_grants
 
         auth = MagicMock()
@@ -165,10 +223,9 @@ class TestGrantsWorkerSecurableCoverage:
                 wh_id="wh-owner",
                 dry_run=False,
             )
-        # Only SELECT was replayed; OWN was skipped (no result row).
-        assert len(results) == 1
-        assert "SELECT" in results[0]["object_name"]
-        assert "user1" in results[0]["object_name"]
-        sql_sent = mock_exec.call_args[0][2]
-        assert sql_sent.startswith("GRANT SELECT")
-        assert mock_exec.call_count == 1
+        # SELECT replayed AND ownership transferred to user2.
+        assert len(results) == 2
+        sqls = [c.args[2] for c in mock_exec.call_args_list]
+        assert any("GRANT SELECT ON SCHEMA" in s for s in sqls)
+        assert any(s == "ALTER SCHEMA `cat`.`sch` OWNER TO `user2`" for s in sqls)
+        assert mock_exec.call_count == 2

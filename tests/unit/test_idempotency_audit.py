@@ -273,17 +273,20 @@ class TestGrantsIdempotency:
         assert any("GRANT MODIFY ON CATALOG `cat`" in s for s in sqls)
 
     @patch("migrate.grants_worker.execute_and_poll")
-    def test_replay_grants_skips_owner(self, mock_exec):
-        """Pin: OWN grants are skipped (ownership is not a GRANT)."""
+    def test_replay_grants_transfers_owner(self, mock_exec):
+        """Pin (#5): OWN grants transfer ownership via ALTER ... OWNER TO the
+        original owner — idempotent (ALTER OWNER is a set, not an append)."""
         from migrate.grants_worker import replay_grants
 
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
         results = replay_grants(
             "CATALOG", "`cat`",
             [{"principal": "alice", "action_type": "OWN"}],
             auth=MagicMock(), wh_id="wh", dry_run=False,
         )
-        assert results == []
-        mock_exec.assert_not_called()
+        assert len(results) == 1
+        assert results[0]["status"] == "validated"
+        assert mock_exec.call_args[0][2] == "ALTER CATALOG `cat` OWNER TO `alice`"
 
 
 # ============================================================================
@@ -1028,14 +1031,28 @@ class TestHiveGrantsIdempotency:
         assert res["status"] == "skipped"
         assert "unmapped privilege" in (res["error_message"] or "")
 
-    def test_own_is_skipped(self):
-        """Pin: OWN grants are not migrated (ownership transfer is manual)."""
+    @patch("migrate.hive_grants_worker.execute_and_poll")
+    def test_own_transfers_ownership(self, mock_exec):
+        """Pin (#5): OWN grants transfer ownership via ALTER ... OWNER TO."""
+        from migrate.hive_grants_worker import _emit_grant
+
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        res = _emit_grant(
+            action_type="OWN", securable_keyword="TABLE",
+            target_fqn="`uc_hive`.`db`.`t`", principal="alice@x.com",
+            auth=MagicMock(), wh_id="wh", dry_run=False,
+        )
+        assert res["status"] == "validated"
+        assert mock_exec.call_args[0][2] == "ALTER TABLE `uc_hive`.`db`.`t` OWNER TO `alice@x.com`"
+
+    def test_own_skipped_when_transfer_disabled(self):
+        """transfer_ownership=False preserves the old skip behaviour."""
         from migrate.hive_grants_worker import _emit_grant
 
         res = _emit_grant(
             action_type="OWN", securable_keyword="TABLE",
             target_fqn="`uc_hive`.`db`.`t`", principal="alice@x.com",
-            auth=MagicMock(), wh_id="wh", dry_run=False,
+            auth=MagicMock(), wh_id="wh", dry_run=False, transfer_ownership=False,
         )
         assert res["status"] == "skipped"
 

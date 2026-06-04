@@ -128,8 +128,11 @@ DDL: `GRANT {priv} ON {securable} TO {principal}`.
 
 Worker does NOT read tracking; it re-reads `SHOW GRANTS` on every run.
 UC `GRANT` is server-side idempotent (repeated grants are no-ops).
-`OWN` action_type is skipped (ownership is set via `ALTER ... OWNER TO`,
-not GRANT).
+`OWN` action_type transfers ownership to the original owner via
+`ALTER <securable> ... OWNER TO` (applied after the other grants so the SPN
+keeps MANAGE while granting), gated on `config.transfer_ownership` (default
+True). `ALTER ... OWNER TO` is idempotent (it sets, not appends). A missing
+target principal fails that row loudly without crashing the batch.
 
 | Input status | Target | Current behavior | Idempotent? |
 |---|---|---|---|
