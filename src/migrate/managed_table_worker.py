@@ -25,6 +25,8 @@ import threading as _threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from databricks.sdk.errors import NotFound
+
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
@@ -73,6 +75,27 @@ def _reset_kill_counter() -> None:
     global _kill_counter
     with _kill_lock:
         _kill_counter = 0
+
+
+def _target_table_exists(auth: AuthManager, target_fqn: str) -> bool:
+    """Whether ``target_fqn`` exists on the TARGET workspace.
+
+    Critically uses ``auth.target_client`` (the target metastore), NOT the
+    source spark session — source and target share the same FQN, so a source
+    spark ``DESCRIBE TABLE`` would always find the source table and wrongly
+    report the target as present (review finding #2 live regression). On any
+    non-NotFound error we return False so an existence-check hiccup never
+    blocks the migration (CREATE OR REPLACE is correct for a fresh target).
+    """
+    dotted = target_fqn.replace("`", "")
+    try:
+        auth.target_client.tables.get(full_name=dotted)
+        return True
+    except NotFound:
+        return False
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not determine target existence for %s: %s; proceeding to clone.", dotted, exc)
+        return False
 
 
 # COMMAND ----------
@@ -287,7 +310,7 @@ def clone_table(
     # reconciliation resets to pending, re-feeding the worker. Foreign
     # pre-existing targets are caught earlier by collision pre-check.
     overwrite = getattr(config, "overwrite_existing", False)
-    if not overwrite and validator.validate_object_exists(target_fqn):
+    if not overwrite and _target_table_exists(auth, target_fqn):
         logger.info(
             "Target %s already exists; validating without re-clone "
             "(set overwrite_existing=true to force CREATE OR REPLACE).",

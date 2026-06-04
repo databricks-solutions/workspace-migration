@@ -7,12 +7,17 @@ class TestCloneTable:
     """Tests for the managed_table_worker.clone_table function."""
 
     def _make_deps(self, *, dry_run: bool = False) -> dict:
+        from databricks.sdk.errors import NotFound
+
         config = MagicMock()
         config.dry_run = dry_run
         # Realistic defaults: overwrite off, target does not pre-exist → the
         # normal CREATE OR REPLACE clone path runs. Individual tests override.
         config.overwrite_existing = False
         auth = MagicMock()
+        # Target-existence check goes through the TARGET workspace client
+        # (review finding #2). Default: target absent → NotFound → clone runs.
+        auth.target_client.tables.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
         tracker = MagicMock()
         # No staging by default → exercise the original-consumer DEEP CLONE
         # / CTAS branches the rest of the suite asserts on.
@@ -135,7 +140,9 @@ class TestCloneTable:
 
         deps = self._make_deps()
         deps["config"].overwrite_existing = False
-        deps["validator"].validate_object_exists.return_value = True  # target already there
+        # Target exists on the TARGET workspace → tables.get succeeds.
+        deps["auth"].target_client.tables.get.side_effect = None
+        deps["auth"].target_client.tables.get.return_value = MagicMock()
         deps["validator"].validate_row_count.return_value = {
             "match": True, "source_count": 42, "target_count": 42,
         }
@@ -158,7 +165,9 @@ class TestCloneTable:
 
         deps = self._make_deps()
         deps["config"].overwrite_existing = True
-        deps["validator"].validate_object_exists.return_value = True
+        # Even though target exists, overwrite=True forces the clone.
+        deps["auth"].target_client.tables.get.side_effect = None
+        deps["auth"].target_client.tables.get.return_value = MagicMock()
         deps["validator"].validate_row_count.return_value = {
             "match": True, "source_count": 42, "target_count": 42,
         }
@@ -168,6 +177,36 @@ class TestCloneTable:
         assert result["status"] == "validated"
         clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
         assert len(clone_sqls) == 1
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_existence_gate_uses_target_client_not_source_spark(self, mock_execute, mock_time):
+        """Live regression pin (#2): the gate must check the TARGET workspace
+        client, not the source spark session. Source and target share the same
+        FQN, so the source-spark validator would falsely report 'exists' and
+        skip every clone (no-op migration). Target client says NotFound ⇒ clone
+        MUST proceed even though the source-spark validator would say True."""
+        from databricks.sdk.errors import NotFound
+
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 105.0, 110.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps()
+        deps["config"].overwrite_existing = False
+        deps["auth"].target_client.tables.get.side_effect = NotFound("absent on target")
+        # The (wrong) source-spark check would say the table exists:
+        deps["validator"].validate_object_exists.return_value = True
+        deps["validator"].validate_row_count.return_value = {
+            "match": True, "source_count": 42, "target_count": 42,
+        }
+
+        result = clone_table({"object_name": "`cat`.`sch`.`tbl`"}, **deps)
+
+        assert result["status"] == "validated"
+        clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
+        assert len(clone_sqls) == 1, "clone must run when the TARGET does not have the table"
 
 
 class TestIcebergManagedTable:
