@@ -208,6 +208,117 @@ class TestHiveManagedDbfsWorker:
         # (LOCATION on CREATE TABLE makes it external in UC).
         assert "LOCATION" in src
 
+    @staticmethod
+    def _describe_rows(*pairs, partition_cols=()):
+        """Build mock DESCRIBE TABLE rows: column pairs, then (optionally) the
+        partition section (blank sep, '# Partition Information', '# col_name',
+        then the partition columns repeated)."""
+        rows = []
+
+        def _row(col_name, data_type=""):
+            r = MagicMock()
+            r.asDict.return_value = {"col_name": col_name, "data_type": data_type, "comment": ""}
+            return r
+
+        for name, dtype in pairs:
+            rows.append(_row(name, dtype))
+        if partition_cols:
+            rows.append(_row("", ""))
+            rows.append(_row("# Partition Information", ""))
+            rows.append(_row("# col_name", "data_type"))
+            for pc in partition_cols:
+                rows.append(_row(pc, "string"))
+        return rows
+
+    def _dbfs_config(self):
+        cfg = _config_mock()
+        cfg.migrate_hive_dbfs_root = True
+        cfg.hive_dbfs_target_path = "abfss://x@y.dfs.core.windows.net/hive_data"
+        cfg.hive_target_catalog = "uc_hive"
+        return cfg
+
+    @patch("migrate.hive_managed_dbfs_worker.time")
+    @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
+    def test_partitioned_source_preserves_partition_columns(self, mock_exec, mock_time):
+        """Review finding #4: a partitioned source must be written partitioned
+        on the target — the worker had no partitionBy, silently flattening it."""
+        from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        spark = MagicMock()
+        df = MagicMock()
+        df.count.return_value = 5
+        spark.read.table.return_value = df
+        # DESCRIBE TABLE returns a partitioned schema (partitioned by country).
+        spark.sql.return_value.collect.return_value = self._describe_rows(
+            ("id", "int"), ("amount", "double"), ("country", "string"),
+            partition_cols=["country"],
+        )
+        # Independent re-read of the written path matches source count.
+        spark.read.format.return_value.load.return_value.count.return_value = 5
+
+        res = migrate_hive_managed_dbfs(
+            {"object_name": "`hive_metastore`.`db`.`t`"},
+            config=self._dbfs_config(), auth=MagicMock(), tracker=MagicMock(),
+            spark=spark, wh_id="wh",
+        )
+
+        df.write.mode.return_value.format.return_value.partitionBy.assert_called_once_with("country")
+        assert res["status"] == "validated"
+
+    @patch("migrate.hive_managed_dbfs_worker.time")
+    @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
+    def test_unpartitioned_source_does_not_call_partitionby(self, mock_exec, mock_time):
+        from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        spark = MagicMock()
+        df = MagicMock()
+        df.count.return_value = 5
+        spark.read.table.return_value = df
+        spark.sql.return_value.collect.return_value = self._describe_rows(("id", "int"))
+        spark.read.format.return_value.load.return_value.count.return_value = 5
+
+        migrate_hive_managed_dbfs(
+            {"object_name": "`hive_metastore`.`db`.`t`"},
+            config=self._dbfs_config(), auth=MagicMock(), tracker=MagicMock(),
+            spark=spark, wh_id="wh",
+        )
+
+        df.write.mode.return_value.format.return_value.partitionBy.assert_not_called()
+
+    @patch("migrate.hive_managed_dbfs_worker.time")
+    @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
+    def test_validation_rereads_written_target_and_catches_mismatch(self, mock_exec, mock_time):
+        """Validation must re-read the actually-written data, not blindly
+        report target_row_count = source_row_count."""
+        from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        spark = MagicMock()
+        df = MagicMock()
+        df.count.return_value = 5
+        spark.read.table.return_value = df
+        spark.sql.return_value.collect.return_value = self._describe_rows(("id", "int"))
+        # Re-read of the written path finds only 3 rows — a real divergence.
+        spark.read.format.return_value.load.return_value.count.return_value = 3
+
+        res = migrate_hive_managed_dbfs(
+            {"object_name": "`hive_metastore`.`db`.`t`"},
+            config=self._dbfs_config(), auth=MagicMock(), tracker=MagicMock(),
+            spark=spark, wh_id="wh",
+        )
+
+        assert res["status"] == "validation_failed"
+        assert res["target_row_count"] == 3
+        assert res["source_row_count"] == 5
+
 
 # ----------------------------------------------------------------------
 # hive_managed_nondbfs_worker
