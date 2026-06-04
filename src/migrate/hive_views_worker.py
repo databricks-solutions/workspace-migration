@@ -31,6 +31,7 @@ from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
 from migrate.hive_common import rewrite_hive_namespace
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_views_worker")
@@ -152,6 +153,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     view_list_json = dbutils.jobs.taskValues.get(taskKey="hive_orchestrator", key="hive_view_list")
     views_raw: list[dict] = json.loads(view_list_json) if view_list_json else []

@@ -131,8 +131,76 @@ class TestValidateSchemaMatch:
         mismatch = result["mismatches"][0]
         assert mismatch["column"] == "id"
         assert mismatch["issue"] == "type_mismatch"
-        assert mismatch["source"] == {"col_name": "id", "data_type": "int", "comment": ""}
-        assert mismatch["target"] == {"col_name": "id", "data_type": "bigint", "comment": ""}
+        # New contract: report the data_type only, not the full row dict.
+        assert mismatch["source"] == "int"
+        assert mismatch["target"] == "bigint"
+
+    def test_schema_match_ignores_comment_differences(self, validator, source_explorer, target_explorer):
+        """A comment-only difference must NOT be flagged as a schema mismatch."""
+        source_explorer.spark.sql.return_value.collect.return_value = [
+            _describe_row("id", "int", comment="source comment"),
+            _describe_row("name", "string", comment="the name"),
+        ]
+        target_explorer.spark.sql.return_value.collect.return_value = [
+            _describe_row("id", "int", comment=""),
+            _describe_row("name", "string", comment="a different comment"),
+        ]
+
+        result = validator.validate_schema_match("src.db.tbl", "tgt.db.tbl")
+
+        assert result["match"] is True
+        assert result["mismatches"] == []
+
+    def test_schema_match_ignores_partition_metadata_rows(self, validator, source_explorer, target_explorer):
+        """DESCRIBE TABLE output for a partitioned table includes a blank
+        separator, a '# Partition Information' header, a '# col_name' header,
+        and the partition columns repeated. None of those are real columns and
+        an identical partitioned schema must validate as a match."""
+        partitioned_describe = [
+            _describe_row("id", "int"),
+            _describe_row("amount", "double"),
+            _describe_row("country", "string"),
+            _describe_row("", ""),  # blank separator
+            _describe_row("# Partition Information", ""),
+            _describe_row("# col_name", "data_type"),
+            _describe_row("country", "string"),  # partition col repeated
+        ]
+        source_explorer.spark.sql.return_value.collect.return_value = partitioned_describe
+        target_explorer.spark.sql.return_value.collect.return_value = list(partitioned_describe)
+
+        result = validator.validate_schema_match("src.db.tbl", "tgt.db.tbl")
+
+        assert result["match"] is True
+        assert result["mismatches"] == []
+        # Only the three real columns should be reported, not the metadata rows.
+        assert {c["col_name"] for c in result["source_columns"]} == {"id", "amount", "country"}
+
+    def test_schema_match_detects_real_divergence_under_partition_metadata(
+        self, validator, source_explorer, target_explorer
+    ):
+        """A genuine type divergence must still be caught even when partition
+        metadata rows are present (guard against over-filtering)."""
+        source_explorer.spark.sql.return_value.collect.return_value = [
+            _describe_row("id", "int"),
+            _describe_row("country", "string"),
+            _describe_row("", ""),
+            _describe_row("# Partition Information", ""),
+            _describe_row("country", "string"),
+        ]
+        target_explorer.spark.sql.return_value.collect.return_value = [
+            _describe_row("id", "bigint"),  # divergent type
+            _describe_row("country", "string"),
+            _describe_row("", ""),
+            _describe_row("# Partition Information", ""),
+            _describe_row("country", "string"),
+        ]
+
+        result = validator.validate_schema_match("src.db.tbl", "tgt.db.tbl")
+
+        assert result["match"] is False
+        assert len(result["mismatches"]) == 1
+        assert result["mismatches"][0]["column"] == "id"
+        assert result["mismatches"][0]["issue"] == "type_mismatch"
 
 
 # --------------------------------------------------------------------------- #

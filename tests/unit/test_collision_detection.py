@@ -9,6 +9,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import pytest
+from databricks.sdk.errors import NotFound, PermissionDenied
 
 from pre_check.collision_detection import (
     _PROBES,
@@ -18,13 +19,18 @@ from pre_check.collision_detection import (
 
 
 def _not_found_client() -> MagicMock:
-    """Target client where every SDK ``*.get`` raises (target is empty)."""
+    """Target client where every SDK ``*.get`` raises NotFound (target empty).
+
+    Uses the real SDK ``NotFound`` (covers RESOURCE_DOES_NOT_EXIST, a subclass)
+    — NOT a bare RuntimeError. After the fail-closed fix (#10) only genuine
+    not-found errors map to "absent"; any other error is a check failure.
+    """
     c = MagicMock()
-    c.catalogs.get.side_effect = RuntimeError("NOT_FOUND")
-    c.schemas.get.side_effect = RuntimeError("NOT_FOUND")
-    c.tables.get.side_effect = RuntimeError("NOT_FOUND")
-    c.functions.get.side_effect = RuntimeError("NOT_FOUND")
-    c.volumes.read.side_effect = RuntimeError("NOT_FOUND")
+    c.catalogs.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
+    c.schemas.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
+    c.tables.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
+    c.functions.get.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
+    c.volumes.read.side_effect = NotFound("RESOURCE_DOES_NOT_EXIST")
     return c
 
 
@@ -103,6 +109,68 @@ class TestDetectCollisionsPerType:
             existing_status_keys=set(),
         )
         assert out == []
+
+
+class TestCollisionProbesFailClosed:
+    """Review finding #10: probes caught bare Exception and returned False,
+    so a permission error on a pre-existing target read as 'absent' → 'safe',
+    and the destructive migration proceeded. Probes must fail CLOSED: only a
+    genuine NotFound means absent; any other error surfaces as a check failure."""
+
+    def test_permission_denied_is_not_treated_as_absent(self):
+        client = MagicMock()
+        client.tables.get.side_effect = PermissionDenied("user has no permission on target")
+        rows = [
+            {
+                "object_name": "`retail`.`orders`.`t`",
+                "object_type": "managed_table",
+                "source_type": "uc",
+            }
+        ]
+        out = detect_collisions(
+            target_client=client,
+            discovery_rows=rows,
+            existing_status_keys=set(),
+        )
+        # Must NOT be silently empty (that would be fail-open). A check-failure
+        # record is emitted so the caller can fail closed.
+        assert len(out) == 1
+        assert out[0]["check_failed"] is True
+        assert "permission" in out[0]["error"].lower()
+
+    def test_genuine_not_found_is_absent(self):
+        """A real NotFound still means 'no collision' (no check_failed)."""
+        client = _not_found_client()
+        out = detect_collisions(
+            target_client=client,
+            discovery_rows=[{"object_name": "c", "object_type": "catalog", "source_type": "uc"}],
+            existing_status_keys=set(),
+        )
+        assert out == []
+
+    def test_real_collision_is_not_flagged_check_failed(self):
+        client = _found_client()
+        out = detect_collisions(
+            target_client=client,
+            discovery_rows=[{"object_name": "c", "object_type": "catalog", "source_type": "uc"}],
+            existing_status_keys=set(),
+        )
+        assert len(out) == 1
+        assert out[0].get("check_failed") is False
+
+    def test_build_skip_status_rows_ignores_check_failures(self):
+        """A check-failure must never become a skipped_target_exists row —
+        skipping an object we couldn't verify is exactly the unsafe outcome."""
+        collisions = [
+            {"object_type": "managed_table", "source_fqn": "`c`.`s`.`real`",
+             "target_fqn": "c.s.real", "source_type": "uc", "check_failed": False},
+            {"object_type": "managed_table", "source_fqn": "`c`.`s`.`unverifiable`",
+             "target_fqn": "c.s.unverifiable", "source_type": "uc", "check_failed": True,
+             "error": "PermissionDenied"},
+        ]
+        rows = build_skip_status_rows(collisions)
+        names = {r["object_name"] for r in rows}
+        assert names == {"`c`.`s`.`real`"}
 
 
 class TestCollisionsRespectExistingStatus:

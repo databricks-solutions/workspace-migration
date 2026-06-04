@@ -28,10 +28,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
-from common.sql_utils import execute_and_poll, find_warehouse
+from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
 from common.validation import Validator
-from migrate.reconciliation import maybe_kill
+from migrate.reconciliation import maybe_kill, resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("managed_table_worker")
@@ -176,7 +176,11 @@ def clone_table(
                 "duration_seconds": time.time() - start,
             }
 
-        insert_sql = f"INSERT INTO {target_fqn} SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
+        # Idempotency (review finding #3): make CREATE non-destructive-on-retry
+        # (IF NOT EXISTS) and the load replace-not-append (INSERT OVERWRITE), so
+        # a retry after a successful first attempt can't double the rows.
+        create_stmt = rewrite_ddl(create_stmt, r"CREATE\s+TABLE\b", "CREATE TABLE IF NOT EXISTS")
+        insert_sql = f"INSERT OVERWRITE {target_fqn} SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
 
         if config.dry_run:
             duration = time.time() - start
@@ -275,17 +279,32 @@ def clone_table(
             "duration_seconds": duration,
         }
 
-    result = execute_and_poll(auth, wh_id, sql)
-    duration = time.time() - start
-
-    if result["state"] != "SUCCEEDED":
-        return {
-            "object_name": obj_name,
-            "object_type": "managed_table",
-            "status": "failed",
-            "error_message": result.get("error", result["state"]),
-            "duration_seconds": duration,
-        }
+    # Existence gate (review finding #2): CREATE OR REPLACE … DEEP CLONE is
+    # unconditionally destructive. If the target already exists and the
+    # operator hasn't opted into overwrite, do NOT re-clone — validate the
+    # existing target instead. This closes the orphan-replay window where a
+    # crash between clone and status-write leaves an in_progress row that
+    # reconciliation resets to pending, re-feeding the worker. Foreign
+    # pre-existing targets are caught earlier by collision pre-check.
+    overwrite = getattr(config, "overwrite_existing", False)
+    if not overwrite and validator.validate_object_exists(target_fqn):
+        logger.info(
+            "Target %s already exists; validating without re-clone "
+            "(set overwrite_existing=true to force CREATE OR REPLACE).",
+            target_fqn,
+        )
+        duration = time.time() - start
+    else:
+        result = execute_and_poll(auth, wh_id, sql)
+        duration = time.time() - start
+        if result["state"] != "SUCCEEDED":
+            return {
+                "object_name": obj_name,
+                "object_type": "managed_table",
+                "status": "failed",
+                "error_message": result.get("error", result["state"]),
+                "duration_seconds": duration,
+            }
 
     # Validate row count
     try:
@@ -322,6 +341,7 @@ def run(dbutils, spark) -> None:
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     source_explorer = CatalogExplorer(spark_session, auth)
     target_explorer = CatalogExplorer(spark_session, auth)

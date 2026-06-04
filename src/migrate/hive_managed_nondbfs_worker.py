@@ -34,6 +34,7 @@ from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
 from common.validation import Validator
 from migrate.hive_common import rewrite_hive_fqn, rewrite_hive_namespace
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_managed_nondbfs_worker")
@@ -93,7 +94,7 @@ def migrate_hive_managed_nondbfs(
 
     The target points at the same storage path as the source — no data copy.
     """
-    source_fqn = record["fqn"]
+    source_fqn = record["object_name"]
     storage_location = record.get("storage_location", "")
     provider = (record.get("provider") or "").lower()
     target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
@@ -223,6 +224,7 @@ def run(dbutils, spark) -> None:
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
     explorer = CatalogExplorer(spark_session, auth)
 
     # Build a target explorer for validation (shares the same spark session)
@@ -261,7 +263,7 @@ def run(dbutils, spark) -> None:
                 res = future.result()
             except Exception as exc:  # noqa: BLE001
                 res = {
-                    "object_name": rec_info["fqn"],
+                    "object_name": rec_info["object_name"],
                     "object_type": "hive_managed_nondbfs",
                     "status": "failed",
                     "error_message": str(exc),

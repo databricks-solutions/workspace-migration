@@ -9,12 +9,16 @@ class TestCloneTable:
     def _make_deps(self, *, dry_run: bool = False) -> dict:
         config = MagicMock()
         config.dry_run = dry_run
+        # Realistic defaults: overwrite off, target does not pre-exist → the
+        # normal CREATE OR REPLACE clone path runs. Individual tests override.
+        config.overwrite_existing = False
         auth = MagicMock()
         tracker = MagicMock()
         # No staging by default → exercise the original-consumer DEEP CLONE
         # / CTAS branches the rest of the suite asserts on.
         tracker.get_staging_for_original.return_value = None
         validator = MagicMock()
+        validator.validate_object_exists.return_value = False
         return {
             "config": config,
             "auth": auth,
@@ -118,6 +122,53 @@ class TestCloneTable:
         assert "Malformed FQN" in result["error_message"]
         assert result["duration_seconds"] == 0.0
 
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_existing_target_is_not_overwritten_when_flag_off(self, mock_execute, mock_time):
+        """Review finding #2: CREATE OR REPLACE … DEEP CLONE had no existence
+        gate, so an orphaned-in_progress resume (or any re-trigger) re-clobbered
+        the target. With overwrite_existing off and the target already present,
+        the worker must validate without issuing a CREATE OR REPLACE."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 105.0, 110.0]
+
+        deps = self._make_deps()
+        deps["config"].overwrite_existing = False
+        deps["validator"].validate_object_exists.return_value = True  # target already there
+        deps["validator"].validate_row_count.return_value = {
+            "match": True, "source_count": 42, "target_count": 42,
+        }
+
+        result = clone_table({"object_name": "`cat`.`sch`.`tbl`"}, **deps)
+
+        assert result["status"] == "validated"
+        # No DEEP CLONE / CREATE OR REPLACE was issued.
+        clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
+        assert clone_sqls == []
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_overwrite_existing_flag_forces_clone(self, mock_execute, mock_time):
+        """With overwrite_existing=True, a present target IS replaced."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 105.0, 110.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps()
+        deps["config"].overwrite_existing = True
+        deps["validator"].validate_object_exists.return_value = True
+        deps["validator"].validate_row_count.return_value = {
+            "match": True, "source_count": 42, "target_count": 42,
+        }
+
+        result = clone_table({"object_name": "`cat`.`sch`.`tbl`"}, **deps)
+
+        assert result["status"] == "validated"
+        clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
+        assert len(clone_sqls) == 1
+
 
 class TestIcebergManagedTable:
     """Tests for the Iceberg Option A branch of clone_table."""
@@ -186,8 +237,38 @@ class TestIcebergManagedTable:
         assert result["source_row_count"] == 10
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         assert any("USING ICEBERG" in s for s in sqls)  # CREATE executed
-        assert any("INSERT INTO" in s for s in sqls)  # Re-ingest executed
+        assert any("INSERT OVERWRITE" in s for s in sqls)  # idempotent re-ingest (#3)
         assert any("FROM `cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_iceberg_is_idempotent_on_retry(self, mock_execute, mock_time):
+        """Review finding #3: the Iceberg branch did CREATE (non-idempotent)
+        then INSERT INTO (append). A retry after a successful CREATE would
+        append a second full copy. The CREATE must be IF NOT EXISTS and the
+        load must be INSERT OVERWRITE so a re-run can't double rows."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 130.0, 160.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps(iceberg_strategy="ddl_replay")
+        deps["validator"].validate_row_count.return_value = {
+            "match": True, "source_count": 10, "target_count": 10,
+        }
+        table_info = {
+            "object_name": "`cat`.`sch`.`ice_tbl`",
+            "format": "iceberg",
+            "create_statement": "CREATE TABLE `cat`.`sch`.`ice_tbl` (id INT) USING ICEBERG",
+        }
+        clone_table(table_info, **deps)
+
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        create_sql = next(s for s in sqls if "USING ICEBERG" in s)
+        insert_sql = next(s for s in sqls if "INSERT" in s)
+        assert "CREATE TABLE IF NOT EXISTS" in create_sql
+        assert "INSERT OVERWRITE" in insert_sql
+        assert "INSERT INTO" not in insert_sql
 
     @patch("migrate.managed_table_worker.time")
     @patch("migrate.managed_table_worker.execute_and_poll")
@@ -309,7 +390,7 @@ class TestIcebergManagedTable:
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         # Both ddl_replay statements must have run on the second pass.
         assert any("USING ICEBERG" in s for s in sqls), "CREATE DDL not replayed"
-        assert any("INSERT INTO" in s for s in sqls), "Data re-ingest not executed"
+        assert any("INSERT OVERWRITE" in s for s in sqls), "Data re-ingest not executed"
         # Ingest reads from the consumer catalog exposed by the share.
         assert any("`cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
 

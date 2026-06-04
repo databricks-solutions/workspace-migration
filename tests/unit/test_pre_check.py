@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+from databricks.sdk.errors import NotFound, PermissionDenied
 
 from common.config import MigrationConfig
 from pre_check.pre_check import run
@@ -272,23 +273,23 @@ def _setup_collision_mocks(
     def _tables_get(full_name):
         if full_name in target_hits:
             return MagicMock()
-        raise RuntimeError("NOT_FOUND")
+        raise NotFound("NOT_FOUND")
 
     def _catalogs_get(name):
         if name in target_hits:
             return MagicMock()
-        raise RuntimeError("NOT_FOUND")
+        raise NotFound("NOT_FOUND")
 
     mock_auth.target_client.tables.get.side_effect = _tables_get
     mock_auth.target_client.catalogs.get.side_effect = _catalogs_get
     mock_auth.target_client.schemas.get.side_effect = lambda full_name: (
-        MagicMock() if full_name in target_hits else (_ for _ in ()).throw(RuntimeError("NOT_FOUND"))
+        MagicMock() if full_name in target_hits else (_ for _ in ()).throw(NotFound("NOT_FOUND"))
     )
     mock_auth.target_client.functions.get.side_effect = lambda name: (
-        MagicMock() if name in target_hits else (_ for _ in ()).throw(RuntimeError("NOT_FOUND"))
+        MagicMock() if name in target_hits else (_ for _ in ()).throw(NotFound("NOT_FOUND"))
     )
     mock_auth.target_client.volumes.read.side_effect = lambda name: (
-        MagicMock() if name in target_hits else (_ for _ in ()).throw(RuntimeError("NOT_FOUND"))
+        MagicMock() if name in target_hits else (_ for _ in ()).throw(NotFound("NOT_FOUND"))
     )
     return mock_auth
 
@@ -365,6 +366,42 @@ class TestPreCheckCollisionDetection:
 
         with pytest.raises(Exception, match="Pre-check failed"):
             run(dbutils, spark)
+
+    @patch("pre_check.pre_check.MigrationConfig.from_workspace_file")
+    @patch("pre_check.pre_check.AuthManager")
+    @patch("pre_check.pre_check.TrackingManager")
+    @patch("pre_check.pre_check.CatalogExplorer")
+    def test_collision_probe_error_fails_closed(
+        self, mock_explorer_cls, mock_tracker_cls, mock_auth_cls, mock_from_file
+    ):
+        """Review finding #10: if the target probe errors (e.g. the SPN lacks
+        read access), collision detection must FAIL closed — not silently pass
+        — even under on_target_collision=skip."""
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config(on_target_collision="skip")
+        _setup_collision_mocks(
+            mock_auth_cls, mock_tracker_cls, mock_explorer_cls, spark,
+            discovery_rows=[
+                {"object_name": "`c`.`s`.`t`", "object_type": "managed_table", "source_type": "uc"}
+            ],
+            target_hits=set(),
+        )
+        # Probe errors with a non-NotFound error → must not read as "absent".
+        mock_auth_cls.return_value.target_client.tables.get.side_effect = PermissionDenied(
+            "SPN lacks read on target"
+        )
+
+        with pytest.raises(Exception, match="Pre-check failed"):
+            run(dbutils, spark)
+        # Even under skip policy, the unverifiable object must NOT be turned
+        # into a skipped_target_exists row.
+        appended = mock_tracker_cls.return_value.append_migration_status.call_args_list
+        seeded = [
+            row for call in appended for row in (call.args[0] if call.args else [])
+            if isinstance(row, dict) and row.get("status") == "skipped_target_exists"
+        ]
+        assert seeded == []
 
     @patch("pre_check.pre_check.MigrationConfig.from_workspace_file")
     @patch("pre_check.pre_check.AuthManager")

@@ -43,6 +43,7 @@ import time
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mv_st_worker")
@@ -110,6 +111,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     dbutils.widgets.text("batch", "[]")
     batch: list[dict] = json.loads(dbutils.widgets.get("batch"))

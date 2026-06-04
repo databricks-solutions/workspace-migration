@@ -200,6 +200,30 @@ class TestReconcileStaleRuns:
         tracker.append_migration_status.assert_not_called()
         mock_config.dry_run = False
 
+    def test_dry_run_does_not_run_cleanup_hook(self, mock_config):
+        """Review finding #9: cleanup hooks (volumes.delete / model drop) were
+        not gated on dry_run, so a dry-run reconcile would actually delete
+        target objects. A dry-run must NOT invoke the destructive hook."""
+        from migrate.reconciliation import reconcile_stale_runs
+
+        mock_config.dry_run = True
+        rows = [_mock_status_row("`cat`.`sch`.`v`", "volume", "in_progress", "old-run")]
+        spark = _spark_returning(rows)
+        tracker = MagicMock()
+        auth = MagicMock()
+
+        with patch("migrate.volume_worker.cleanup_partial_target") as cleanup:
+            out = reconcile_stale_runs(
+                spark=spark,
+                config=mock_config,
+                tracker=tracker,
+                auth=auth,
+                current_job_run_id="new-run",
+            )
+            cleanup.assert_not_called()
+        assert out["cleanup_count"] == 0
+        mock_config.dry_run = False
+
     def test_cleanup_hook_dispatched_for_volume(self, mock_config):
         """A volume in_progress row triggers cleanup_partial_target."""
         from migrate.reconciliation import reconcile_stale_runs

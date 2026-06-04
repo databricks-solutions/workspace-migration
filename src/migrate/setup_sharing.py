@@ -39,6 +39,7 @@ except ImportError:
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 from migrate.rls_cm import capture_rls_cm, has_rls_cm, make_staging_table_fqn
 
 logging.basicConfig(level=logging.INFO)
@@ -335,6 +336,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     # 1. Create or get the delta share on source
     share = get_or_create_share(auth, SHARE_NAME, dry_run=config.dry_run)

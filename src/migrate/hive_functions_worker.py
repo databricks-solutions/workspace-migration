@@ -30,6 +30,7 @@ from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
 from migrate.hive_common import rewrite_hive_namespace
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_functions_worker")
@@ -183,6 +184,7 @@ def run(dbutils, spark) -> None:
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     # Parse hive function list from task values (produced by hive_orchestrator)
     function_list_json = dbutils.jobs.taskValues.get(taskKey="hive_orchestrator", key="hive_function_list")

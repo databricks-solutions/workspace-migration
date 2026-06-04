@@ -987,7 +987,7 @@ class TestHiveManagedNondbfsIdempotency:
         config.dry_run = False
         config.hive_target_catalog = "uc_hive"
         res = migrate_hive_managed_nondbfs(
-            {"fqn": "`hive_metastore`.`db`.`t`",
+            {"object_name": "`hive_metastore`.`db`.`t`",
              "storage_location": "abfss://x@y/t", "provider": "delta"},
             config=config, auth=MagicMock(), tracker=MagicMock(),
             explorer=explorer, validator=validator, wh_id="wh",
