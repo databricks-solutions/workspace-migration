@@ -202,18 +202,50 @@ return handler(x)
 
 # COMMAND ----------
 
+# MV/ST require a serverless/Pro DBSQL warehouse — classic-cluster spark.sql
+# cannot create them (it silently fails, leaving mv/st untested). Create them
+# via the (ambient, source) workspace's statement execution against a
+# serverless warehouse; execute_statement auto-starts a stopped warehouse, so
+# we just poll through the cold start.
+from databricks.sdk import WorkspaceClient as _SeedWC  # noqa: E402
+from databricks.sdk.service.sql import StatementState as _SeedSS  # noqa: E402
+
+_seed_wc = _SeedWC()
+
+
+def _run_via_warehouse(sql: str) -> None:
+    import time as _t
+
+    _whs = [w for w in _seed_wc.warehouses.list() if getattr(w, "enable_serverless_compute", False)]
+    if not _whs:
+        _whs = list(_seed_wc.warehouses.list())
+    if not _whs:
+        raise RuntimeError("no SQL warehouse available to create MV/ST")
+    _wh = _whs[0]
+    _resp = _seed_wc.statement_execution.execute_statement(
+        warehouse_id=_wh.id, statement=sql, wait_timeout="50s"
+    )
+    _sid = _resp.statement_id
+    for _ in range(150):  # ~5 min to cover serverless cold-start + MV build
+        _s = _seed_wc.statement_execution.get_statement(_sid)
+        _st = _s.status.state
+        if _st == _SeedSS.SUCCEEDED:
+            return
+        if _st in (_SeedSS.FAILED, _SeedSS.CANCELED, _SeedSS.CLOSED):
+            raise RuntimeError(_s.status.error.message if _s.status.error else str(_st))
+        _t.sleep(2)
+    raise RuntimeError("warehouse statement timed out")
+
+
 # --- Phase 2.5.D: SQL-created materialized view ---
-# Wrapped in try/except because MV support requires a compatible DBR.
 _has_mv = False
 try:
-    spark.sql(  # noqa: F821
-        """
-        CREATE OR REPLACE MATERIALIZED VIEW integration_test_src.test_schema.mv_high_value
-        AS SELECT * FROM integration_test_src.test_schema.managed_orders WHERE amount > 100
-        """
+    _run_via_warehouse(
+        "CREATE OR REPLACE MATERIALIZED VIEW integration_test_src.test_schema.mv_high_value "
+        "AS SELECT * FROM integration_test_src.test_schema.managed_orders WHERE amount > 100"
     )
     _has_mv = True
-    print("Created materialized view mv_high_value.")
+    print("Created materialized view mv_high_value (via serverless warehouse).")
 except Exception as _exc:  # noqa: BLE001
     print(f"Skipped MV seed (unsupported on this runtime): {_exc}")
 
@@ -228,14 +260,12 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 # CREATE STREAMING TABLE from a warehouse / notebook context.
 _has_st = False
 try:
-    spark.sql(  # noqa: F821
-        """
-        CREATE OR REPLACE STREAMING TABLE integration_test_src.test_schema.st_orders
-        AS SELECT * FROM STREAM(integration_test_src.test_schema.managed_orders)
-        """
+    _run_via_warehouse(
+        "CREATE OR REPLACE STREAMING TABLE integration_test_src.test_schema.st_orders "
+        "AS SELECT * FROM STREAM(integration_test_src.test_schema.managed_orders)"
     )
     _has_st = True
-    print("Created streaming table st_orders.")
+    print("Created streaming table st_orders (via serverless warehouse).")
 except Exception as _exc:  # noqa: BLE001
     print(f"Skipped ST seed (unsupported on this runtime): {_exc}")
 
