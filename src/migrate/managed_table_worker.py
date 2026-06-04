@@ -275,17 +275,32 @@ def clone_table(
             "duration_seconds": duration,
         }
 
-    result = execute_and_poll(auth, wh_id, sql)
-    duration = time.time() - start
-
-    if result["state"] != "SUCCEEDED":
-        return {
-            "object_name": obj_name,
-            "object_type": "managed_table",
-            "status": "failed",
-            "error_message": result.get("error", result["state"]),
-            "duration_seconds": duration,
-        }
+    # Existence gate (review finding #2): CREATE OR REPLACE … DEEP CLONE is
+    # unconditionally destructive. If the target already exists and the
+    # operator hasn't opted into overwrite, do NOT re-clone — validate the
+    # existing target instead. This closes the orphan-replay window where a
+    # crash between clone and status-write leaves an in_progress row that
+    # reconciliation resets to pending, re-feeding the worker. Foreign
+    # pre-existing targets are caught earlier by collision pre-check.
+    overwrite = getattr(config, "overwrite_existing", False)
+    if not overwrite and validator.validate_object_exists(target_fqn):
+        logger.info(
+            "Target %s already exists; validating without re-clone "
+            "(set overwrite_existing=true to force CREATE OR REPLACE).",
+            target_fqn,
+        )
+        duration = time.time() - start
+    else:
+        result = execute_and_poll(auth, wh_id, sql)
+        duration = time.time() - start
+        if result["state"] != "SUCCEEDED":
+            return {
+                "object_name": obj_name,
+                "object_type": "managed_table",
+                "status": "failed",
+                "error_message": result.get("error", result["state"]),
+                "duration_seconds": duration,
+            }
 
     # Validate row count
     try:
