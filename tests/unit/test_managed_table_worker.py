@@ -237,8 +237,38 @@ class TestIcebergManagedTable:
         assert result["source_row_count"] == 10
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         assert any("USING ICEBERG" in s for s in sqls)  # CREATE executed
-        assert any("INSERT INTO" in s for s in sqls)  # Re-ingest executed
+        assert any("INSERT OVERWRITE" in s for s in sqls)  # idempotent re-ingest (#3)
         assert any("FROM `cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
+
+    @patch("migrate.managed_table_worker.time")
+    @patch("migrate.managed_table_worker.execute_and_poll")
+    def test_iceberg_is_idempotent_on_retry(self, mock_execute, mock_time):
+        """Review finding #3: the Iceberg branch did CREATE (non-idempotent)
+        then INSERT INTO (append). A retry after a successful CREATE would
+        append a second full copy. The CREATE must be IF NOT EXISTS and the
+        load must be INSERT OVERWRITE so a re-run can't double rows."""
+        from migrate.managed_table_worker import clone_table
+
+        mock_time.time.side_effect = [100.0, 130.0, 160.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+
+        deps = self._make_deps(iceberg_strategy="ddl_replay")
+        deps["validator"].validate_row_count.return_value = {
+            "match": True, "source_count": 10, "target_count": 10,
+        }
+        table_info = {
+            "object_name": "`cat`.`sch`.`ice_tbl`",
+            "format": "iceberg",
+            "create_statement": "CREATE TABLE `cat`.`sch`.`ice_tbl` (id INT) USING ICEBERG",
+        }
+        clone_table(table_info, **deps)
+
+        sqls = [c.args[2] for c in mock_execute.call_args_list]
+        create_sql = next(s for s in sqls if "USING ICEBERG" in s)
+        insert_sql = next(s for s in sqls if "INSERT" in s)
+        assert "CREATE TABLE IF NOT EXISTS" in create_sql
+        assert "INSERT OVERWRITE" in insert_sql
+        assert "INSERT INTO" not in insert_sql
 
     @patch("migrate.managed_table_worker.time")
     @patch("migrate.managed_table_worker.execute_and_poll")
@@ -360,7 +390,7 @@ class TestIcebergManagedTable:
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         # Both ddl_replay statements must have run on the second pass.
         assert any("USING ICEBERG" in s for s in sqls), "CREATE DDL not replayed"
-        assert any("INSERT INTO" in s for s in sqls), "Data re-ingest not executed"
+        assert any("INSERT OVERWRITE" in s for s in sqls), "Data re-ingest not executed"
         # Ingest reads from the consumer catalog exposed by the share.
         assert any("`cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
 

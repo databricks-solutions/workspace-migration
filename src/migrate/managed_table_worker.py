@@ -28,7 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
-from common.sql_utils import execute_and_poll, find_warehouse
+from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
 from common.validation import Validator
 from migrate.reconciliation import maybe_kill
@@ -176,7 +176,11 @@ def clone_table(
                 "duration_seconds": time.time() - start,
             }
 
-        insert_sql = f"INSERT INTO {target_fqn} SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
+        # Idempotency (review finding #3): make CREATE non-destructive-on-retry
+        # (IF NOT EXISTS) and the load replace-not-append (INSERT OVERWRITE), so
+        # a retry after a successful first attempt can't double the rows.
+        create_stmt = rewrite_ddl(create_stmt, r"CREATE\s+TABLE\b", "CREATE TABLE IF NOT EXISTS")
+        insert_sql = f"INSERT OVERWRITE {target_fqn} SELECT * FROM `{consumer_catalog}`.`{schema}`.`{table}`"
 
         if config.dry_run:
             duration = time.time() - start
