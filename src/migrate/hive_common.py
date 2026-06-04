@@ -49,6 +49,6 @@ HIVE_TO_UC_PRIVILEGES = {
     "CREATE": "CREATE SCHEMA",
     "CREATE_NAMED_FUNCTION": "CREATE FUNCTION",
     "USAGE": "USE CATALOG",
-    "OWN": "OWNER",  # Ownership is transferred, not granted; worker skips this case.
+    "OWN": "OWNER",  # Ownership is transferred via ALTER ... OWNER TO (hive_grants_worker), not granted.
     "ALL PRIVILEGES": "ALL PRIVILEGES",
 }
