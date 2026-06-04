@@ -10,6 +10,14 @@
 
 ---
 
+## Status
+
+- **Phase 1 — ✅ COMPLETE** (8/13 findings: #1,#2,#3,#4,#7,#8,#9,#10). All TDD, 878 unit tests green. PR opened for independent review. Not yet live-integration-tested.
+- **Phase 2 — in progress** (#5 ownership, #6 collision probes + guard test, integration-test expansion). Stacked on the Phase 1 branch.
+- **Phase 3 — pending** (#11 CI, #12 config untrack, #13 admin group).
+
+---
+
 ## Design Decisions (locked — flagged for user veto before execution)
 
 | # | Decision | Rationale |
