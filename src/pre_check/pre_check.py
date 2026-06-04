@@ -22,7 +22,11 @@ from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
-from pre_check.collision_detection import build_skip_status_rows, detect_collisions
+from pre_check.collision_detection import (
+    build_skip_status_rows,
+    detect_collisions,
+    unprobed_types_present,
+)
 
 # COMMAND ----------
 
@@ -567,6 +571,19 @@ def run(dbutils, spark):  # noqa: D103
                     "Rename, drop, or move the colliding target object(s); or set "
                     "on_target_collision=skip to proceed without overwriting them.",
                 )
+        # Surface coverage (review finding #6): name the in-scope object types
+        # that were NOT collision-checked, so a clean result isn't misread as
+        # "everything is safe".
+        unprobed = unprobed_types_present(discovery_dicts)
+        if unprobed:
+            _add(
+                "check_collision_coverage",
+                "PASS",
+                f"NOT collision-checked: {', '.join(unprobed)}. These target object "
+                "types were not probed for pre-existence (see collision_detection "
+                "._NOT_PROBED_TYPES for the rationale per type); verify manually if "
+                "reusing a populated target.",
+            )
     except Exception as e:  # noqa: BLE001 — discovery_inventory absent / transient
         # discovery_inventory / migration_status may not exist yet on a
         # first-ever pre_check run. init_tracking_tables above created
