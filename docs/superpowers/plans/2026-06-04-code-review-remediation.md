@@ -12,9 +12,11 @@
 
 ## Status
 
-- **Phase 1 — ✅ COMPLETE** (8/13 findings: #1,#2,#3,#4,#7,#8,#9,#10). All TDD, 878 unit tests green. PR opened for independent review. Not yet live-integration-tested.
-- **Phase 2 — in progress** (#5 ownership, #6 collision probes + guard test, integration-test expansion). Stacked on the Phase 1 branch.
-- **Phase 3 — pending** (#11 CI, #12 config untrack, #13 admin group).
+- **Phase 1 — ✅ COMPLETE** (8/13: #1,#2,#3,#4,#7,#8,#9,#10). PR #2. 878 tests.
+- **Phase 2 code — ✅ COMPLETE** (#5 ownership, #6 collision probes + self-enforcing guard test). 891 tests.
+- **Phase 3 — ✅ COMPLETE** (#11 CI wiring + coverage→src/, #12 config untrack + gitignore, #13 admin-group var). 891 tests.
+- **All 13 findings fixed at code/config level.** Remaining work is the **integration-test expansion** (Tasks 2.3/2.4) — needs live workspaces + SQL Server standup + DBU. Plus two tracked follow-ups: retry/collision DAB workflows (#11), full-`src/` mypy (108 pre-existing errors, #11), git-history re-scrub (#12).
+- **Not yet live-integration-tested.**
 
 ---
 
