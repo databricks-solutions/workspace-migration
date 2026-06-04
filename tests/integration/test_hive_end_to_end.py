@@ -205,18 +205,12 @@ if str(_has_multi_upstream).lower() == "true":
 else:
     print("2.10 skipped: seed did not create multi-upstream view.")
 
-# --- 2.11 cross-catalog view (references a UC catalog) ---
-_has_xcat = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_hive", key="has_cross_catalog_view", debugValue="false"
-)
-if str(_has_xcat).lower() == "true":
-    rows_xc = _validated_hive_rows("hive_view", "mixed_ref_view")
-    if not rows_xc:
-        error_messages.append("2.11: mixed_ref_view row missing from migration_status.")
-    elif _expect_validated(rows_xc[0], "2.11 mixed_ref_view"):
-        print("2.11 OK: cross-catalog view mixed_ref_view validated.")
-else:
-    print("2.11 skipped: seed did not create cross-catalog view.")
+# 2.11 (cross-catalog view referencing a UC catalog) was removed: it was the
+# only fixture that created a UC catalog on the Hive side, which forced the
+# fragile catalog_filter="<nonexistent>" hack to keep UC discovery a no-op.
+# That hack now hard-errors under the H8 "raise on empty filter" fix, so the
+# fixture + the filter were dropped together (niche scenario; unblocks the rest
+# of the hive suite). See the workflow YAML (no catalog_filter) for context.
 
 # --- 2.12 partitioned DBFS-root ---
 _has_part_dbfs = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821

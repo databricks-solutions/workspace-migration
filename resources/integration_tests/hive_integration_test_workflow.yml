@@ -29,13 +29,12 @@ resources:
               # visible batch_size no longer has to be lowered for
               # environments with sizable FQNs / storage_locations.
               batch_size: "10"
-              # Restrict UC discovery to integration_test_src so the
-              # Hive cross-catalog-view fixture's parallel UC catalog
-              # (integration_test_hive_ucref) is NOT discovered and
-              # migrated. Hive integration doesn't seed integration_test_src
-              # on source, so UC discovery finds nothing — matches the
-              # pre-2.11 implicit behavior.
-              catalog_filter: "integration_test_src"
+              # No catalog_filter: the hive test no longer seeds any UC catalog
+              # (the 2.11 cross-catalog-view fixture was removed), so UC
+              # discovery legitimately finds nothing and hive discovery runs.
+              # The old filter pointed at a nonexistent catalog to force an
+              # empty UC scan — a hack that now hard-errors under the H8
+              # raise-on-empty-filter guard.
 
         - task_key: seed_hive
           depends_on:
