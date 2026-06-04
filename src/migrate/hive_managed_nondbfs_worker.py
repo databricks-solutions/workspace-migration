@@ -93,7 +93,7 @@ def migrate_hive_managed_nondbfs(
 
     The target points at the same storage path as the source — no data copy.
     """
-    source_fqn = record["fqn"]
+    source_fqn = record["object_name"]
     storage_location = record.get("storage_location", "")
     provider = (record.get("provider") or "").lower()
     target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
@@ -261,7 +261,7 @@ def run(dbutils, spark) -> None:
                 res = future.result()
             except Exception as exc:  # noqa: BLE001
                 res = {
-                    "object_name": rec_info["fqn"],
+                    "object_name": rec_info["object_name"],
                     "object_type": "hive_managed_nondbfs",
                     "status": "failed",
                     "error_message": str(exc),
