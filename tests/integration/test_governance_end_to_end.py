@@ -231,6 +231,16 @@ _gov_cov = tracker.get_latest_migration_status()
 _gov_by_type: dict[str, set] = {}
 for _r in _gov_cov.select("object_type", "status").distinct().collect():
     _gov_by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+# Discovery presence: lets the guard distinguish "not discovered" (seed/source
+# gap) from "discovered but not migrated" (worker gap) for NONE types.
+_gov_discovered: set = set()
+try:
+    _disc = spark.sql(  # noqa: F821
+        f"SELECT DISTINCT object_type FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory"
+    ).collect()
+    _gov_discovered = {_r["object_type"] for _r in _disc}
+except Exception as _exc:  # noqa: BLE001
+    print(f"(could not read discovery_inventory for coverage diagnosis: {_exc})")
 for _t, _ok in _GOV_EXPECTED.items():
     _got = _gov_by_type.get(_t, set())
     if _got & _ok:
@@ -250,6 +260,14 @@ for _t, _ok in _GOV_EXPECTED.items():
             )
             _why = " Failures: " + "; ".join(
                 f"{_fr['object_name']}: {_fr['error_message']}" for _fr in _frows
+            )
+        elif not _got:
+            # Distinguish not-discovered (seed/source gap) from
+            # discovered-but-not-migrated (worker gap).
+            _why = (
+                " [discovered but NOT migrated — worker gap]"
+                if _t in _gov_discovered
+                else " [NOT in discovery_inventory — seed/source gap]"
             )
         error_messages.append(
             f"COVERAGE: in-scope governance type '{_t}' was NOT exercised — expected "
