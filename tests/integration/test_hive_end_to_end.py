@@ -322,6 +322,94 @@ else:
     print("2.15 skipped: seed did not create view chain.")
 
 # COMMAND ----------
+# --- Coverage guard: every hive-owned in-scope type must be EXERCISED ---
+# Red-if-untested (same mechanism as the UC + governance suites). The hive
+# suite (migrate_hive) owns these object types. A type is "exercised" when
+# migration_status has a row in its expected terminal state (validated).
+# Anything in scope that isn't exercised — and isn't explicitly
+# exempted-with-reason — fails the run, naming the type, so a silently
+# untested type shows RED instead of a false green.
+#
+# Exemptions are surfaced loudly (an EXEMPT line, never a silent green), and
+# only apply to types whose *source fixture* genuinely can't be created in
+# this environment — NOT to a seeded type whose migration failed (that stays
+# hard RED). Two environmental gates:
+#  1. The whole DBFS-root group only runs when migrate_hive_dbfs_root is on.
+#  2. hive_external / hive_managed_nondbfs are seeded by writing hive_metastore
+#     tables to a RAW abfss LOCATION, which needs a direct storage account key.
+#     The serverless test compute reaches ADLS only via UC external locations,
+#     so it can't create those source tables (managed_dbfs_root has no explicit
+#     LOCATION, so it seeds fine). The seed reports has_hive_external /
+#     has_hive_nondbfs=false when it couldn't; we exempt-with-reason on that.
+_HIVE_EXPECTED = {
+    "hive_view": {"validated"},
+    "hive_function": {"validated"},
+    "hive_grant": {"validated"},
+    "hive_managed_dbfs_root": {"validated"},
+    "hive_managed_nondbfs": {"validated"},
+    "hive_external": {"validated"},
+}
+_HIVE_COVERAGE_EXEMPT: dict[str, str] = {}
+if not config.migrate_hive_dbfs_root:
+    _dbfs_reason = "requires migrate_hive_dbfs_root=true (DBFS-root migration disabled this run)"
+    for _t in ("hive_managed_dbfs_root", "hive_managed_nondbfs", "hive_external"):
+        _HIVE_COVERAGE_EXEMPT[_t] = _dbfs_reason
+else:
+    # Gate the raw-abfss-LOCATION fixtures on whether the seed could create
+    # them (serverless seed compute lacks a direct storage account key).
+    _seed_storage_reason = (
+        "source fixture not seeded — serverless seed compute can't write a "
+        "hive_metastore table to a raw abfss LOCATION (no direct storage "
+        "account key; needs a classic cluster with storage creds). Migration "
+        "path itself is unaffected."
+    )
+    _has_ext = str(
+        dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+            taskKey="seed_hive", key="has_hive_external", debugValue="false"
+        )
+    ).lower()
+    _has_nd = str(
+        dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+            taskKey="seed_hive", key="has_hive_nondbfs", debugValue="false"
+        )
+    ).lower()
+    if _has_ext != "true":
+        _HIVE_COVERAGE_EXEMPT["hive_external"] = _seed_storage_reason
+    if _has_nd != "true":
+        _HIVE_COVERAGE_EXEMPT["hive_managed_nondbfs"] = _seed_storage_reason
+
+_hive_cov = tracker.get_latest_migration_status()
+_hive_by_type: dict[str, set] = {}
+for _r in _hive_cov.select("object_type", "status").distinct().collect():
+    _hive_by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+
+for _t, _ok in _HIVE_EXPECTED.items():
+    _got = _hive_by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _HIVE_COVERAGE_EXEMPT:
+        print(f"COVERAGE EXEMPT '{_t}': {_HIVE_COVERAGE_EXEMPT[_t]}")
+    elif _got:
+        # Attempted but never reached a validated state — surface the failure
+        # messages so the red names WHY, not just THAT it failed.
+        _fails = (
+            _hive_cov.filter(f"object_type = '{_t}' AND status != 'validated'")
+            .select("object_name", "status", "error_message")
+            .limit(5)
+            .collect()
+        )
+        _detail = "; ".join(f"{_r['object_name']}: {_r['error_message']}" for _r in _fails)
+        error_messages.append(
+            f"COVERAGE: in-scope hive type '{_t}' was NOT validated — found {sorted(_got)}. "
+            f"Failures: {_detail}"
+        )
+    else:
+        error_messages.append(
+            f"COVERAGE: in-scope hive type '{_t}' was NOT exercised — expected {sorted(_ok)}, "
+            f"found NONE. Type is untested."
+        )
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
