@@ -225,15 +225,10 @@ _GOV_EXPECTED = {
     "recipient": {"validated"},
     "provider": {"validated"},
 }
-# type -> reason (surfaced, never silent). These two can't be tested in this
-# lab without manual infra an account admin must provide; flip them back to
-# enforced once that's in place.
+# type -> reason (surfaced, never silent). Flip back to enforced once the infra
+# exists. (policy: now ENFORCED — ABAC enabled at account level. connection/
+# foreign_catalog: now ENFORCED — private-link NCC PEs wired to the SQL server.)
 _GOV_COVERAGE_EXEMPT: dict[str, str] = {
-    "policy": (
-        "ABAC preview not enrolled on this workspace (no CLI/settings toggle; "
-        "requires account-console preview enrollment). Re-enable enforcement "
-        "once ABAC is enrolled and the seed's SET ABAC POLICY succeeds."
-    ),
     "provider": (
         "Inbound Delta Sharing provider requires a SECOND provider workspace "
         "sharing into this one. Re-enable enforcement once that workspace + "

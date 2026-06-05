@@ -764,6 +764,58 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 )
 
 # COMMAND ----------
+# --- 3.21 / 3.22 UC connection + foreign catalog (SQL Server federation) ---
+# Create a UC connection to the test Azure SQL Server + a foreign catalog so
+# discovery finds them and migrate_connections / migrate_foreign_catalogs
+# exercise them. MUST run via a SERVERLESS warehouse: the connection reaches
+# the SQL server over the NCC private endpoint (serverless-only egress) —
+# classic-cluster spark.sql egresses via the workspace VNet, which has no
+# route to the (private-link-only-reachable) SQL server. Password comes from
+# the ``migration`` secret scope (never committed).
+_CONN_NAME = "integration_test_sqlserver"
+_FC_NAME = "integration_test_fc_sqlserver"
+_SQL_HOST = "sqlsrv-wsm-test-ne.database.windows.net"
+_SQL_DB = "sqldb-wsm-test"
+_has_connection = False
+try:
+    from databricks.sdk import WorkspaceClient as _ConnWC  # noqa: E402
+    from databricks.sdk.service.sql import StatementState as _ConnSS  # noqa: E402
+
+    _conn_wc = _ConnWC()
+    _sql_pwd = dbutils.secrets.get(scope="migration", key="sqltest-password")  # type: ignore[name-defined]  # noqa: F821
+
+    def _conn_run(sql: str) -> None:
+        import time as _t
+
+        _whs = [w for w in _conn_wc.warehouses.list() if getattr(w, "enable_serverless_compute", False)]
+        _whs = _whs or list(_conn_wc.warehouses.list())
+        _wh = _whs[0]
+        _r = _conn_wc.statement_execution.execute_statement(warehouse_id=_wh.id, statement=sql, wait_timeout="50s")
+        _sid = _r.statement_id
+        for _ in range(120):
+            _s = _conn_wc.statement_execution.get_statement(_sid)
+            if _s.status.state == _ConnSS.SUCCEEDED:
+                return
+            if _s.status.state in (_ConnSS.FAILED, _ConnSS.CANCELED, _ConnSS.CLOSED):
+                raise RuntimeError(_s.status.error.message if _s.status.error else str(_s.status.state))
+            _t.sleep(2)
+        raise RuntimeError("connection-seed statement timed out")
+
+    _conn_run(
+        f"CREATE CONNECTION IF NOT EXISTS {_CONN_NAME} TYPE sqlserver "
+        f"OPTIONS (host '{_SQL_HOST}', port '1433', user 'wsmtestadmin', password '{_sql_pwd}')"
+    )
+    _conn_run(
+        f"CREATE FOREIGN CATALOG IF NOT EXISTS {_FC_NAME} "
+        f"USING CONNECTION {_CONN_NAME} OPTIONS (database '{_SQL_DB}')"
+    )
+    _has_connection = True
+    print(f"Created UC connection '{_CONN_NAME}' + foreign catalog '{_FC_NAME}' (SQL Server federation).")
+except Exception as _exc:  # noqa: BLE001
+    print(f"Skipped connection/foreign-catalog seed: {_exc}")
+dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
+    key="has_connection", value="true" if _has_connection else "false"
+)
 
 # COMMAND ----------
 
