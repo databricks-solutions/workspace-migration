@@ -31,8 +31,10 @@ config = MigrationConfig.from_workspace_file()
 tracker = TrackingManager(spark, config)  # noqa: F821
 
 status_df = tracker.get_latest_migration_status()
-# UC-only object types: base (Phase 1) + Phase 2.5 (mv, st)
-uc_types = ("managed_table", "external_table", "view", "function", "volume", "mv", "st")
+# UC-only object types migrated by this phase.
+# mv/st are out of scope for this phase (hard-excluded; deferred to the
+# Stateful Services Phase). They are intentionally NOT seeded or asserted here.
+uc_types = ("managed_table", "external_table", "view", "function", "volume")
 status_df = status_df.filter(status_df.object_type.isin(list(uc_types)))
 
 total = status_df.count()
@@ -224,54 +226,6 @@ try:
 except Exception as _exc:  # noqa: BLE001
     error_messages.append(f"Phase 2.5.C: py_double failed on target: {_exc}")
 
-# COMMAND ----------
-# --- Phase 2.5.D: SQL-created MV ---
-# Phase 4 scope change: MVs are hard-excluded from the core migration
-# tool. The worker short-circuits to ``skipped_by_stateful_service_
-# migration`` (same pattern as ST since PR #41). The Stateful Services
-# Phase (separate future job) handles MV migration with proper pipeline-
-# state semantics. See docs/stateful_services_phase.md.
-has_mv = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_uc", key="has_mv", debugValue="false"
-)
-if str(has_mv).lower() == "true":
-    mv_status = status_df.filter("object_type = 'mv' AND object_name LIKE '%mv_high_value%'").collect()
-    if not mv_status:
-        error_messages.append("Phase 2.5.D: MV row missing from migration_status.")
-    elif mv_status[0]["status"] != "skipped_by_stateful_service_migration":
-        error_messages.append(
-            f"Phase 2.5.D: MV status is '{mv_status[0]['status']}', expected "
-            f"'skipped_by_stateful_service_migration' (Phase 4 hard-exclude). "
-            f"error={mv_status[0]['error_message']}"
-        )
-    else:
-        print(f"Phase 2.5.D MV hard-excluded (as expected): {mv_status[0]['object_name']}")
-else:
-    _skip("Phase 2.5.D: MV fixture not seeded; skipping MV assertion.")
-
-# COMMAND ----------
-# --- Phase 2.5.D: SQL-created streaming table ---
-has_st = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_uc", key="has_st", debugValue="false"
-)
-if str(has_st).lower() == "true":
-    st_status = status_df.filter("object_type = 'st' AND object_name LIKE '%st_orders%'").collect()
-    if not st_status:
-        error_messages.append("Phase 2.5.D: ST row missing from migration_status.")
-    elif st_status[0]["status"] != "skipped_by_stateful_service_migration":
-        # Scope change: streaming tables are hard-excluded from the core
-        # migration tool (migrated by the future Stateful Services Phase).
-        # The worker short-circuits to skipped_by_stateful_service_migration
-        # with a documented error_message pointer to
-        # docs/stateful_services_phase.md.
-        error_messages.append(
-            f"Phase 2.5.D: ST status is '{st_status[0]['status']}', expected "
-            f"'skipped_by_stateful_service_migration'. error={st_status[0]['error_message']}"
-        )
-    else:
-        print(f"Phase 2.5.D ST hard-excluded (as expected): {st_status[0]['object_name']}")
-else:
-    _skip("Phase 2.5.D: ST fixture not seeded; skipping ST assertion.")
 
 # COMMAND ----------
 # --- Phase 2.5.B: Iceberg managed table ---
@@ -919,28 +873,6 @@ else:
 # Those tests pin the contract: CREATE ok + REFRESH fail → status=validated,
 # error_message contains 'REFRESH failed' + the refresh error.
 
-# COMMAND ----------
-# --- 2.5.12 (superseded): Streaming tables now hard-excluded ---
-# The prior streaming-state warning assertion is obsolete. Streaming
-# tables are now hard-excluded from the core tool; mv_st_worker short-
-# circuits them to ``skipped_by_stateful_service_migration`` with a
-# documented error_message pointing at docs/stateful_services_phase.md.
-# The base 2.5.D ST assertion above already verifies the new terminal
-# state, so 2.5.12 degrades to a docstring pointer.
-
-if str(has_st).lower() == "true":
-    _st_status_rows = status_df.filter("object_type = 'st' AND object_name LIKE '%st_orders%'").collect()
-    if _st_status_rows:
-        _err = (_st_status_rows[0]["error_message"] or "")
-        if "stateful_services_phase.md" not in _err.lower():
-            error_messages.append(
-                f"2.5.12: st_orders error_message does not reference "
-                f"stateful_services_phase.md. Got: {_err!r}."
-            )
-        else:
-            print(f"2.5.12 validated: st_orders error_message points at the new phase doc: {_err[:160]!r}")
-else:
-    _skip("2.5.12: ST fixture not seeded; skipping stateful-services pointer check.")
 
 # COMMAND ----------
 
@@ -1277,8 +1209,10 @@ _UC_EXPECTED = {
     "view": {"validated"},
     "grant": {"validated"},
     "registered_model": {"validated"},
-    "mv": {"skipped_by_stateful_service_migration"},
-    "st": {"skipped_by_stateful_service_migration"},
+    # NOTE: mv / st are deliberately NOT in this guard — they are hard-excluded
+    # in this phase and their migration is deferred to the Stateful Services
+    # Phase (alongside vector search / online tables). The hard-exclude itself
+    # is covered by unit tests (test_mv_st_worker.py).
 }
 # type -> reason. Surfaced (never silent). Empty = enforce all.
 _UC_COVERAGE_EXEMPT: dict[str, str] = {}
