@@ -225,8 +225,21 @@ _GOV_EXPECTED = {
     "recipient": {"validated"},
     "provider": {"validated"},
 }
-# type -> reason (surfaced, never silent). Empty = enforce all.
-_GOV_COVERAGE_EXEMPT: dict[str, str] = {}
+# type -> reason (surfaced, never silent). These two can't be tested in this
+# lab without manual infra an account admin must provide; flip them back to
+# enforced once that's in place.
+_GOV_COVERAGE_EXEMPT: dict[str, str] = {
+    "policy": (
+        "ABAC preview not enrolled on this workspace (no CLI/settings toggle; "
+        "requires account-console preview enrollment). Re-enable enforcement "
+        "once ABAC is enrolled and the seed's SET ABAC POLICY succeeds."
+    ),
+    "provider": (
+        "Inbound Delta Sharing provider requires a SECOND provider workspace "
+        "sharing into this one. Re-enable enforcement once that workspace + "
+        "outbound share exist."
+    ),
+}
 _gov_cov = tracker.get_latest_migration_status()
 _gov_by_type: dict[str, set] = {}
 for _r in _gov_cov.select("object_type", "status").distinct().collect():
