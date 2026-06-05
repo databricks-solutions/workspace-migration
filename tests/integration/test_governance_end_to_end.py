@@ -238,9 +238,22 @@ for _t, _ok in _GOV_EXPECTED.items():
     elif _t in _GOV_COVERAGE_EXEMPT:
         print(f"COVERAGE EXEMPT '{_t}': {_GOV_COVERAGE_EXEMPT[_t]}")
     else:
+        # If the type was attempted but FAILED, surface the latest
+        # error_message so the guard says WHY, not just THAT it's untested.
+        _why = ""
+        if "failed" in _got:
+            _frows = (
+                _gov_cov.filter(f"object_type = '{_t}' AND status = 'failed'")
+                .select("object_name", "error_message")
+                .limit(2)
+                .collect()
+            )
+            _why = " Failures: " + "; ".join(
+                f"{_fr['object_name']}: {_fr['error_message']}" for _fr in _frows
+            )
         error_messages.append(
             f"COVERAGE: in-scope governance type '{_t}' was NOT exercised — expected "
-            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested."
+            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested.{_why}"
         )
 
 # COMMAND ----------
