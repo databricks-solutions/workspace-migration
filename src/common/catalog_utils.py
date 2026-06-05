@@ -581,13 +581,14 @@ class CatalogExplorer:
         seen: set[str] = set()
         for sec_type, full_name in securables:
             try:
+                # ABAC policies are addressed by PATH params, not query params:
+                # GET /api/2.1/unity-catalog/policies/{securable_type}/{fullname}.
+                # The query-param form returns "No API found" — that 404 was
+                # being swallowed here, which is why policies never appeared in
+                # discovery (root cause of the always-NONE policy coverage).
                 resp = client.do(
                     "GET",
-                    "/api/2.1/unity-catalog/policies",
-                    query={
-                        "on_securable_type": sec_type,
-                        "on_securable_fullname": full_name,
-                    },
+                    f"/api/2.1/unity-catalog/policies/{sec_type}/{full_name}",
                 )
             except Exception:  # noqa: BLE001 — preview absent, perms, etc.
                 continue
@@ -682,10 +683,14 @@ class CatalogExplorer:
         try:
             client = self.auth_manager.source_client  # type: ignore[attr-defined]
             for c in client.connections.list():
+                _ct = getattr(c, "connection_type", "")
+                # Store the clean value ("SQLSERVER"), not the enum repr
+                # ("ConnectionType.SQLSERVER") — the latter breaks the worker's
+                # ConnectionType coercion. ``.value`` for an enum, else str.
                 results.append(
                     {
                         "connection_name": c.name,
-                        "connection_type": str(getattr(c, "connection_type", "")),
+                        "connection_type": getattr(_ct, "value", str(_ct)),
                         "options": dict(getattr(c, "options", {}) or {}),
                         "comment": getattr(c, "comment", None),
                     }
@@ -773,7 +778,14 @@ class CatalogExplorer:
         results: list[dict] = []
         try:
             client = self.auth_manager.source_client  # type: ignore[attr-defined]
-            for s in client.shares.list():  # type: ignore[attr-defined]
+            # SDK compat: SharesAPI.list() was renamed to list_shares() in
+            # newer databricks-sdk (the pin is >=0.30, unbounded). Calling the
+            # missing name raises AttributeError, which the outer except below
+            # swallowed → shares ALWAYS came back empty (recipients use the
+            # still-present .list(), which is why recipient migrated but share
+            # never did). Prefer the new name, fall back to the old.
+            _share_lister = getattr(client.shares, "list_shares", None) or client.shares.list
+            for s in _share_lister():  # type: ignore[attr-defined]
                 if s.name in exclude_names:
                     continue
                 objects = []

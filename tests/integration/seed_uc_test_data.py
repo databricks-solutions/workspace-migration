@@ -737,18 +737,24 @@ try:
     # can't see the share, the 3.24 hard assertion in
     # ``test_uc_end_to_end.py`` fails loud with a clear message.
     if config.spn_client_id:
-        with contextlib.suppress(Exception):
+        # NOTE: do NOT suppress these — a swallowed failure here is exactly
+        # how the share silently vanishes from discovery (recipient lands
+        # green, share goes missing). Surface the error to the run log so
+        # the cause is visible instead of guessed.
+        try:
             spark.sql(  # noqa: F821
                 f"ALTER SHARE `{_CUSTOMER_SHARE}` OWNER TO `{config.spn_client_id}`"
             )
-        with contextlib.suppress(Exception):
+            print(f"Share '{_CUSTOMER_SHARE}' OWNER TO {config.spn_client_id} OK.")
+        except Exception as _own_exc:  # noqa: BLE001
+            print(f"!! Share OWNER TO FAILED: {_own_exc}")
+        try:
             spark.sql(  # noqa: F821
                 f"ALTER RECIPIENT `{_CUSTOMER_RECIPIENT}` OWNER TO `{config.spn_client_id}`"
             )
-        print(
-            f"Transferred ownership of share '{_CUSTOMER_SHARE}' + recipient "
-            f"'{_CUSTOMER_RECIPIENT}' to SPN {config.spn_client_id}."
-        )
+            print(f"Recipient '{_CUSTOMER_RECIPIENT}' OWNER TO {config.spn_client_id} OK.")
+        except Exception as _own_exc:  # noqa: BLE001
+            print(f"!! Recipient OWNER TO FAILED: {_own_exc}")
     _has_customer_share = True
     print(f"Created customer share '{_CUSTOMER_SHARE}' with recipient '{_CUSTOMER_RECIPIENT}'.")
 except Exception as _exc:  # noqa: BLE001
@@ -835,36 +841,77 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 
 _has_abac = False
 try:
+    # A 0-arg row-filter function needs no column binding, so the policy
+    # parses without MATCH/USING COLUMNS (those require the tag-driven
+    # has_tag_value() form, which needs account-level governed tag policies).
+    # A coarse admin-gate filter is a valid ABAC row filter and exercises the
+    # full discover -> migrate -> assert path.
     spark.sql(  # noqa: F821
         """
-        CREATE OR REPLACE FUNCTION integration_test_src.test_schema.abac_filter(region STRING)
+        CREATE OR REPLACE FUNCTION integration_test_src.test_schema.abac_filter()
         RETURNS BOOLEAN
-        RETURN region IS NOT NULL
+        RETURN is_account_group_member('admins')
         """
     )
-    # The SET ABAC POLICY shape is the canonical attach form. Policy
-    # name is scoped to the securable so it's fine to reuse a fixed
-    # value across re-runs — idempotent via CREATE OR REPLACE shape
-    # where supported; otherwise we swallow ``already exists``.
+    # Canonical ABAC attach form (preview GA 2026-05):
+    #   CREATE POLICY <name> ON TABLE <t> ROW FILTER <fn> TO <principals> FOR TABLES
+    # The older ``ALTER TABLE ... SET ABAC POLICY`` shape is not accepted on
+    # current runtimes; ``USING COLUMNS``/``MATCH COLUMNS`` are parse errors
+    # unless the filter binds tagged columns. Discovery reads policies via
+    # GET /api/2.1/unity-catalog/policies/{type}/{fullname} (probes TABLE
+    # securables, discovery.py:178). Do NOT swallow the error — if the attach
+    # fails we must see why, not silently degrade to has_abac=false.
     spark.sql(  # noqa: F821
         """
-        ALTER TABLE integration_test_src.test_schema.managed_orders
-        SET ABAC POLICY abac_orders_policy
+        CREATE OR REPLACE POLICY abac_orders_policy
+        ON TABLE integration_test_src.test_schema.managed_orders
         COMMENT 'integration-test ABAC policy'
-        MATCH columns (region)
-        ON ROW FILTER integration_test_src.test_schema.abac_filter
+        ROW FILTER integration_test_src.test_schema.abac_filter
+        TO `account users`
+        FOR TABLES
         """
     )
     _has_abac = True
     print("Applied ABAC policy abac_orders_policy to managed_orders.")
 except Exception as _exc:  # noqa: BLE001
-    # Some workspace runtimes reject the SET ABAC POLICY syntax entirely;
-    # others only reject specific clauses. Either way, the assertion path
-    # is gated — no need to fail the whole seed.
-    print(f"Skipped ABAC seed (unsupported on this runtime): {_exc}")
+    print(f"!! ABAC policy seed FAILED: {_exc}")
 
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_abac", value="true" if _has_abac else "false"
+)
+
+# COMMAND ----------
+
+# --- 3.17 Lakehouse quality monitor ---
+# Attach a snapshot monitor to ``managed_orders`` so discovery's
+# list_monitors (GET /tables/{fqn}/monitor) returns a row and the
+# monitors_worker re-creates it on target. A snapshot monitor needs no
+# timestamp/granularity config — simplest shape that still exercises the
+# full discover -> migrate -> assert path. The monitor's metric tables
+# land in the same schema (output_schema_name). Create is async (monitor
+# provisions PENDING -> ACTIVE) but the GET returns the definition as soon
+# as it exists, so discovery finds it without waiting for ACTIVE.
+_has_monitor = False
+try:
+    from databricks.sdk.service.catalog import MonitorSnapshot  # noqa: E402
+
+    _MON_TABLE = "integration_test_src.test_schema.managed_orders"
+    # Idempotency: drop any monitor left by a prior run so create is clean.
+    with contextlib.suppress(Exception):
+        _w_seed.quality_monitors.delete(table_name=_MON_TABLE)
+    _w_seed.quality_monitors.create(
+        table_name=_MON_TABLE,
+        assets_dir="/Workspace/Shared/cp_migration_monitor_assets/managed_orders",
+        output_schema_name="integration_test_src.test_schema",
+        snapshot=MonitorSnapshot(),
+    )
+    _has_monitor = True
+    print(f"Created snapshot monitor on {_MON_TABLE}.")
+except Exception as _exc:  # noqa: BLE001
+    print(f"!! Monitor seed FAILED: {_exc}")
+
+dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
+    key="has_monitor", value="true" if _has_monitor else "false"
 )
 
 # COMMAND ----------
