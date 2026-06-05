@@ -80,6 +80,23 @@ _sql_on_target("""
     ) USING DELTA
 """)
 
+# The row filter / column mask reference UDFs (region_filter / mask_customer).
+# In a real migration migrate_uc (migrate_functions) puts these on the target
+# before migrate_governance reapplies the filter/mask. The governance test
+# pre-seeds the target directly, so create the functions here too — otherwise
+# SET ROW FILTER / SET MASK fails with ROUTINE_NOT_FOUND. Definitions mirror
+# the source seed (seed_uc_test_data.py).
+_sql_on_target("""
+    CREATE OR REPLACE FUNCTION integration_test_src.test_schema.region_filter(region STRING)
+    RETURNS BOOLEAN
+    RETURN region = 'US' OR is_account_group_member('admins')
+""")
+_sql_on_target("""
+    CREATE OR REPLACE FUNCTION integration_test_src.test_schema.mask_customer(cid INT)
+    RETURNS INT
+    RETURN CASE WHEN is_account_group_member('admins') THEN cid ELSE -1 END
+""")
+
 # managed_sensitive carries source RLS+CM in the integration fixture;
 # the governance test's RLS/CM reapply path doesn't strictly require
 # it on target (Path A staging_copy keeps source intact and the tests
