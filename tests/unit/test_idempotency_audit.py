@@ -927,9 +927,11 @@ class TestModelsIdempotency:
 
 
 class TestHiveExternalIdempotency:
+    @patch("migrate.hive_external_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_external_worker.warehouse_table_count")
     @patch("migrate.hive_external_worker.time")
     @patch("migrate.hive_external_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time):
+    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
         from migrate.hive_external_worker import migrate_hive_external_table
 
         mock_time.time.side_effect = [100.0, 101.0]
@@ -940,16 +942,20 @@ class TestHiveExternalIdempotency:
             "LOCATION 'abfss://x@y/t'"
         )
         explorer.get_table_row_count.return_value = 1
-        target_explorer = MagicMock()
-        target_explorer.get_table_row_count.return_value = 1
+        # NON-UC compute: target row-count via warehouse, status writes too.
+        mock_wh_count.return_value = 1
         config = MagicMock()
         config.dry_run = False
         config.hive_target_catalog = "uc_hive"
         res = migrate_hive_external_table(
             {"object_name": "`hive_metastore`.`db`.`t`"},
-            config=config, auth=MagicMock(), tracker=MagicMock(),
-            explorer=explorer, target_explorer=target_explorer, wh_id="wh",
+            config=config, auth=MagicMock(),
+            explorer=explorer, wh_id="wh",
+            tracking_fqn="migration_tracking.cp_migration", job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
+        # execute_and_poll is now called only for the CREATE DDL (status +
+        # target count are routed through the patched warehouse helpers).
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql
         # Namespace rewrite: hive_metastore -> uc_hive
@@ -1048,9 +1054,11 @@ class TestHiveManagedDbfsIdempotency:
 
 
 class TestHiveManagedNondbfsIdempotency:
+    @patch("migrate.hive_managed_nondbfs_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_managed_nondbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_nondbfs_worker.time")
     @patch("migrate.hive_managed_nondbfs_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_forces_location(self, mock_exec, mock_time):
+    def test_uses_if_not_exists_and_forces_location(self, mock_exec, mock_time, mock_wh_count, mock_append):
         """Pin: non-DBFS managed path rewrites to EXTERNAL (IF NOT EXISTS + LOCATION)."""
         from migrate.hive_managed_nondbfs_worker import migrate_hive_managed_nondbfs
 
@@ -1060,18 +1068,19 @@ class TestHiveManagedNondbfsIdempotency:
         explorer.get_create_statement.return_value = (
             "CREATE TABLE `hive_metastore`.`db`.`t` (id INT) USING DELTA"
         )
-        validator = MagicMock()
-        validator.validate_row_count.return_value = {
-            "match": True, "source_count": 1, "target_count": 1,
-        }
+        explorer.get_table_row_count.return_value = 1
+        # NON-UC compute: target row-count via warehouse, status writes too.
+        mock_wh_count.return_value = 1
         config = MagicMock()
         config.dry_run = False
         config.hive_target_catalog = "uc_hive"
         res = migrate_hive_managed_nondbfs(
             {"object_name": "`hive_metastore`.`db`.`t`",
              "storage_location": "abfss://x@y/t", "provider": "delta"},
-            config=config, auth=MagicMock(), tracker=MagicMock(),
-            explorer=explorer, validator=validator, wh_id="wh",
+            config=config, auth=MagicMock(),
+            explorer=explorer, wh_id="wh",
+            tracking_fqn="migration_tracking.cp_migration", job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql

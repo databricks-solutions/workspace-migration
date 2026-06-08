@@ -351,9 +351,13 @@ class TestHiveManagedNondbfsWorker:
             "storage_location": "abfss://ext@acct.dfs.core.windows.net/nondbfs_sales",
         }
 
+    @patch("migrate.hive_managed_nondbfs_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_managed_nondbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_nondbfs_worker.time")
     @patch("migrate.hive_managed_nondbfs_worker.execute_and_poll")
-    def test_orchestrator_shaped_record_does_not_raise_keyerror(self, mock_execute, mock_time):
+    def test_orchestrator_shaped_record_does_not_raise_keyerror(
+        self, mock_execute, mock_time, mock_wh_count, mock_append
+    ):
         """Regression for review finding #1: the worker read record['fqn'] but
         the orchestrator emits 'object_name' — every non-DBFS managed table
         threw KeyError. The migrated status must be keyed by object_name."""
@@ -361,6 +365,9 @@ class TestHiveManagedNondbfsWorker:
 
         mock_time.time.side_effect = [100.0, 105.0]
         mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        # NON-UC compute: target row-count comes via the warehouse, source via
+        # the worker's spark explorer.
+        mock_wh_count.return_value = 3
 
         rec = self._orchestrator_record()
         explorer = MagicMock()
@@ -368,24 +375,25 @@ class TestHiveManagedNondbfsWorker:
             "CREATE TABLE hive_metastore.integration_test_hive.nondbfs_sales (id INT) "
             "USING delta LOCATION 'abfss://ext@acct.dfs.core.windows.net/nondbfs_sales'"
         )
-        validator = MagicMock()
-        validator.validate_row_count.return_value = {"match": True, "source_count": 3, "target_count": 3}
+        explorer.get_table_row_count.return_value = 3
 
         result = migrate_hive_managed_nondbfs(
             rec,
             config=_config_mock(),
             auth=MagicMock(),
-            tracker=MagicMock(),
             explorer=explorer,
-            validator=validator,
             wh_id="wh-hv",
+            tracking_fqn="migration_tracking.cp_migration",
+            job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
 
         assert result["object_name"] == rec["object_name"]
         assert result["status"] == "validated"
 
+    @patch("migrate.hive_managed_nondbfs_worker.append_migration_status_via_warehouse")
     @patch("migrate.hive_managed_nondbfs_worker.time")
-    def test_ddl_fetch_failure_records_object_name_not_keyerror(self, mock_time):
+    def test_ddl_fetch_failure_records_object_name_not_keyerror(self, mock_time, mock_append):
         """When DDL fetch fails, the failure row must still be keyed by
         object_name (the old code referenced the absent 'fqn' key)."""
         from migrate.hive_managed_nondbfs_worker import migrate_hive_managed_nondbfs
@@ -399,10 +407,11 @@ class TestHiveManagedNondbfsWorker:
             rec,
             config=_config_mock(),
             auth=MagicMock(),
-            tracker=MagicMock(),
             explorer=explorer,
-            validator=MagicMock(),
             wh_id="wh-hv",
+            tracking_fqn="migration_tracking.cp_migration",
+            job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
 
         assert result["object_name"] == rec["object_name"]

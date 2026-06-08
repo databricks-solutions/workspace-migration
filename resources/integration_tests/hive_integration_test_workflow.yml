@@ -5,6 +5,34 @@ resources:
       description: "End-to-end integration test for the Hive migration workflow."
       run_as:
         service_principal_name: ${var.migration_spn_id}
+      # Classic single-node cluster for seed_hive: it creates the
+      # hive_metastore EXTERNAL / managed-non-DBFS source fixtures on ADLS,
+      # which serverless can't do (hive_metastore LOCATION access bypasses UC
+      # vending → legacy fs.azure.account.key, blocked on serverless). The seed
+      # calls hive_common.configure_adls_account_key() at runtime to set the key
+      # from secret migration/adls-account-key — only settable on classic
+      # compute, hence this cluster. Other test tasks stay serverless.
+      job_clusters:
+        - job_cluster_key: hive_adls_classic
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            # No-Isolation single-node cluster (data_security_mode: NONE) — the
+            # only mode that honors fs.azure.account.key for the seed's
+            # hive_metastore-on-ADLS fixtures (UC access modes ignore it). The
+            # seed touches only hive_metastore (account key) + does its one UC
+            # grant via the warehouse, so it doesn't need UC on this cluster.
+            num_workers: 0
+            data_security_mode: "NONE"
+            # spark_conf (singleNode profile + the ADLS account key) is supplied
+            # per-environment via the hive_adls_spark_conf complex var — the
+            # account name is in the conf KEY, which DAB can't template, so the
+            # whole map comes from the var (key value = secret reference).
+            spark_conf: ${var.hive_adls_spark_conf}
+            custom_tags:
+              ResourceClass: "SingleNode"
+            azure_attributes:
+              availability: "ON_DEMAND_AZURE"
       tasks:
         - task_key: setup_test_config
           notebook_task:
@@ -39,6 +67,7 @@ resources:
         - task_key: seed_hive
           depends_on:
             - task_key: setup_test_config
+          job_cluster_key: hive_adls_classic
           notebook_task:
             notebook_path: ../../tests/integration/seed_hive_test_data.py
 
@@ -48,15 +77,32 @@ resources:
           notebook_task:
             notebook_path: ../../src/pre_check/pre_check.py
 
+        # UC + stateful discovery on serverless (also creates the tracking
+        # tables). Skips hive — hive_metastore-on-ADLS tables can't be read on
+        # serverless (their Delta log lives on ADLS), so hive is discovered
+        # separately on the classic cluster below.
         - task_key: discovery
           depends_on:
             - task_key: pre_check
           notebook_task:
             notebook_path: ../../src/discovery/discovery.py
+            base_parameters:
+              discovery_scope: uc
+
+        # Hive discovery on the classic No-Isolation cluster (reads the abfss
+        # source tables) — writes discovery_inventory through the SQL warehouse.
+        - task_key: discover_hive
+          depends_on:
+            - task_key: discovery
+          job_cluster_key: hive_adls_classic
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+            base_parameters:
+              discovery_scope: hive
 
         - task_key: migrate_hive
           depends_on:
-            - task_key: discovery
+            - task_key: discover_hive
           run_job_task:
             job_id: ${resources.jobs.migrate_hive.id}
 
@@ -72,6 +118,7 @@ resources:
             - task_key: seed_hive
             - task_key: pre_check
             - task_key: discovery
+            - task_key: discover_hive
             - task_key: migrate_hive
             - task_key: test_hive
           run_if: ALL_DONE

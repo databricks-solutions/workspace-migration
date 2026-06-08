@@ -24,10 +24,30 @@ except NameError:
 from common.auth import AuthManager  # noqa: E402
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
+from migrate.hive_common import configure_adls_account_key
 
 config = MigrationConfig.from_workspace_file()
 
+
+
+
 # COMMAND ----------
+
+# Clean any stale fixtures from a prior interrupted run. DBFS-root managed-table
+# files can be orphaned when a run is cancelled: teardown_hive runs on serverless
+# and can't always delete DBFS-root managed-table data, so a later
+# CREATE TABLE fails with "location is not empty and also not a Delta table".
+# This seed runs on a classic cluster (hive_adls_classic) that CAN delete those
+# files, so drop the database CASCADE here (clears managed locations) and rm the
+# warehouse dir for good measure before re-creating the fixtures.
+import contextlib  # noqa: E402
+
+spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive CASCADE")  # noqa: F821
+# The managed-non-DBFS db lives on ADLS; drop it too (this classic cluster can
+# reach the abfss data to clean it).
+spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive_nd CASCADE")  # noqa: F821
+with contextlib.suppress(Exception):
+    dbutils.fs.rm("dbfs:/user/hive/warehouse/integration_test_hive.db", True)  # type: ignore[name-defined]  # noqa: F821
 
 spark.sql("CREATE DATABASE IF NOT EXISTS hive_metastore.integration_test_hive")  # noqa: F821
 
@@ -80,15 +100,24 @@ spark.sql(  # noqa: F821
 # The ADLS path reuses the external location used by DBFS-root
 # migration, gated on the same config fields.
 
+_ND_DB = "integration_test_hive_nd"  # dedicated db with a non-DBFS LOCATION
 _hive_external_location: str | None = None
-_hive_nondbfs_location: str | None = None
+_hive_nondbfs_db_location: str | None = None
 if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path:
     _base = config.hive_dbfs_target_path.rstrip("/")
     _hive_external_location = f"{_base}/hive_external_invoices"
-    _hive_nondbfs_location = f"{_base}/hive_nondbfs_sales"
+    _hive_nondbfs_db_location = f"{_base}/hive_nondbfs_db"
 
 _has_hive_external = False
 _has_hive_nondbfs = False
+
+# hive_metastore tables at an abfss LOCATION need the legacy account-key Hadoop
+# conf (UC vending doesn't cover hive_metastore LOCATION). Set it at runtime
+# from secret migration/adls-account-key — only works on classic compute (this
+# task runs on the hive_adls_classic cluster); no-op/warns on serverless, in
+# which case the CREATEs below fail and has_*=false (guard exempts with reason).
+if _hive_external_location:
+    configure_adls_account_key(spark, dbutils, _hive_external_location)  # noqa: F821
 
 if _hive_external_location:
     try:
@@ -116,33 +145,38 @@ if _hive_external_location:
     except Exception as _exc:  # noqa: BLE001
         print(f"Skipped Hive external seed: {_exc}")
 
-if _hive_nondbfs_location:
+if _hive_nondbfs_db_location:
     try:
-        # MANAGED non-DBFS — in hive_metastore, a managed table with an
-        # explicit LOCATION off DBFS root. Covers the hive_managed_nondbfs
-        # worker's path (legacy mount / non-default cluster config).
+        # MANAGED non-DBFS: a managed table whose storage is off the DBFS root.
+        # In hive_metastore, CREATE TABLE ... LOCATION makes an EXTERNAL table —
+        # so the only way to get a MANAGED table at a non-default location is to
+        # give the *database* a non-DBFS LOCATION, then create a managed table
+        # (no LOCATION) that inherits it. categorize_hive_table then classifies
+        # it as hive_managed_nondbfs (MANAGED + abfss location), not external.
+        spark.sql(  # noqa: F821
+            f"CREATE DATABASE IF NOT EXISTS hive_metastore.{_ND_DB} LOCATION '{_hive_nondbfs_db_location}'"
+        )
         spark.sql(  # noqa: F821
             f"""
-            CREATE TABLE IF NOT EXISTS hive_metastore.integration_test_hive.nondbfs_sales (
+            CREATE TABLE IF NOT EXISTS hive_metastore.{_ND_DB}.nondbfs_sales (
                 sale_id INT,
                 amount DOUBLE
             )
             USING DELTA
-            LOCATION '{_hive_nondbfs_location}'
             """
         )
         spark.sql(  # noqa: F821
-            """
-            INSERT OVERWRITE TABLE hive_metastore.integration_test_hive.nondbfs_sales VALUES
+            f"""
+            INSERT OVERWRITE TABLE hive_metastore.{_ND_DB}.nondbfs_sales VALUES
                 (201, 50.0),
                 (202, 75.0),
                 (203, 90.0)
             """
         )
         _has_hive_nondbfs = True
-        print(f"Created Hive managed non-DBFS table at {_hive_nondbfs_location}.")
+        print(f"Created Hive MANAGED non-DBFS table hive_metastore.{_ND_DB}.nondbfs_sales (db LOCATION {_hive_nondbfs_db_location}).")
     except Exception as _exc:  # noqa: BLE001
-        print(f"Skipped Hive managed-nondbfs seed: {_exc}")
+        print(f"!! Skipped Hive managed-nondbfs seed: {_exc}")
 
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_hive_external", value="true" if _has_hive_external else "false"

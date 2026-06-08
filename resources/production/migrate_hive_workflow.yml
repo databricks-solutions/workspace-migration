@@ -9,6 +9,40 @@ resources:
         run discovery first.
       run_as:
         service_principal_name: ${var.migration_spn_id}
+      # Classic single-node cluster for the hive_metastore EXTERNAL /
+      # managed-non-DBFS workers ONLY. Those tables live on ADLS, and
+      # hive_metastore LOCATION access does NOT route through UC credential
+      # vending — it falls back to the legacy fs.azure.account.key path, which
+      # serverless blocks. The workers call hive_common.configure_adls_account_key()
+      # at runtime to set fs.azure.account.key.<account> from the secret
+      # migration/adls-account-key (account parsed from each table's
+      # storage_location) — that conf is only settable on classic compute, hence
+      # this cluster. All other hive tasks stay serverless (dbfs-root reads
+      # workspace storage; functions/views/grants are metadata-only).
+      job_clusters:
+        - job_cluster_key: hive_adls_classic
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            # No-Isolation single-node cluster (data_security_mode: NONE). This
+            # is the ONLY mode that honors the legacy fs.azure.account.key conf
+            # for hive_metastore-on-ADLS reads — UC access modes (SINGLE_USER /
+            # standard) ignore Hadoop filesystem settings (confirmed in docs +
+            # a live hang). Because NONE compute can't touch Unity Catalog, the
+            # external/nondbfs workers route ALL their UC operations (status
+            # writes + target row-count) through the SQL warehouse; only the
+            # legacy source reads run on this cluster's spark session.
+            num_workers: 0
+            data_security_mode: "NONE"
+            # spark_conf (singleNode profile + the ADLS account key) is supplied
+            # per-environment via the hive_adls_spark_conf complex var — the
+            # account name is in the conf KEY, which DAB can't template, so the
+            # whole map comes from the var (key value = secret reference).
+            spark_conf: ${var.hive_adls_spark_conf}
+            custom_tags:
+              ResourceClass: "SingleNode"
+            azure_attributes:
+              availability: "ON_DEMAND_AZURE"
       tasks:
         - task_key: hive_orchestrator
           notebook_task:
@@ -21,6 +55,7 @@ resources:
             inputs: "{{tasks.hive_orchestrator.values.hive_external_batches}}"
             task:
               task_key: hive_external_batch
+              job_cluster_key: hive_adls_classic
               notebook_task:
                 notebook_path: ../../src/migrate/hive_external_worker.py
                 base_parameters:
@@ -33,6 +68,7 @@ resources:
             inputs: "{{tasks.hive_orchestrator.values.hive_managed_nondbfs_batches}}"
             task:
               task_key: hive_managed_nondbfs_batch
+              job_cluster_key: hive_adls_classic
               notebook_task:
                 notebook_path: ../../src/migrate/hive_managed_nondbfs_worker.py
                 base_parameters:

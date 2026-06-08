@@ -1061,19 +1061,33 @@ class CatalogExplorer:
     def list_hive_functions(self, database: str) -> list[str]:
         """Return user-defined functions in a Hive database (fully-qualified)."""
         try:
+            # SHOW USER FUNCTIONS IN <cat>.<db> requires the CURRENT CATALOG to
+            # be <cat> on current runtimes ("target schema is not in the current
+            # catalog"), unlike SHOW TABLES. Set the catalog on the (persistent)
+            # session first, then query with the bare db name. Without this the
+            # call errored and was swallowed → hive functions were never found.
+            self.spark.sql(f"USE CATALOG `{HIVE_CATALOG}`")  # type: ignore[attr-defined]
             rows = self.spark.sql(  # type: ignore[attr-defined]
-                f"SHOW USER FUNCTIONS IN `{HIVE_CATALOG}`.`{database}`"
+                f"SHOW USER FUNCTIONS IN `{database}`"
             ).collect()
         except Exception:  # noqa: BLE001
             return []
         out = []
+        db_lower = database.lower()
         for row in rows:
             # `function` column name varies by DBR version — probe common ones.
             name = getattr(row, "function", None) or getattr(row, "name", None)
             if not name:
                 continue
-            # Skip built-ins that leak into SHOW USER FUNCTIONS on some versions.
-            if "." not in name:
+            # SHOW USER FUNCTIONS IN <db> is scoped to user functions in that
+            # database (built-ins are global, not in a named db, so they don't
+            # appear here). Names come back qualified (cat.db.fn / db.fn) OR bare
+            # (fn) depending on DBR — keep bare names (they're user funcs in the
+            # scoped db) and qualified names that belong to THIS db; drop names
+            # qualified to a different db. (The old "skip if no dot" rule wrongly
+            # dropped bare user functions — that's why hive_function was empty.)
+            parts = name.split(".")
+            if len(parts) >= 2 and parts[-2].lower() != db_lower:
                 continue
-            out.append(f"`{HIVE_CATALOG}`.`{database}`.`{name.split('.')[-1]}`")
+            out.append(f"`{HIVE_CATALOG}`.`{database}`.`{parts[-1]}`")
         return out

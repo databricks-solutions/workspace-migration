@@ -31,6 +31,25 @@ variables:
     description: "Resolved warehouse ID (do not set directly — override dashboard_warehouse_name instead)."
     lookup:
       warehouse: ${var.dashboard_warehouse_name}
+  hive_adls_spark_conf:
+    description: |
+      Full spark_conf map for the classic No-Isolation cluster that discovers +
+      migrates hive_metastore tables stored on ADLS (seed_hive, discover_hive,
+      and the hive external/managed-nondbfs workers). Why a complex (whole-map)
+      variable: the per-account ``fs.azure.account.key.<ACCOUNT>.dfs.core.windows.net``
+      entry has the storage account name IN THE KEY, and DAB can't template a
+      spark_conf key with ${var...} — so the whole map (including that key) is
+      supplied per-environment via a target ``variables:`` override below. The
+      key's VALUE is a Databricks secret reference, so the real storage key is
+      never committed (put it in the scope with ``databricks secrets put-secret``).
+      The default has only the single-node profile (required: num_workers:0 with
+      no singleNode profile = a driver with zero executors = jobs hang) and NO
+      account key — environments WITHOUT ADLS-backed hive_metastore tables can
+      use it as-is; environments WITH them must override per target.
+    type: complex
+    default:
+      spark.databricks.cluster.profile: "singleNode"
+      spark.master: "local[*]"
 
 workspace:
   # Deploy to a Shared workspace path so the bundle is visible to all migration
@@ -58,6 +77,14 @@ include:
   - resources/production/*.yml
   - resources/integration_tests/*.yml
 
+# config.yaml is gitignored (holds real workspace URLs + SPN client id), but it
+# IS the runtime config the notebooks read from ${workspace.file_path}/config.yaml.
+# DAB's default sync skips gitignored files, so force-include it here — otherwise
+# setup_test_config / the workers fail with "config.yaml not found".
+sync:
+  include:
+    - config.yaml
+
 targets:
   dev:
     default: true
@@ -68,6 +95,13 @@ targets:
       name_prefix: "[dev-${workspace.current_user.short_name}] "
       tags:
         dev: "${workspace.current_user.userName}"
+    variables:
+      # Dev lab's ADLS account + key (key value = secret reference, resolved at
+      # cluster launch). Replace the account name + secret scope/key per env.
+      hive_adls_spark_conf:
+        spark.databricks.cluster.profile: "singleNode"
+        spark.master: "local[*]"
+        spark.hadoop.fs.azure.account.key.stextsourcemig36cd38.dfs.core.windows.net: "{{secrets/migration/adls-account-key}}"
     resources:
       # Dashboards don't support run_as != owner, so skip in dev (SPN run_as).
       dashboards:
@@ -76,6 +110,18 @@ targets:
   test:
     presets:
       name_prefix: "[test] "
+    variables:
+      hive_adls_spark_conf:
+        spark.databricks.cluster.profile: "singleNode"
+        spark.master: "local[*]"
+        spark.hadoop.fs.azure.account.key.stextsourcemig36cd38.dfs.core.windows.net: "{{secrets/migration/adls-account-key}}"
 
   prod:
     mode: production
+    # Set the prod ADLS account + secret here (only needed if you migrate
+    # hive_metastore tables stored on ADLS):
+    # variables:
+    #   hive_adls_spark_conf:
+    #     spark.databricks.cluster.profile: "singleNode"
+    #     spark.master: "local[*]"
+    #     spark.hadoop.fs.azure.account.key.<PROD_ACCOUNT>.dfs.core.windows.net: "{{secrets/<prod-scope>/<prod-key>}}"

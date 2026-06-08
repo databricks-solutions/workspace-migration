@@ -356,12 +356,22 @@ if not config.migrate_hive_dbfs_root:
         _HIVE_COVERAGE_EXEMPT[_t] = _dbfs_reason
 else:
     # Gate the raw-abfss-LOCATION fixtures on whether the seed could create
-    # them (serverless seed compute lacks a direct storage account key).
+    # them. hive_metastore LOCATION access on ADLS bypasses UC credential
+    # vending and falls back to the legacy fs.azure.account.key path, which
+    # serverless BLOCKS — so seed_hive and the migrate_hive external/nondbfs
+    # workers run on a CLASSIC cluster (job_cluster_key=hive_adls_classic) with
+    # the storage account key from secret migration/adls-account-key (account
+    # from the hive_adls_storage_account var). When that cluster + key + var are
+    # configured, the seed creates the fixtures (has_*=true) and these types are
+    # ENFORCED. They're only exempted-with-reason when the storage isn't
+    # configured (var/secret unset) so the fixtures can't be created — never to
+    # paper over a seeded-but-failed migration (that stays hard RED).
     _seed_storage_reason = (
-        "source fixture not seeded — serverless seed compute can't write a "
-        "hive_metastore table to a raw abfss LOCATION (no direct storage "
-        "account key; needs a classic cluster with storage creds). Migration "
-        "path itself is unaffected."
+        "source fixture not seeded — hive_metastore ADLS external/nondbfs tables "
+        "need a classic cluster with a storage account key (serverless can't do "
+        "legacy fs.azure.account.key access). Set the hive_adls_storage_account "
+        "var + migration/adls-account-key secret so seed_hive (on the "
+        "hive_adls_classic cluster) can create them."
     )
     _has_ext = str(
         dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
