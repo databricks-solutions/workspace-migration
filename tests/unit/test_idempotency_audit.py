@@ -520,10 +520,19 @@ class TestMonitorsIdempotency:
 
 
 class TestConnectionsIdempotency:
+    @staticmethod
+    def _absent_on_target(auth):
+        """Make the target-existence pre-check report 'not present' so the
+        test exercises the from-scratch create path."""
+        from databricks.sdk.errors import NotFound
+
+        auth.target_client.connections.get.side_effect = NotFound("not found")
+
     def test_create_succeeds(self):
         from migrate.connections_worker import apply_connection
 
         auth = MagicMock()
+        self._absent_on_target(auth)
         auth.target_client.connections.create.return_value = None
         res = apply_connection(
             {"connection_name": "c1", "connection_type": "MYSQL",
@@ -532,11 +541,35 @@ class TestConnectionsIdempotency:
         )
         assert res["status"] == "validated"
 
+    def test_connection_type_enum_repr_is_coerced_to_enum(self):
+        """Live regression: discovery stores str(connection_type) =
+        'ConnectionType.SQLSERVER' (the enum repr). The worker must coerce that
+        to a real ConnectionType enum — the SDK's connections.create() calls
+        .value on connection_type, so a passed-through string raises
+        \"'str' object has no attribute 'value'\". Must NEVER pass a str."""
+        from databricks.sdk.service.catalog import ConnectionType
+
+        from migrate.connections_worker import apply_connection
+
+        auth = MagicMock()
+        self._absent_on_target(auth)
+        auth.target_client.connections.create.return_value = None
+        res = apply_connection(
+            {"connection_name": "c1", "connection_type": "ConnectionType.SQLSERVER",
+             "options": {"host": "x", "port": "1433"}},
+            auth=auth, dry_run=False,
+        )
+        assert res["status"] == "validated", res
+        ct = auth.target_client.connections.create.call_args.kwargs["connection_type"]
+        assert isinstance(ct, ConnectionType), f"must pass a ConnectionType enum, got {type(ct).__name__}: {ct!r}"
+        assert ct == ConnectionType.SQLSERVER
+
     def test_create_with_secret_becomes_validation_failed(self):
         """Pin: connections with secret fields return validation_failed until re-entered."""
         from migrate.connections_worker import apply_connection
 
         auth = MagicMock()
+        self._absent_on_target(auth)
         auth.target_client.connections.create.return_value = None
         res = apply_connection(
             {"connection_name": "c1", "connection_type": "MYSQL",
@@ -551,6 +584,7 @@ class TestConnectionsIdempotency:
         from migrate.connections_worker import apply_connection
 
         auth = MagicMock()
+        self._absent_on_target(auth)
         auth.target_client.connections.create.side_effect = Exception(
             "connection 'c1' already exists"
         )
@@ -565,12 +599,56 @@ class TestConnectionsIdempotency:
         from migrate.connections_worker import apply_connection
 
         auth = MagicMock()
+        self._absent_on_target(auth)
         auth.target_client.connections.create.side_effect = Exception("bad options")
         res = apply_connection(
             {"connection_name": "c1", "connection_type": "MYSQL", "options": {}},
             auth=auth, dry_run=False,
         )
         assert res["status"] == "failed"
+
+    def test_existing_target_connection_is_validated_idempotent(self):
+        """Live: UC never returns secret options (user/password for SQLSERVER)
+        from GET, so the worker can't recreate the connection from discovery
+        alone. When the connection already exists on target (operator
+        recreated it with credentials per the runbook, or a prior run made
+        it), the target-existence pre-check returns validated WITHOUT
+        attempting create — mirrors _target_table_exists fail-closed
+        idempotency."""
+        from migrate.connections_worker import apply_connection
+
+        auth = MagicMock()
+        auth.target_client.connections.get.return_value = MagicMock(name="existing_conn")
+        res = apply_connection(
+            {"connection_name": "integration_test_sqlserver",
+             "connection_type": "ConnectionType.SQLSERVER",
+             "options": {"host": "x", "port": "1433"}},
+            auth=auth, dry_run=False,
+        )
+        assert res["status"] == "validated", res
+        auth.target_client.connections.create.assert_not_called()
+
+    def test_missing_mandatory_credentials_becomes_validation_failed(self):
+        """Live: from-scratch create with only the discovered options (host,
+        port) is rejected by UC for SQLSERVER — 'must include the following
+        option(s): user,password'. That's the non-exportable-credential
+        limitation, NOT an unexpected error: surface validation_failed
+        (manual recreation required), never failed."""
+        from migrate.connections_worker import apply_connection
+
+        auth = MagicMock()
+        self._absent_on_target(auth)
+        auth.target_client.connections.create.side_effect = Exception(
+            "CONNECTION/CONNECTION_SQLSERVER must include the following option(s): user,password."
+        )
+        res = apply_connection(
+            {"connection_name": "integration_test_sqlserver",
+             "connection_type": "ConnectionType.SQLSERVER",
+             "options": {"host": "x", "port": "1433"}},
+            auth=auth, dry_run=False,
+        )
+        assert res["status"] == "validation_failed", res
+        assert "user,password" in (res["error_message"] or "")
 
 
 # ============================================================================
@@ -849,9 +927,11 @@ class TestModelsIdempotency:
 
 
 class TestHiveExternalIdempotency:
+    @patch("migrate.hive_external_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_external_worker.warehouse_table_count")
     @patch("migrate.hive_external_worker.time")
     @patch("migrate.hive_external_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time):
+    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
         from migrate.hive_external_worker import migrate_hive_external_table
 
         mock_time.time.side_effect = [100.0, 101.0]
@@ -862,16 +942,20 @@ class TestHiveExternalIdempotency:
             "LOCATION 'abfss://x@y/t'"
         )
         explorer.get_table_row_count.return_value = 1
-        target_explorer = MagicMock()
-        target_explorer.get_table_row_count.return_value = 1
+        # NON-UC compute: target row-count via warehouse, status writes too.
+        mock_wh_count.return_value = 1
         config = MagicMock()
         config.dry_run = False
         config.hive_target_catalog = "uc_hive"
         res = migrate_hive_external_table(
             {"object_name": "`hive_metastore`.`db`.`t`"},
-            config=config, auth=MagicMock(), tracker=MagicMock(),
-            explorer=explorer, target_explorer=target_explorer, wh_id="wh",
+            config=config, auth=MagicMock(),
+            explorer=explorer, wh_id="wh",
+            tracking_fqn="migration_tracking.cp_migration", job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
+        # execute_and_poll is now called only for the CREATE DDL (status +
+        # target count are routed through the patched warehouse helpers).
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql
         # Namespace rewrite: hive_metastore -> uc_hive
@@ -970,9 +1054,11 @@ class TestHiveManagedDbfsIdempotency:
 
 
 class TestHiveManagedNondbfsIdempotency:
+    @patch("migrate.hive_managed_nondbfs_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_managed_nondbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_nondbfs_worker.time")
     @patch("migrate.hive_managed_nondbfs_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_forces_location(self, mock_exec, mock_time):
+    def test_uses_if_not_exists_and_forces_location(self, mock_exec, mock_time, mock_wh_count, mock_append):
         """Pin: non-DBFS managed path rewrites to EXTERNAL (IF NOT EXISTS + LOCATION)."""
         from migrate.hive_managed_nondbfs_worker import migrate_hive_managed_nondbfs
 
@@ -982,18 +1068,19 @@ class TestHiveManagedNondbfsIdempotency:
         explorer.get_create_statement.return_value = (
             "CREATE TABLE `hive_metastore`.`db`.`t` (id INT) USING DELTA"
         )
-        validator = MagicMock()
-        validator.validate_row_count.return_value = {
-            "match": True, "source_count": 1, "target_count": 1,
-        }
+        explorer.get_table_row_count.return_value = 1
+        # NON-UC compute: target row-count via warehouse, status writes too.
+        mock_wh_count.return_value = 1
         config = MagicMock()
         config.dry_run = False
         config.hive_target_catalog = "uc_hive"
         res = migrate_hive_managed_nondbfs(
             {"object_name": "`hive_metastore`.`db`.`t`",
              "storage_location": "abfss://x@y/t", "provider": "delta"},
-            config=config, auth=MagicMock(), tracker=MagicMock(),
-            explorer=explorer, validator=validator, wh_id="wh",
+            config=config, auth=MagicMock(),
+            explorer=explorer, wh_id="wh",
+            tracking_fqn="migration_tracking.cp_migration", job_run_id="jr-1",
+            status_wh_id="wh-src",
         )
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql

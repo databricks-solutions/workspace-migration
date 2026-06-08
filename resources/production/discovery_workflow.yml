@@ -4,7 +4,49 @@ resources:
       name: "${var.job_prefix}-discovery"
       run_as:
         service_principal_name: ${var.migration_spn_id}
+      # Classic single-node No-Isolation cluster for hive_metastore-on-ADLS
+      # discovery ONLY. hive_metastore Delta tables resolve their schema from a
+      # _delta_log on ADLS, which serverless/UC compute can't read (UC modes
+      # ignore fs.azure.account.key); so hive discovery runs here while UC
+      # discovery stays serverless. Requirements (see migrate_hive_workflow):
+      #   - data_security_mode NONE (UC modes ignore the account key)
+      #   - singleNode profile conf (else num_workers:0 = 0 executors = hang)
+      #   - the storage account key in spark_conf (secret-ref value). The
+      #     account name is hardcoded here for the lab — a real deployment
+      #     replaces it with its own ADLS account (DAB can't template a
+      #     spark_conf KEY, so it must be edited per-environment).
+      job_clusters:
+        - job_cluster_key: hive_adls_classic
+          new_cluster:
+            spark_version: "15.4.x-scala2.12"
+            node_type_id: "Standard_DS3_v2"
+            num_workers: 0
+            data_security_mode: "NONE"
+            # spark_conf (singleNode profile + the ADLS account key) is supplied
+            # per-environment via the hive_adls_spark_conf complex var — the
+            # account name is in the conf KEY, which DAB can't template, so the
+            # whole map comes from the var (key value = secret reference).
+            spark_conf: ${var.hive_adls_spark_conf}
+            custom_tags:
+              ResourceClass: "SingleNode"
+            azure_attributes:
+              availability: "ON_DEMAND_AZURE"
       tasks:
+        # UC + stateful discovery on serverless (also creates the tracking
+        # tables). Skips hive — discovered separately on the classic cluster.
         - task_key: discovery
           notebook_task:
             notebook_path: ../../src/discovery/discovery.py
+            base_parameters:
+              discovery_scope: uc
+
+        # Hive discovery on the classic cluster (reads the abfss source tables);
+        # writes discovery_inventory through the SQL warehouse.
+        - task_key: discover_hive
+          depends_on:
+            - task_key: discovery
+          job_cluster_key: hive_adls_classic
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+            base_parameters:
+              discovery_scope: hive

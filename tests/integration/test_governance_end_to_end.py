@@ -207,6 +207,82 @@ else:
     print(f"Phase 3 T32 validated: {len(comment_rows)} comment row(s) replayed.")
 
 # COMMAND ----------
+# --- Coverage guard: every governance-owned in-scope type must be EXERCISED ---
+# Makes "not tested" RED instead of a silent green. The governance suite
+# (migrate_governance) owns these types. A type is "exercised" when
+# migration_status has a row in its expected terminal state. Anything not
+# exercised and not explicitly exempted-with-reason fails the run, naming it.
+_GOV_EXPECTED = {
+    "tag": {"validated"},
+    "comment": {"validated"},
+    "row_filter": {"validated"},
+    "column_mask": {"validated"},
+    "policy": {"validated"},
+    "monitor": {"validated"},
+    "connection": {"validated"},
+    "foreign_catalog": {"validated"},
+    "share": {"validated"},
+    "recipient": {"validated"},
+    "provider": {"validated"},
+}
+# type -> reason (surfaced, never silent). Flip back to enforced once the infra
+# exists. (policy: now ENFORCED — ABAC enabled at account level. connection/
+# foreign_catalog: now ENFORCED — private-link NCC PEs wired to the SQL server.)
+_GOV_COVERAGE_EXEMPT: dict[str, str] = {
+    "provider": (
+        "Inbound Delta Sharing provider requires a SECOND provider workspace "
+        "sharing into this one. Re-enable enforcement once that workspace + "
+        "outbound share exist."
+    ),
+}
+_gov_cov = tracker.get_latest_migration_status()
+_gov_by_type: dict[str, set] = {}
+for _r in _gov_cov.select("object_type", "status").distinct().collect():
+    _gov_by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+# Discovery presence: lets the guard distinguish "not discovered" (seed/source
+# gap) from "discovered but not migrated" (worker gap) for NONE types.
+_gov_discovered: set = set()
+try:
+    _disc = spark.sql(  # noqa: F821
+        f"SELECT DISTINCT object_type FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory"
+    ).collect()
+    _gov_discovered = {_r["object_type"] for _r in _disc}
+except Exception as _exc:  # noqa: BLE001
+    print(f"(could not read discovery_inventory for coverage diagnosis: {_exc})")
+for _t, _ok in _GOV_EXPECTED.items():
+    _got = _gov_by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _GOV_COVERAGE_EXEMPT:
+        print(f"COVERAGE EXEMPT '{_t}': {_GOV_COVERAGE_EXEMPT[_t]}")
+    else:
+        # If the type was attempted but FAILED, surface the latest
+        # error_message so the guard says WHY, not just THAT it's untested.
+        _why = ""
+        if "failed" in _got:
+            _frows = (
+                _gov_cov.filter(f"object_type = '{_t}' AND status = 'failed'")
+                .select("object_name", "error_message")
+                .limit(2)
+                .collect()
+            )
+            _why = " Failures: " + "; ".join(
+                f"{_fr['object_name']}: {_fr['error_message']}" for _fr in _frows
+            )
+        elif not _got:
+            # Distinguish not-discovered (seed/source gap) from
+            # discovered-but-not-migrated (worker gap).
+            _why = (
+                " [discovered but NOT migrated — worker gap]"
+                if _t in _gov_discovered
+                else " [NOT in discovery_inventory — seed/source gap]"
+            )
+        error_messages.append(
+            f"COVERAGE: in-scope governance type '{_t}' was NOT exercised — expected "
+            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested.{_why}"
+        )
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(

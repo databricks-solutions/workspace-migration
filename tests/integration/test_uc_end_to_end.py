@@ -31,8 +31,10 @@ config = MigrationConfig.from_workspace_file()
 tracker = TrackingManager(spark, config)  # noqa: F821
 
 status_df = tracker.get_latest_migration_status()
-# UC-only object types: base (Phase 1) + Phase 2.5 (mv, st)
-uc_types = ("managed_table", "external_table", "view", "function", "volume", "mv", "st")
+# UC-only object types migrated by this phase.
+# mv/st are out of scope for this phase (hard-excluded; deferred to the
+# Stateful Services Phase). They are intentionally NOT seeded or asserted here.
+uc_types = ("managed_table", "external_table", "view", "function", "volume")
 status_df = status_df.filter(status_df.object_type.isin(list(uc_types)))
 
 total = status_df.count()
@@ -40,6 +42,20 @@ print(f"Total UC migrated objects: {total}")
 assert total > 0, "No UC migration status records found."
 
 error_messages: list[str] = []
+
+# Named, tracked skips (review finding: no silent skips). Env-blocked fixtures
+# (preview features, source-capability gaps) that aren't seeded record a NAMED
+# skip here instead of a bare print, so the run output reports exactly what was
+# NOT exercised — a clean pass is never mistaken for full coverage. MANDATORY
+# in-scope fixtures (no env blocker) append to error_messages instead, failing
+# the run if they're missing.
+skips: list[str] = []
+
+
+def _skip(reason: str) -> None:
+    """Record a named, surfaced skip for an env-blocked fixture."""
+    skips.append(reason)
+    print(f"SKIPPED (tracked): {reason}")
 
 
 def _expect_validated(row, label: str) -> bool:  # type: ignore[no-untyped-def]
@@ -210,54 +226,6 @@ try:
 except Exception as _exc:  # noqa: BLE001
     error_messages.append(f"Phase 2.5.C: py_double failed on target: {_exc}")
 
-# COMMAND ----------
-# --- Phase 2.5.D: SQL-created MV ---
-# Phase 4 scope change: MVs are hard-excluded from the core migration
-# tool. The worker short-circuits to ``skipped_by_stateful_service_
-# migration`` (same pattern as ST since PR #41). The Stateful Services
-# Phase (separate future job) handles MV migration with proper pipeline-
-# state semantics. See docs/stateful_services_phase.md.
-has_mv = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_uc", key="has_mv", debugValue="false"
-)
-if str(has_mv).lower() == "true":
-    mv_status = status_df.filter("object_type = 'mv' AND object_name LIKE '%mv_high_value%'").collect()
-    if not mv_status:
-        error_messages.append("Phase 2.5.D: MV row missing from migration_status.")
-    elif mv_status[0]["status"] != "skipped_by_stateful_service_migration":
-        error_messages.append(
-            f"Phase 2.5.D: MV status is '{mv_status[0]['status']}', expected "
-            f"'skipped_by_stateful_service_migration' (Phase 4 hard-exclude). "
-            f"error={mv_status[0]['error_message']}"
-        )
-    else:
-        print(f"Phase 2.5.D MV hard-excluded (as expected): {mv_status[0]['object_name']}")
-else:
-    print("Phase 2.5.D: MV fixture not seeded; skipping MV assertion.")
-
-# COMMAND ----------
-# --- Phase 2.5.D: SQL-created streaming table ---
-has_st = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_uc", key="has_st", debugValue="false"
-)
-if str(has_st).lower() == "true":
-    st_status = status_df.filter("object_type = 'st' AND object_name LIKE '%st_orders%'").collect()
-    if not st_status:
-        error_messages.append("Phase 2.5.D: ST row missing from migration_status.")
-    elif st_status[0]["status"] != "skipped_by_stateful_service_migration":
-        # Scope change: streaming tables are hard-excluded from the core
-        # migration tool (migrated by the future Stateful Services Phase).
-        # The worker short-circuits to skipped_by_stateful_service_migration
-        # with a documented error_message pointer to
-        # docs/stateful_services_phase.md.
-        error_messages.append(
-            f"Phase 2.5.D: ST status is '{st_status[0]['status']}', expected "
-            f"'skipped_by_stateful_service_migration'. error={st_status[0]['error_message']}"
-        )
-    else:
-        print(f"Phase 2.5.D ST hard-excluded (as expected): {st_status[0]['object_name']}")
-else:
-    print("Phase 2.5.D: ST fixture not seeded; skipping ST assertion.")
 
 # COMMAND ----------
 # --- Phase 2.5.B: Iceberg managed table ---
@@ -289,7 +257,7 @@ if str(has_iceberg).lower() == "true":
         except Exception as _exc:  # noqa: BLE001
             error_messages.append(f"Phase 2.5.B: DESCRIBE DETAIL failed: {_exc}")
 else:
-    print("Phase 2.5.B: Iceberg fixture not seeded; skipping Iceberg assertion.")
+    _skip("Phase 2.5.B: Iceberg fixture not seeded; skipping Iceberg assertion.")
 
 # COMMAND ----------
 
@@ -334,7 +302,7 @@ if str(has_schema_grant).lower() == "true":
             f"replayed on target."
         )
 else:
-    print("Grants: schema-level grant not seeded; skipping assertion.")
+    _skip("Grants: schema-level grant not seeded; skipping assertion.")
 
 # COMMAND ----------
 # --- RLS/CM skip-path assertion ---
@@ -385,7 +353,7 @@ elif _rls_cm_strategy_active == "staging_copy":
         "migrates via staging consumer (Task 15 assertions cover it)."
     )
 else:
-    print("RLS/CM skip: managed_sensitive fixture not seeded; skipping.")
+    _skip("RLS/CM skip: managed_sensitive fixture not seeded; skipping.")
 
 # COMMAND ----------
 
@@ -442,7 +410,7 @@ if str(_has_partitioned).lower() == "true":
         except Exception as _exc:  # noqa: BLE001
             error_messages.append(f"1.11 partitioned external: target lookup failed: {_exc}")
 else:
-    print("1.11 partitioned external: fixture not seeded; skipping.")
+    _skip("1.11 partitioned external: fixture not seeded; skipping.")
 
 # 1.12 External volume with seeded files — Phase 2.5.A already
 # validates marker.txt presence/size on target; this block adds a
@@ -514,7 +482,7 @@ if str(_has_missing_grant).lower() == "true":
         else:
             print(f"1.13 missing-principal grant validated: status={_st!r} (row is surfaced, not silently dropped).")
 else:
-    print("1.13 missing-principal grant: fixture not seeded; skipping.")
+    _skip("1.13 missing-principal grant: fixture not seeded; skipping.")
 
 # COMMAND ----------
 # --- 3.15, 3.17: tags + column/volume comments ---
@@ -570,7 +538,7 @@ if str(_has_rm).lower() == "true":
             except Exception as _exc:  # noqa: BLE001
                 error_messages.append(f"3.19 registered model: target lookup failed: {_exc}")
 else:
-    print("3.19 registered model: not seeded; skipping.")
+    _skip("3.19 registered model: not seeded; skipping.")
 
 # COMMAND ----------
 # --- 3.24: Customer-defined Delta share ---
@@ -720,7 +688,7 @@ if str(has_iceberg).lower() == "true":
     except Exception as _exc:  # noqa: BLE001
         error_messages.append(f"2.5.8: Iceberg row-level compare aborted: {_exc}")
 else:
-    print("2.5.8: Iceberg fixture not seeded; skipping row-level compare.")
+    _skip("2.5.8: Iceberg fixture not seeded; skipping row-level compare.")
 
 # COMMAND ----------
 # --- 2.5.9: Iceberg re-run (skipped_by_config -> validated) transition ---
@@ -794,7 +762,7 @@ if str(has_iceberg_replay).lower() == "true":
     elif not _expect_validated(_latest[0], "2.5.9 iceberg_replay_target latest"):
         pass  # error already appended
 else:
-    print("2.5.9: Iceberg re-run fixture not seeded; skipping.")
+    _skip("2.5.9: Iceberg re-run fixture not seeded; skipping.")
 
 # COMMAND ----------
 # --- 2.5.10: Managed volume with nested directory tree ---
@@ -882,7 +850,10 @@ if str(has_nested_volume).lower() == "true":
     elif not _expect_validated(_nv_status[0], "2.5.10 nested_volume"):
         pass  # error already appended
 else:
-    print("2.5.10: nested_volume fixture not seeded; skipping.")
+    error_messages.append(
+        "MANDATORY: 2.5.10 nested_volume fixture not seeded — core managed-volume "
+        "copy is in scope and must be exercised (no env blocker)."
+    )
 
 # COMMAND ----------
 # --- 2.5.11: Materialized view that fails to refresh on target (SKIPPED) ---
@@ -902,28 +873,6 @@ else:
 # Those tests pin the contract: CREATE ok + REFRESH fail → status=validated,
 # error_message contains 'REFRESH failed' + the refresh error.
 
-# COMMAND ----------
-# --- 2.5.12 (superseded): Streaming tables now hard-excluded ---
-# The prior streaming-state warning assertion is obsolete. Streaming
-# tables are now hard-excluded from the core tool; mv_st_worker short-
-# circuits them to ``skipped_by_stateful_service_migration`` with a
-# documented error_message pointing at docs/stateful_services_phase.md.
-# The base 2.5.D ST assertion above already verifies the new terminal
-# state, so 2.5.12 degrades to a docstring pointer.
-
-if str(has_st).lower() == "true":
-    _st_status_rows = status_df.filter("object_type = 'st' AND object_name LIKE '%st_orders%'").collect()
-    if _st_status_rows:
-        _err = (_st_status_rows[0]["error_message"] or "")
-        if "stateful_services_phase.md" not in _err.lower():
-            error_messages.append(
-                f"2.5.12: st_orders error_message does not reference "
-                f"stateful_services_phase.md. Got: {_err!r}."
-            )
-        else:
-            print(f"2.5.12 validated: st_orders error_message points at the new phase doc: {_err[:160]!r}")
-else:
-    print("2.5.12: ST fixture not seeded; skipping stateful-services pointer check.")
 
 # COMMAND ----------
 
@@ -973,7 +922,7 @@ if str(has_abac).lower() == "true":
             f"row(s) with status='validated' in migration_status."
         )
 else:
-    print("3.16 ABAC: fixture not seeded (workspace runtime rejected SET ABAC POLICY); skipping.")
+    _skip("3.16 ABAC: fixture not seeded (workspace runtime rejected SET ABAC POLICY); skipping.")
 
 # COMMAND ----------
 # --- 3.20 Model artifacts ---
@@ -1041,7 +990,7 @@ if str(has_model_artifacts).lower() == "true":
                         f"{_bytes} byte(s) copied for {_obj_key}."
                     )
 else:
-    print("3.20 Model artifacts: fixture not seeded; skipping.")
+    _skip("3.20 Model artifacts: fixture not seeded; skipping.")
 
 # COMMAND ----------
 # --- Path A staging_copy end-to-end assertions ---
@@ -1245,6 +1194,45 @@ else:
     )
 
 # COMMAND ----------
+# --- Coverage guard: every UC-owned in-scope type must be EXERCISED ---
+# Makes "not tested" RED instead of a silent green (the whole point: if a type
+# isn't exercised, you find out). The UC suite (migrate_uc) owns the types
+# below; governance/stateful types are enforced by their own suites. A type is
+# "exercised" when migration_status has a row in its expected terminal state
+# (validated for migrated types; the hard-exclude skip for mv/st). Anything not
+# exercised and not explicitly exempted-with-reason fails the run.
+_UC_EXPECTED = {
+    "managed_table": {"validated"},
+    "external_table": {"validated"},
+    "volume": {"validated"},
+    "function": {"validated"},
+    "view": {"validated"},
+    "grant": {"validated"},
+    "registered_model": {"validated"},
+    # NOTE: mv / st are deliberately NOT in this guard — they are hard-excluded
+    # in this phase and their migration is deferred to the Stateful Services
+    # Phase (alongside vector search / online tables). The hard-exclude itself
+    # is covered by unit tests (test_mv_st_worker.py).
+}
+# type -> reason. Surfaced (never silent). Empty = enforce all.
+_UC_COVERAGE_EXEMPT: dict[str, str] = {}
+_cov = tracker.get_latest_migration_status()
+_by_type: dict[str, set] = {}
+for _r in _cov.select("object_type", "status").distinct().collect():
+    _by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+for _t, _ok in _UC_EXPECTED.items():
+    _got = _by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _UC_COVERAGE_EXEMPT:
+        _skip(f"COVERAGE EXEMPT '{_t}': {_UC_COVERAGE_EXEMPT[_t]}")
+    else:
+        error_messages.append(
+            f"COVERAGE: in-scope UC type '{_t}' was NOT exercised — expected "
+            f"{sorted(_ok)}, found {sorted(_got) or 'NONE'}. Type is untested."
+        )
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
@@ -1311,9 +1299,21 @@ else:
             else:
                 print(f"  OK: {_name!r} type={_otype!r} capability={_cap!r}")
 
+# Surface the NAMED, TRACKED skips (review finding: no silent skips). A clean
+# pass must never be mistaken for full coverage — the operator sees exactly
+# which in-scope fixtures were env-blocked and therefore NOT exercised.
+if skips:
+    print(f"\n=== TRACKED SKIPS ({len(skips)}) — env-blocked fixtures NOT exercised ===")
+    for _s in skips:
+        print(f"  - {_s}")
+else:
+    print("\n=== TRACKED SKIPS: none — every in-scope UC fixture was exercised ===")
+
 if error_messages:
     raise AssertionError(
-        f"Task-8 stateful inventory assertions failed "
-        f"({len(error_messages)} error(s)):\n" + "\n".join(error_messages)
+        f"UC integration assertions failed "
+        f"({len(error_messages)} error(s); {len(skips)} tracked skip(s)):\n"
+        + "\n".join(error_messages)
+        + (f"\n\nTracked skips ({len(skips)}):\n" + "\n".join(skips) if skips else "")
     )
-print("UC integration tests passed (Phase 1/2 + Phase 2.5 + Phase 3).")
+print(f"UC integration tests passed (Phase 1/2 + Phase 2.5 + Phase 3). Tracked skips: {len(skips)}.")

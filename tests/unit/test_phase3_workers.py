@@ -410,6 +410,42 @@ class TestPoliciesWorker:
         assert "/policies" in path
 
     @patch("migrate.policies_worker.time")
+    def test_strips_readonly_fields_before_post(self, mock_time):
+        """Live: the GET policy definition carries server-generated read-only
+        fields (id, created_at, created_by, updated_at, updated_by) that POST
+        /policies must not receive. The worker strips them, keeping the spec."""
+        from migrate.policies_worker import apply_policy
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        auth = MagicMock()
+        auth.target_client.api_client.do.return_value = {"ok": True}
+
+        res = apply_policy(
+            {
+                "name": "p1",
+                "on_securable_type": "TABLE",
+                "on_securable_fullname": "c.s.t",
+                "to_principals": ["account users"],
+                "policy_type": "POLICY_TYPE_ROW_FILTER",
+                "row_filter": {"function_name": "c.s.rf0"},
+                "id": "abc-123",
+                "created_at": 123,
+                "created_by": "someone@x.com",
+                "updated_at": 456,
+                "updated_by": "someone@x.com",
+            },
+            auth=auth,
+            dry_run=False,
+        )
+        assert res["status"] == "validated"
+        body = auth.target_client.api_client.do.call_args.kwargs["body"]
+        for ro in ("id", "created_at", "created_by", "updated_at", "updated_by"):
+            assert ro not in body, f"{ro} must be stripped before POST"
+        assert body["name"] == "p1"
+        assert body["row_filter"] == {"function_name": "c.s.rf0"}
+        assert body["to_principals"] == ["account users"]
+
+    @patch("migrate.policies_worker.time")
     def test_records_error_on_api_failure(self, mock_time):
         from migrate.policies_worker import apply_policy
 
@@ -450,6 +486,10 @@ class TestMonitorsWorker:
         body = auth.target_client.api_client.do.call_args.kwargs["body"]
         assert "table_name" not in body  # stripped
         assert "status" not in body
+        # assets_dir is REQUIRED by the create API — the worker must set a
+        # fresh deterministic target path, not strip it (the source path is
+        # meaningless on target). Live failure was "assets_dir is required".
+        assert body["assets_dir"] == "/Workspace/Shared/cp_migration_monitor_assets/c.s.t"
         assert "schedule" in body
 
 
@@ -603,10 +643,15 @@ class TestModelsWorker:
 class TestConnectionsWorker:
     @patch("migrate.connections_worker.time")
     def test_creates_connection_and_flags_missing_credentials(self, mock_time):
+        from databricks.sdk.errors import NotFound
+
         from migrate.connections_worker import apply_connection
 
         mock_time.time.side_effect = [100.0, 101.0]
         auth = MagicMock()
+        # Connection absent on target → exercise the create path (not the
+        # idempotent target-existence short-circuit).
+        auth.target_client.connections.get.side_effect = NotFound("not found")
         auth.target_client.connections.create.return_value = MagicMock()
 
         res = apply_connection(
@@ -619,10 +664,13 @@ class TestConnectionsWorker:
 
     @patch("migrate.connections_worker.time")
     def test_validated_when_no_secret_options(self, mock_time):
+        from databricks.sdk.errors import NotFound
+
         from migrate.connections_worker import apply_connection
 
         mock_time.time.side_effect = [100.0, 101.0]
         auth = MagicMock()
+        auth.target_client.connections.get.side_effect = NotFound("not found")
         auth.target_client.connections.create.return_value = MagicMock()
 
         res = apply_connection(

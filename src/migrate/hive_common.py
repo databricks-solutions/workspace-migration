@@ -2,9 +2,66 @@
 
 from __future__ import annotations
 
+import logging
 import re
 
 HIVE_CATALOG = "hive_metastore"
+
+logger = logging.getLogger("hive_common")
+
+# Secret holding the ADLS storage account key for hive_metastore tables on
+# ADLS. hive_metastore LOCATION access does NOT route through UC credential
+# vending — it uses the legacy fs.azure.account.key Hadoop conf, which can only
+# be set on CLASSIC compute (serverless rejects it). Workers/seed that touch
+# ADLS-backed hive_metastore tables must therefore run on a classic cluster
+# (job_cluster_key=hive_adls_classic) and call configure_adls_account_key().
+ADLS_KEY_SECRET_SCOPE = "migration"
+ADLS_KEY_SECRET_KEY = "adls-account-key"
+
+
+def configure_adls_account_key(
+    spark,
+    dbutils,
+    storage_location: str | None,
+    *,
+    scope: str = ADLS_KEY_SECRET_SCOPE,
+    key: str = ADLS_KEY_SECRET_KEY,
+) -> bool:
+    """Set fs.azure.account.key for the storage account in *storage_location*.
+
+    hive_metastore EXTERNAL / managed-non-DBFS tables live on ADLS, and that
+    access bypasses UC credential vending — it needs the legacy account-key
+    Hadoop conf, settable only on classic compute. Parses the account host from
+    an ``abfss://container@<account>.dfs.core.windows.net/...`` location and
+    sets the per-session key from the secret. Best-effort and idempotent:
+
+    * no-op for non-abfss locations,
+    * no-op if the secret isn't configured (returns False — caller stays on UC
+      vending / serverless behaviour),
+    * no-op if the runtime rejects the conf (serverless), logged not raised.
+
+    Returns True only when the key was successfully applied.
+    """
+    if not storage_location or not storage_location.startswith("abfss://"):
+        return False
+    try:
+        host = storage_location.split("@", 1)[1].split("/", 1)[0]  # <account>.dfs.core.windows.net
+    except (IndexError, AttributeError):
+        return False
+    if not host:
+        return False
+    try:
+        secret = dbutils.secrets.get(scope=scope, key=key)
+    except Exception as exc:  # noqa: BLE001 — secret not configured
+        logger.info("ADLS account key secret %s/%s unavailable (%s); skipping.", scope, key, exc)
+        return False
+    try:
+        spark.conf.set(f"fs.azure.account.key.{host}", secret)
+        logger.info("Configured fs.azure.account.key for %s.", host)
+        return True
+    except Exception as exc:  # noqa: BLE001 — serverless blocks this conf
+        logger.warning("Could not set fs.azure.account.key for %s (%s).", host, exc)
+        return False
 
 
 def rewrite_hive_namespace(sql: str, target_catalog: str) -> str:

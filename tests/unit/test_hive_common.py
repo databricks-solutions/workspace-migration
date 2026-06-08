@@ -109,3 +109,60 @@ class TestHiveCatalogConstant:
         configurable, since the rewrite helpers depend on the exact
         string ``hive_metastore``."""
         assert HIVE_CATALOG == "hive_metastore"
+
+
+class TestConfigureAdlsAccountKey:
+    """configure_adls_account_key sets the legacy fs.azure.account.key Hadoop
+    conf for hive_metastore-on-ADLS access (serverless can't, classic can)."""
+
+    def _spark_dbutils(self, secret="theKey"):
+        from unittest.mock import MagicMock
+
+        spark = MagicMock()
+        dbutils = MagicMock()
+        dbutils.secrets.get.return_value = secret
+        return spark, dbutils
+
+    def test_sets_account_key_for_abfss(self):
+        from migrate.hive_common import configure_adls_account_key
+
+        spark, dbutils = self._spark_dbutils()
+        ok = configure_adls_account_key(
+            spark, dbutils,
+            "abfss://external-data@myacct.dfs.core.windows.net/path/t",
+        )
+        assert ok is True
+        spark.conf.set.assert_called_once_with(
+            "fs.azure.account.key.myacct.dfs.core.windows.net", "theKey"
+        )
+
+    def test_noop_for_non_abfss(self):
+        from migrate.hive_common import configure_adls_account_key
+
+        spark, dbutils = self._spark_dbutils()
+        for loc in (None, "", "dbfs:/x", "s3://b/k"):
+            assert configure_adls_account_key(spark, dbutils, loc) is False
+        spark.conf.set.assert_not_called()
+        dbutils.secrets.get.assert_not_called()
+
+    def test_returns_false_when_secret_missing(self):
+        from migrate.hive_common import configure_adls_account_key
+
+        spark, dbutils = self._spark_dbutils()
+        dbutils.secrets.get.side_effect = Exception("no such secret")
+        ok = configure_adls_account_key(
+            spark, dbutils, "abfss://c@acct.dfs.core.windows.net/t"
+        )
+        assert ok is False
+        spark.conf.set.assert_not_called()
+
+    def test_returns_false_when_conf_rejected(self):
+        """Serverless rejects fs.azure.account.key — must not raise."""
+        from migrate.hive_common import configure_adls_account_key
+
+        spark, dbutils = self._spark_dbutils()
+        spark.conf.set.side_effect = Exception("CONFIG_NOT_AVAILABLE")
+        ok = configure_adls_account_key(
+            spark, dbutils, "abfss://c@acct.dfs.core.windows.net/t"
+        )
+        assert ok is False

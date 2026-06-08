@@ -21,6 +21,7 @@ except NameError:
 # catalog by extracting DDL via DESCRIBE FUNCTION EXTENDED, rewriting the
 # namespace, and replaying as CREATE OR REPLACE FUNCTION on the target.
 
+import contextlib
 import json
 import logging
 import time
@@ -57,6 +58,10 @@ def get_hive_function_ddl(spark, func_fqn: str) -> str:
     ``DESCRIBE FUNCTION EXTENDED``. Handles both SQL UDFs and JVM UDFs
     (registered via ``USING JAR``).
     """
+    # DESCRIBE FUNCTION EXTENDED <cat>.<db>.<fn> requires the current catalog to
+    # be <cat> on current runtimes ("not in the current catalog"). Set it first.
+    with contextlib.suppress(Exception):
+        spark.sql("USE CATALOG hive_metastore")
     rows = spark.sql(f"DESCRIBE FUNCTION EXTENDED {func_fqn}").collect()
     # DESCRIBE returns rows with a `function_desc` column. Parse key: value lines.
     info: dict[str, str] = {}

@@ -759,3 +759,42 @@ class TestListForeignCatalogs:
 
         with pytest.raises(PermissionDenied):
             explorer.list_foreign_catalogs()
+
+
+class TestListHiveFunctions:
+    """list_hive_functions parses SHOW USER FUNCTIONS IN <db>. Regression:
+    the old 'skip if no dot' filter dropped BARE user-function names, so
+    hive_function discovery came back empty even when a UDF existed."""
+
+    def test_keeps_bare_user_function_name(self, mock_spark):
+        # SHOW USER FUNCTIONS IN <db> can return the UDF name unqualified.
+        mock_spark.sql.return_value.collect.return_value = [_row(function="triple")]
+        explorer = CatalogExplorer(mock_spark, MagicMock())
+        result = explorer.list_hive_functions("integration_test_hive")
+        assert result == ["`hive_metastore`.`integration_test_hive`.`triple`"]
+
+    def test_keeps_qualified_name_for_this_db(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [
+            _row(function="integration_test_hive.triple"),
+            _row(function="spark_catalog.integration_test_hive.quad"),
+        ]
+        explorer = CatalogExplorer(mock_spark, MagicMock())
+        result = explorer.list_hive_functions("integration_test_hive")
+        assert result == [
+            "`hive_metastore`.`integration_test_hive`.`triple`",
+            "`hive_metastore`.`integration_test_hive`.`quad`",
+        ]
+
+    def test_drops_function_qualified_to_other_db(self, mock_spark):
+        mock_spark.sql.return_value.collect.return_value = [
+            _row(function="other_db.somefn"),
+            _row(function="triple"),
+        ]
+        explorer = CatalogExplorer(mock_spark, MagicMock())
+        result = explorer.list_hive_functions("integration_test_hive")
+        assert result == ["`hive_metastore`.`integration_test_hive`.`triple`"]
+
+    def test_returns_empty_on_error(self, mock_spark):
+        mock_spark.sql.side_effect = Exception("SHOW failed")
+        explorer = CatalogExplorer(mock_spark, MagicMock())
+        assert explorer.list_hive_functions("db") == []

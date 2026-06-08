@@ -205,18 +205,12 @@ if str(_has_multi_upstream).lower() == "true":
 else:
     print("2.10 skipped: seed did not create multi-upstream view.")
 
-# --- 2.11 cross-catalog view (references a UC catalog) ---
-_has_xcat = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_hive", key="has_cross_catalog_view", debugValue="false"
-)
-if str(_has_xcat).lower() == "true":
-    rows_xc = _validated_hive_rows("hive_view", "mixed_ref_view")
-    if not rows_xc:
-        error_messages.append("2.11: mixed_ref_view row missing from migration_status.")
-    elif _expect_validated(rows_xc[0], "2.11 mixed_ref_view"):
-        print("2.11 OK: cross-catalog view mixed_ref_view validated.")
-else:
-    print("2.11 skipped: seed did not create cross-catalog view.")
+# 2.11 (cross-catalog view referencing a UC catalog) was removed: it was the
+# only fixture that created a UC catalog on the Hive side, which forced the
+# fragile catalog_filter="<nonexistent>" hack to keep UC discovery a no-op.
+# That hack now hard-errors under the H8 "raise on empty filter" fix, so the
+# fixture + the filter were dropped together (niche scenario; unblocks the rest
+# of the hive suite). See the workflow YAML (no catalog_filter) for context.
 
 # --- 2.12 partitioned DBFS-root ---
 _has_part_dbfs = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
@@ -326,6 +320,104 @@ if str(_has_chain).lower() == "true":
         print("2.15 OK: view_level1 → view_level2 → view_level3 all validated.")
 else:
     print("2.15 skipped: seed did not create view chain.")
+
+# COMMAND ----------
+# --- Coverage guard: every hive-owned in-scope type must be EXERCISED ---
+# Red-if-untested (same mechanism as the UC + governance suites). The hive
+# suite (migrate_hive) owns these object types. A type is "exercised" when
+# migration_status has a row in its expected terminal state (validated).
+# Anything in scope that isn't exercised — and isn't explicitly
+# exempted-with-reason — fails the run, naming the type, so a silently
+# untested type shows RED instead of a false green.
+#
+# Exemptions are surfaced loudly (an EXEMPT line, never a silent green), and
+# only apply to types whose *source fixture* genuinely can't be created in
+# this environment — NOT to a seeded type whose migration failed (that stays
+# hard RED). Two environmental gates:
+#  1. The whole DBFS-root group only runs when migrate_hive_dbfs_root is on.
+#  2. hive_external / hive_managed_nondbfs are seeded by writing hive_metastore
+#     tables to a RAW abfss LOCATION, which needs a direct storage account key.
+#     The serverless test compute reaches ADLS only via UC external locations,
+#     so it can't create those source tables (managed_dbfs_root has no explicit
+#     LOCATION, so it seeds fine). The seed reports has_hive_external /
+#     has_hive_nondbfs=false when it couldn't; we exempt-with-reason on that.
+_HIVE_EXPECTED = {
+    "hive_view": {"validated"},
+    "hive_function": {"validated"},
+    "hive_grant": {"validated"},
+    "hive_managed_dbfs_root": {"validated"},
+    "hive_managed_nondbfs": {"validated"},
+    "hive_external": {"validated"},
+}
+_HIVE_COVERAGE_EXEMPT: dict[str, str] = {}
+if not config.migrate_hive_dbfs_root:
+    _dbfs_reason = "requires migrate_hive_dbfs_root=true (DBFS-root migration disabled this run)"
+    for _t in ("hive_managed_dbfs_root", "hive_managed_nondbfs", "hive_external"):
+        _HIVE_COVERAGE_EXEMPT[_t] = _dbfs_reason
+else:
+    # Gate the raw-abfss-LOCATION fixtures on whether the seed could create
+    # them. hive_metastore LOCATION access on ADLS bypasses UC credential
+    # vending and falls back to the legacy fs.azure.account.key path, which
+    # serverless BLOCKS — so seed_hive and the migrate_hive external/nondbfs
+    # workers run on a CLASSIC cluster (job_cluster_key=hive_adls_classic) with
+    # the storage account key from secret migration/adls-account-key (account
+    # from the hive_adls_storage_account var). When that cluster + key + var are
+    # configured, the seed creates the fixtures (has_*=true) and these types are
+    # ENFORCED. They're only exempted-with-reason when the storage isn't
+    # configured (var/secret unset) so the fixtures can't be created — never to
+    # paper over a seeded-but-failed migration (that stays hard RED).
+    _seed_storage_reason = (
+        "source fixture not seeded — hive_metastore ADLS external/nondbfs tables "
+        "need a classic cluster with a storage account key (serverless can't do "
+        "legacy fs.azure.account.key access). Set the hive_adls_storage_account "
+        "var + migration/adls-account-key secret so seed_hive (on the "
+        "hive_adls_classic cluster) can create them."
+    )
+    _has_ext = str(
+        dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+            taskKey="seed_hive", key="has_hive_external", debugValue="false"
+        )
+    ).lower()
+    _has_nd = str(
+        dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+            taskKey="seed_hive", key="has_hive_nondbfs", debugValue="false"
+        )
+    ).lower()
+    if _has_ext != "true":
+        _HIVE_COVERAGE_EXEMPT["hive_external"] = _seed_storage_reason
+    if _has_nd != "true":
+        _HIVE_COVERAGE_EXEMPT["hive_managed_nondbfs"] = _seed_storage_reason
+
+_hive_cov = tracker.get_latest_migration_status()
+_hive_by_type: dict[str, set] = {}
+for _r in _hive_cov.select("object_type", "status").distinct().collect():
+    _hive_by_type.setdefault(_r["object_type"], set()).add(_r["status"])
+
+for _t, _ok in _HIVE_EXPECTED.items():
+    _got = _hive_by_type.get(_t, set())
+    if _got & _ok:
+        print(f"COVERAGE OK: '{_t}' exercised ({sorted(_got)})")
+    elif _t in _HIVE_COVERAGE_EXEMPT:
+        print(f"COVERAGE EXEMPT '{_t}': {_HIVE_COVERAGE_EXEMPT[_t]}")
+    elif _got:
+        # Attempted but never reached a validated state — surface the failure
+        # messages so the red names WHY, not just THAT it failed.
+        _fails = (
+            _hive_cov.filter(f"object_type = '{_t}' AND status != 'validated'")
+            .select("object_name", "status", "error_message")
+            .limit(5)
+            .collect()
+        )
+        _detail = "; ".join(f"{_r['object_name']}: {_r['error_message']}" for _r in _fails)
+        error_messages.append(
+            f"COVERAGE: in-scope hive type '{_t}' was NOT validated — found {sorted(_got)}. "
+            f"Failures: {_detail}"
+        )
+    else:
+        error_messages.append(
+            f"COVERAGE: in-scope hive type '{_t}' was NOT exercised — expected {sorted(_ok)}, "
+            f"found NONE. Type is untested."
+        )
 
 # COMMAND ----------
 
