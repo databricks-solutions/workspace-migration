@@ -47,6 +47,7 @@ connectors with a settable boundary (Tier 1) and **not** achievable for the rest
 | D8 | Reuse Path A staging + `clone_table` for the data clone (Tier 1), with two small refactors: explicit target FQN + parametrized `object_type`. |
 | D9 | **CDC SCD2 history-loss is accepted and documented** (D4): a re-pull rebuilds history only from cutover forward; pre-cutover `__START_AT/__END_AT` versions are lost. Operators who must keep them archive the old table separately. |
 | D10 | The gateway↔ingestion **relationship** is captured at discovery and used to pair + order + re-wire recreation; the source id **values** are discarded and remapped to new target ids. |
+| D11 | **Real-resource integration tests for all 4 scenarios**, on two source systems: one Azure SQL (S3, CDC+CT) for C+D, one Salesforce dev org for A+B (B routed through Tier 2 with no filter). No preview-gated stubs. Coverage guard fails RED on any unexercised scenario. |
 
 ## The two tiers
 
@@ -198,19 +199,59 @@ job up-front (via the existing orchestrator gate) only on hard blockers
 
 ## Testing
 
-- **Unit** — `test_lfc_worker.py`: Tier-1 clone+filtered-recreate+SCD1-merge-view;
-  Tier-1 SCD2 union view; per-table mixed filter (incremental vs batch);
-  Tier-2 full-reload recreate; CDC gateway recreate + id remap + ordered wiring;
+**Goal: real-resource integration coverage of all four scenarios** (not
+preview-gated stubs), mirroring the confidence the governance/hive suites built.
+The four scenarios collapse onto **two source systems** because the tool's code
+paths are connector-agnostic within a tier.
+
+### Source systems (real)
+
+| Source | Scenarios covered | Provisioning |
+|---|---|---|
+| **One Azure SQL Server** (S3 SKU, **CDC *and* Change Tracking** enabled on the seeded tables) | **C** query-based + **D** CDC/gateway | Extend `infra/azure-sql-test` (existing PE + NCC + cursor-friendly seed). S3 SKU so true CDC — not just CT — is exercised. |
+| **One Salesforce dev org** (`lfc-test`, already seeded) | **A** Tier-1 `row_filter` + **B** Tier-2 no-filter | Creds-gated UC connection (same posture as the governance connection test). |
+
+- **C (query-based):** existing `dbo.customers`/`dbo.orders` already carry
+  timestamp cursor columns (`created_at`/`placed_at`) + PKs. Test creates the
+  connection + query-based pipeline; serverless reaches the DB via the existing
+  NCC PE.
+- **D (CDC/gateway):** enable CDC + CT on the seeded tables; test provisions a
+  **staging volume**, recreates **gateway + ingestion pipeline**; the classic
+  gateway reaches the DB via the existing workspace-VNet PE. This is the riskiest
+  code (gateway recreate, id-remap, full reload) → real coverage matters most.
+- **A (SaaS `row_filter`):** Salesforce pipeline **with** a cursor `row_filter` →
+  Tier-1 clone + filtered recreate + unified view.
+- **B (SaaS non-`row_filter`):** **same Salesforce org**, a pipeline **without** a
+  `row_filter`, deliberately routed through **Tier 2** → full reload, no
+  clone/view. Salesforce-no-filter faithfully reproduces B's runtime (full initial
+  load); the Tier-2 worker is connector-agnostic so no real non-`row_filter`
+  connector hits a path this misses. The **classifier's** "Workday/HubSpot/Jira →
+  Tier 2" decision (the only connector-specific part) is covered by **unit test**
+  against the real connector-type strings.
+
+### Test workflows
+- `lfc_integration_test_workflow.yml` — seed → discovery → pre_check → migrate →
+  assert, run live against the two source systems. Per-scenario assertions:
+  C/A → history clone + `_incr` pipeline with `row_filter` + unified view;
+  D/B → recreated pipeline (+ gateway for D) + full-reloaded table.
+- **Coverage guard** (same red-if-untested pattern as the UC/governance/hive
+  suites): fail RED if any of the 4 scenarios isn't exercised (validated or
+  documented-exempt with reason).
+
+### Unit
+- `test_lfc_worker.py`: Tier-1 clone+filtered-recreate+SCD1-merge-view; Tier-1
+  SCD2 union view; per-table mixed filter (incremental vs batch); Tier-2
+  full-reload recreate; CDC gateway recreate + id remap + ordered wiring;
   idempotent `skipped_target_pipeline_exists`; per-pipeline isolation on failure.
-  `test_pre_check_lfc.py`: tier classification; missing connection/catalog → FAIL;
-  CDC preconditions recorded. Mock `pipelines`, `connections`, `tables`,
-  warehouse exec.
-- **Integration** — `lfc_integration_test_workflow.yml`: seed a query-based LFC
-  pipeline (cleanest Tier-1 path) + landed data → discovery → pre_check → migrate
-  → assert history clone + `_incr` pipeline with `row_filter` + unified view.
-  CDC/gateway integration is **preview/infra-gated** (needs a source DB + network
-  + classic gateway) — tolerant/preview-gated assertion, same posture as the
-  PR #53 stateful inventory test. Unit tests are the CI gate.
+- `test_pre_check_lfc.py`: **tier classification across all connector types**
+  (incl. Workday/HubSpot/Jira → Tier 2); missing connection/catalog → FAIL; CDC
+  preconditions recorded. Mock `pipelines`, `connections`, `tables`, warehouse exec.
+
+### Infra build (staged — see implementation plan)
+Real testing requires a live lab (sandbox; likely expired — rebuild first). Build
+in layers, pausing for verification between each: ① workspaces → ② Azure SQL
+(S3) + PE + NCC → ③ enable CDC/CT + cursor seed → ④ Salesforce connection +
+seeded objects → ⑤ LFC pipelines/seeds + test workflows.
 
 ## Docs (ship with the code)
 
@@ -261,3 +302,6 @@ job up-front (via the existing orchestrator gate) only on hard blockers
 - `tests/unit/test_lfc_worker.py`, `tests/unit/test_pre_check_lfc.py` — **new**
 - `docs/user_guide.md` — `migrate_lfc` section + Known limitations
 - `docs/stateful_services_phase.md` — LFC now has a migration job
+- `infra/azure-sql-test/` (local infra repo, not this bundle) — bump SKU to S3;
+  enable CDC + Change Tracking on seeded tables; cursor columns already present.
+  Salesforce connection/seeded objects reuse the `lfc-test` dev org.
