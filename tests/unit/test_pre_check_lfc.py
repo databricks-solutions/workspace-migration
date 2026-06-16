@@ -7,10 +7,11 @@ from pre_check.pre_check_lfc import find_blockers
 def _row(defn):
     return {"object_name": "p1", "metadata_json": json.dumps({"definition": defn})}
 
-QB = {"spec": {"ingestion_definition": {"connection_name": "src_pg", "objects": [
+QB = {"spec": {"ingestion_definition": {"connection_name": "src_pg", "source_type": "POSTGRESQL", "objects": [
     {"table": {"destination_catalog": "bronze", "destination_schema": "pg",
                "destination_table": "orders",
-               "table_configuration": {"cursor_column": "updated_at"}}}]}}}
+               "table_configuration": {"primary_keys": ["order_id"],
+                                       "query_based_connector_config": {"cursor_columns": ["updated_at"]}}}}]}}}
 
 def test_blocker_when_connection_missing():
     tc = MagicMock()

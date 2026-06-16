@@ -3,11 +3,12 @@ from unittest.mock import MagicMock
 
 from migrate.lfc_worker import migrate_pipeline
 
-DEF = {"spec": {"ingestion_definition": {"connection_name": "src_pg", "objects": [
+DEF = {"spec": {"catalog": "bronze", "schema": "pg", "ingestion_definition": {
+    "connection_name": "src_pg", "source_type": "POSTGRESQL", "objects": [
     {"table": {"source_catalog": "pg", "source_schema": "public", "source_table": "orders",
                "destination_catalog": "bronze", "destination_schema": "pg", "destination_table": "orders",
                "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["order_id"],
-                                       "cursor_column": "updated_at"}}}]}}}
+                                       "query_based_connector_config": {"cursor_columns": ["updated_at"]}}}}]}}}
 
 def _row():
     return {"object_name": "lfc_orders", "object_type": "lfc_pipeline",
@@ -41,11 +42,12 @@ def test_idempotent_when_view_exists():
 
 
 def test_batch_table_without_cursor_is_not_cloned_or_viewed():
-    two_tables = {"spec": {"ingestion_definition": {"connection_name": "src_pg", "objects": [
+    two_tables = {"spec": {"catalog": "bronze", "schema": "pg", "ingestion_definition": {
+        "connection_name": "src_pg", "source_type": "POSTGRESQL", "objects": [
         {"table": {"source_catalog": "pg", "source_schema": "public", "source_table": "orders",
                    "destination_catalog": "bronze", "destination_schema": "pg", "destination_table": "orders",
                    "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["order_id"],
-                                           "cursor_column": "updated_at"}}},
+                                           "query_based_connector_config": {"cursor_columns": ["updated_at"]}}}},
         {"table": {"source_catalog": "pg", "source_schema": "public", "source_table": "regions",
                    "destination_catalog": "bronze", "destination_schema": "pg", "destination_table": "regions",
                    "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["region_id"]}}},

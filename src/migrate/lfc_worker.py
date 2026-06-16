@@ -239,16 +239,20 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
     def _create_pipeline(spec: dict) -> None:
         """Create the recreated LFC pipeline on the TARGET workspace.
 
-        # LIVE-VALIDATION: confirm pipelines.create accepts this spec shape
-        # against the installed SDK (plan Task 8). If the typed API rejects
-        # a raw dict, use CreatePipeline.from_dict(spec) or equivalent.
+        Live-validated shape (databricks-sdk 0.102): pipelines.create takes the
+        ingestion_definition as a typed IngestionPipelineDefinition, plus the
+        REQUIRED top-level catalog/schema (direct publishing mode). There is no
+        CreatePipeline class in this SDK.
         """
-        try:
-            auth.target_client.pipelines.create(**spec)
-        except TypeError:
-            # Fallback: SDK may require a typed object
-            from databricks.sdk.service.pipelines import CreatePipeline  # type: ignore[attr-defined]
-            auth.target_client.pipelines.create(CreatePipeline.from_dict(spec))
+        from databricks.sdk.service.pipelines import IngestionPipelineDefinition
+
+        auth.target_client.pipelines.create(
+            name=spec["name"],
+            catalog=spec.get("catalog"),
+            schema=spec.get("schema"),
+            channel=spec.get("channel", "PREVIEW"),
+            ingestion_definition=IngestionPipelineDefinition.from_dict(spec["ingestion_definition"]),
+        )
 
     def _create_view(sql: str) -> None:
         """Execute a CREATE OR REPLACE VIEW DDL on the TARGET warehouse."""
