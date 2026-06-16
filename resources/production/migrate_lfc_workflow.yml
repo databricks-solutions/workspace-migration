@@ -1,0 +1,38 @@
+resources:
+  jobs:
+    migrate_lfc:
+      name: "${var.job_prefix}-migrate-lfc"
+      description: |
+        Lakeflow Connect migration (Stage 1: query-based connectors). Clones
+        each landed destination table to <t>_history, recreates the pipeline
+        on target with a per-table cursor row_filter (>= the migrated boundary)
+        writing to <t>_incr, and creates a unified view at the canonical name.
+        Trust-the-operator: target catalogs/schemas + the UC connection must
+        already exist (run migrate_uc + connection migration first).
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: pre_check_lfc
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check_lfc.py
+
+        - task_key: orchestrator
+          depends_on:
+            - task_key: pre_check_lfc
+          notebook_task:
+            notebook_path: ../../src/migrate/orchestrator.py
+
+        - task_key: migrate_lfc
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/lfc_worker.py
+
+        - task_key: summary_lfc
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_lfc
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              object_types: "lfc_pipeline,lfc_table,lfc_view"
