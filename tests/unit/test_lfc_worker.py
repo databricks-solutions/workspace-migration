@@ -79,4 +79,9 @@ def test_clone_failure_still_recreates_pipeline_and_records_error():
     assert len(lfc_tables) == 1
     assert lfc_tables[0]["status"] == "failed"
     assert lfc_tables[0]["error_message"] == "boom"
+    # pipeline is still recreated (independent of the history clone)...
     deps.create_pipeline.assert_called_once()
+    # ...but the unified view is SKIPPED — can't union a missing _history table,
+    # and we must not mask the clone error with a downstream create_view failure.
+    deps.create_view.assert_not_called()
+    assert not any(r["object_type"] == "lfc_view" for r in results)

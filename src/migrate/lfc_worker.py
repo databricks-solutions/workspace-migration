@@ -63,6 +63,7 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
 
     results: list[dict] = []
     boundaries: dict[str, str] = {}
+    cloned_ok: dict[str, bool] = {}  # source_table -> history clone landed on target?
     start = time.time()
 
     for c in cfgs:
@@ -73,6 +74,8 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
         clone = deps.clone_history(c)
         results.append({"object_name": f"{src_table_fqn}_history", "object_type": "lfc_table",
                         "status": clone["status"], "error_message": clone.get("error_message")})
+        # history exists on target iff the clone validated (or was already there)
+        cloned_ok[c["source_table"]] = clone["status"] in ("validated", "skipped_target_exists")
 
     spec = build_query_based_create_spec(
         definition, target_connection_name=target_connection_name,
@@ -86,7 +89,19 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
     for c in cfgs:
         if not c.get("cursor_column"):
             continue
+        if not cloned_ok.get(c["source_table"]):
+            continue  # history clone failed — can't union a missing _history table; clone row already records the error
         base = f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}"
+        # The unified view unions <base>_history (cloned) + <base>_incr (produced by the
+        # recreated pipeline's forward ingestion). If the pipeline hasn't run yet — e.g. it
+        # can't reach the source without target-side network egress — <base>_incr won't
+        # exist; defer the view rather than fail. It's created once forward ingestion runs.
+        if not deps.target_table_exists(_bt(f"{base}_incr")):
+            results.append({"object_name": base, "object_type": "lfc_view",
+                            "status": "lfc_view_pending_forward_ingest",
+                            "error_message": f"{base}_incr not present — recreated pipeline forward ingestion has "
+                                             "not run yet; unified view deferred"})
+            continue
         sql = build_unified_view_sql(
             canonical=_bt(base), history=_bt(f"{base}_history"), incr=_bt(f"{base}_incr"),
             scd_type=c["scd_type"], primary_keys=c["primary_keys"], cursor_column=c["cursor_column"],
@@ -108,20 +123,23 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
     """
     import types
 
+    from databricks.sdk.service.sharing import PermissionsChange, Privilege
+
     from common.auth import AuthManager
     from common.catalog_utils import CatalogExplorer
     from common.config import MigrationConfig
     from common.sql_utils import execute_and_fetch, execute_and_poll, find_warehouse
     from common.tracking import TrackingManager
     from common.validation import Validator
-    from migrate.managed_table_worker import clone_table
+    from migrate.clone_lib import clone_table
     from migrate.reconciliation import resolve_current_job_run_id
     from migrate.rls_cm import make_staging_table_fqn
-    from migrate.setup_sharing import (
+    from migrate.sharing_lib import (
         SHARE_NAME,
         add_tables_to_share,
         ensure_share_consumer_catalog,
         ensure_target_catalogs_and_schemas,
+        get_or_create_recipient,
         get_or_create_share,
     )
 
@@ -160,6 +178,14 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         if not rows_data or not rows_data[0]:
             raise RuntimeError(f"compute_boundary returned no rows for {table_fqn}")
         return str(rows_data[0][0])
+
+    def _count_rows(wh_id: str, fqn_bt: str, *, use_source: bool) -> int | None:
+        """COUNT(*) over a backticked FQN on the given warehouse. Returns None on error."""
+        res = execute_and_fetch(auth, wh_id, f"SELECT COUNT(*) FROM {fqn_bt}", use_source=use_source)
+        if res["state"] != "SUCCEEDED":
+            return None
+        rd = res.get("rows") or []
+        return int(rd[0][0]) if rd and rd[0] and rd[0][0] is not None else None
 
     def _clone_history(table_cfg: dict) -> dict:
         """Path-A staging clone of the landed Streaming Table into a _history table on target.
@@ -200,6 +226,11 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
             {"object_name": target_history_fqn, "catalog_name": dest_cat, "schema_name": dest_sch}
         ]
         get_or_create_share(auth, SHARE_NAME)
+        # Establish the cross-metastore D2D recipient on source keyed to the TARGET
+        # metastore — this is what creates the target-side provider that
+        # ensure_share_consumer_catalog needs. Mirrors setup_sharing.run().
+        target_metastore_id = auth.target_client.metastores.summary().global_metastore_id
+        recipient_name = get_or_create_recipient(auth, target_metastore_id)
         # staging_fqn shape: `<tcat>`.`cp_migration_staging`.`stg_<hash>`
         # build the share entry for the staging table
         staging_clean = staging_fqn.strip("`").replace("`.`", ".")
@@ -210,22 +241,63 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
             "schema_name": "cp_migration_staging",
         }
         add_tables_to_share(auth, SHARE_NAME, [staging_share_entry])
+        # GRANT SELECT on the share to the recipient — WITHOUT this the recipient
+        # sees an empty share and the consumer catalog exposes no tables, so the
+        # DEEP CLONE fails with SCHEMA/TABLE_NOT_FOUND. Mirrors setup_sharing.run()
+        # step 6. Idempotent (share-level; covers tables added later this run).
+        auth.source_client.shares.update_permissions(
+            name=SHARE_NAME,
+            changes=[PermissionsChange(principal=recipient_name, add=[Privilege.SELECT.value])],
+        )
         ensure_target_catalogs_and_schemas(auth, target_tbl_list)
         ensure_share_consumer_catalog(auth, SHARE_NAME, dry_run=False)
 
-        # Step 4: deep clone via clone_table
-        # staging_share_entry mimics a managed_table row so clone_table can derive the consumer path
-        return clone_table(
-            {"object_name": staging_fqn, "format": "delta"},
-            config=config,
-            auth=auth,
-            tracker=tracker,
-            validator=validator,
-            wh_id=tgt_wh_id,
-            share_name=SHARE_NAME,
-            target_fqn=target_history_fqn,
-            object_type="lfc_table",
-        )
+        # Step 4: DEEP CLONE the staging copy onto target as <table>_history, with a
+        # retry on cross-region (NE->WE) Delta-Sharing propagation lag — the staging
+        # table can be invisible in the consumer catalog for a short window after
+        # ALTER SHARE ADD (see reference_wsm_target_copy_share_race). Refresh the
+        # consumer catalog + retry on NOT_FOUND-shaped errors only.
+        last_res: dict = {}
+        for attempt in range(6):
+            last_res = clone_table(
+                {"object_name": staging_fqn, "format": "delta"},
+                config=config,
+                auth=auth,
+                tracker=tracker,
+                validator=validator,
+                wh_id=tgt_wh_id,
+                share_name=SHARE_NAME,
+                target_fqn=target_history_fqn,
+                object_type="lfc_table",
+            )
+            st = last_res["status"]
+            if st in ("validated", "skipped_target_exists"):
+                return last_res
+            if st == "validation_failed":
+                # The DEEP CLONE DDL succeeded but clone_table's validate_row_count
+                # counts the TARGET table on the SOURCE spark session (known H10 flaw)
+                # and can't find it. Re-validate authoritatively via the warehouses:
+                # source staging count vs target _history count.
+                src_cnt = _count_rows(src_wh_id, staging_fqn, use_source=True)
+                tgt_cnt = _count_rows(tgt_wh_id, target_history_fqn, use_source=False)
+                if src_cnt is not None and src_cnt == tgt_cnt:
+                    return {"object_name": last_res.get("object_name", staging_fqn),
+                            "object_type": "lfc_table", "status": "validated", "error_message": None,
+                            "source_row_count": src_cnt, "target_row_count": tgt_cnt}
+                return {"object_name": last_res.get("object_name", staging_fqn),
+                        "object_type": "lfc_table", "status": "validation_failed",
+                        "error_message": f"warehouse row-count check: source={src_cnt} target={tgt_cnt}"}
+            # st == "failed": retry ONLY on a consumer-side NOT_FOUND (share propagation lag)
+            err = (last_res.get("error_message") or "").upper()
+            if "NOT_FOUND" not in err and "CANNOT BE FOUND" not in err:
+                return last_res  # genuine clone failure — surface immediately
+            logger.info(
+                "[lfc] staging not visible in consumer catalog yet (attempt %d/6) — refreshing share + retrying",
+                attempt + 1,
+            )
+            time.sleep(15)
+            ensure_share_consumer_catalog(auth, SHARE_NAME, dry_run=False)
+        return last_res
 
     def _target_view_exists(canonical_fqn: str) -> bool:
         """True iff the canonical table/view exists on the target workspace."""
@@ -264,6 +336,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         compute_boundary=_compute_boundary,
         clone_history=_clone_history,
         target_view_exists=_target_view_exists,
+        target_table_exists=_target_view_exists,  # same impl (tables.get) — checks <t>_incr presence
         create_pipeline=_create_pipeline,
         create_view=_create_view,
     )
