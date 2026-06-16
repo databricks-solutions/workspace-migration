@@ -60,8 +60,8 @@ class TestManagedTableIdempotency:
             "validator": MagicMock(), "wh_id": "wh", "share_name": "cp_migration_share",
         }
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_delta_retry_uses_create_or_replace(self, mock_exec, mock_time):
         """Pin: DEEP CLONE uses CREATE OR REPLACE so existing target is silently overwritten."""
         from migrate.managed_table_worker import clone_table
@@ -77,8 +77,8 @@ class TestManagedTableIdempotency:
         assert "CREATE OR REPLACE TABLE" in sql
         assert res["status"] == "validated"
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_not_opted_in_is_skipped(self, mock_exec, mock_time):
         from migrate.managed_table_worker import clone_table
 

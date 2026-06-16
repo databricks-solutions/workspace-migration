@@ -33,8 +33,8 @@ class TestCloneTable:
             "share_name": "cp_migration_share",
         }
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_clone_table_success(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -59,8 +59,8 @@ class TestCloneTable:
         deps["tracker"].append_migration_status.assert_called_once()
         mock_execute.assert_called_once()
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_clone_table_dry_run(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -74,8 +74,8 @@ class TestCloneTable:
         assert result["error_message"] == "dry_run"
         mock_execute.assert_not_called()
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_clone_table_clone_failure(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -93,8 +93,8 @@ class TestCloneTable:
         assert result["status"] == "failed"
         assert "TABLE_NOT_FOUND" in result["error_message"]
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_clone_table_validation_mismatch(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -127,8 +127,8 @@ class TestCloneTable:
         assert "Malformed FQN" in result["error_message"]
         assert result["duration_seconds"] == 0.0
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_existing_target_is_not_overwritten_when_flag_off(self, mock_execute, mock_time):
         """Review finding #2: CREATE OR REPLACE … DEEP CLONE had no existence
         gate, so an orphaned-in_progress resume (or any re-trigger) re-clobbered
@@ -154,8 +154,8 @@ class TestCloneTable:
         clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
         assert clone_sqls == []
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_overwrite_existing_flag_forces_clone(self, mock_execute, mock_time):
         """With overwrite_existing=True, a present target IS replaced."""
         from migrate.managed_table_worker import clone_table
@@ -178,8 +178,8 @@ class TestCloneTable:
         clone_sqls = [c.args[2] for c in mock_execute.call_args_list if "DEEP CLONE" in c.args[2]]
         assert len(clone_sqls) == 1
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_existence_gate_uses_target_client_not_source_spark(self, mock_execute, mock_time):
         """Live regression pin (#2): the gate must check the TARGET workspace
         client, not the source spark session. Source and target share the same
@@ -229,8 +229,8 @@ class TestIcebergManagedTable:
             "share_name": "cp_migration_share",
         }
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_without_opt_in_is_skipped(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -250,8 +250,8 @@ class TestIcebergManagedTable:
         assert "iceberg_strategy" in result["error_message"]
         mock_execute.assert_not_called()
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_ddl_replay_success(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -279,8 +279,8 @@ class TestIcebergManagedTable:
         assert any("INSERT OVERWRITE" in s for s in sqls)  # idempotent re-ingest (#3)
         assert any("FROM `cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_is_idempotent_on_retry(self, mock_execute, mock_time):
         """Review finding #3: the Iceberg branch did CREATE (non-idempotent)
         then INSERT INTO (append). A retry after a successful CREATE would
@@ -309,8 +309,8 @@ class TestIcebergManagedTable:
         assert "INSERT OVERWRITE" in insert_sql
         assert "INSERT INTO" not in insert_sql
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_missing_create_statement_fails(self, mock_execute, mock_time):
         from migrate.managed_table_worker import clone_table
 
@@ -330,8 +330,8 @@ class TestIcebergManagedTable:
         assert result["status"] == "failed"
         assert "create_statement" in result["error_message"]
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_rehydrates_create_statement_from_tracker(self, mock_execute, mock_time):
         """When create_statement is stripped from the batch (to stay under
         Jobs' 3000-byte for_each limit), the worker falls back to
@@ -364,8 +364,8 @@ class TestIcebergManagedTable:
         sqls = [c.args[2] for c in mock_execute.call_args_list]
         assert any("USING ICEBERG" in s for s in sqls)
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_iceberg_rerun_after_strategy_flip(self, mock_execute, mock_time):
         """Backlog 2.5.1 — Iceberg re-run after strategy flip.
 
@@ -433,8 +433,8 @@ class TestIcebergManagedTable:
         # Ingest reads from the consumer catalog exposed by the share.
         assert any("`cp_migration_share_consumer`.`sch`.`ice_tbl`" in s for s in sqls)
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_delta_format_still_uses_deep_clone(self, mock_execute, mock_time):
         """Regression: explicit format='delta' should behave like no format set."""
         from migrate.managed_table_worker import clone_table
@@ -490,8 +490,8 @@ class TestStagingCopyDeepClone:
             "share_name": "cp_migration_share",
         }
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_deep_clones_from_staging_consumer_path_when_staging_exists(
         self, mock_execute, mock_time
     ):
@@ -522,8 +522,8 @@ class TestStagingCopyDeepClone:
         assert not any("AS SELECT * FROM" in s for s in sqls), sqls
         assert not any("`cp_migration_share_consumer`.`s`.`rls_table`" in s for s in sqls), sqls
 
-    @patch("migrate.managed_table_worker.time")
-    @patch("migrate.managed_table_worker.execute_and_poll")
+    @patch("migrate.clone_lib.time")
+    @patch("migrate.clone_lib.execute_and_poll")
     def test_no_staging_falls_through_to_original_consumer_deep_clone(
         self, mock_execute, mock_time
     ):
@@ -548,7 +548,7 @@ class TestStagingCopyDeepClone:
 
 def test_clone_table_honours_explicit_target_fqn_and_object_type(monkeypatch):
     # Force the "target already exists -> validate, no re-clone" path.
-    import migrate.managed_table_worker as m
+    import migrate.clone_lib as m
     from migrate.managed_table_worker import clone_table
     monkeypatch.setattr(m, "_target_table_exists", lambda auth, fqn: True)
     cfg = MagicMock(dry_run=False, overwrite_existing=False, iceberg_strategy="ddl_replay")
