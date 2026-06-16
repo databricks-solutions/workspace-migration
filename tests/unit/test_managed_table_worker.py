@@ -548,8 +548,8 @@ class TestStagingCopyDeepClone:
 
 def test_clone_table_honours_explicit_target_fqn_and_object_type(monkeypatch):
     # Force the "target already exists -> validate, no re-clone" path.
-    from migrate.managed_table_worker import clone_table
     import migrate.managed_table_worker as m
+    from migrate.managed_table_worker import clone_table
     monkeypatch.setattr(m, "_target_table_exists", lambda auth, fqn: True)
     cfg = MagicMock(dry_run=False, overwrite_existing=False, iceberg_strategy="ddl_replay")
     tracker = MagicMock()

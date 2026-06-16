@@ -1,5 +1,7 @@
-import yaml
 from pathlib import Path
+
+import yaml
+
 
 def test_migrate_lfc_workflow_has_expected_tasks():
     doc = yaml.safe_load(Path("resources/production/migrate_lfc_workflow.yml").read_text())
