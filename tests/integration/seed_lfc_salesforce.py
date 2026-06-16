@@ -33,9 +33,10 @@ except NameError:
 #   be created non-interactively here. This seed VERIFIES the connection exists
 #   and fails fast with guidance if it does not. Everything else is idempotent.
 #
-# NOTE (confirm live): the Salesforce object TableSpec uses source_table =
-#   the SObject API name ("Account"); source_catalog/source_schema are omitted.
-#   If a given workspace's connector requires a source_schema, set _SF_SOURCE_SCHEMA.
+# NOTE: the Salesforce object TableSpec uses source_schema = "objects" and
+#   source_table = the SObject API name ("Account") — confirmed against the
+#   Databricks Salesforce ingestion docs (the connector resolves SObjects under
+#   the "objects" schema; omitting it fails analysis with SCHEMA_NOT_FOUND ``).
 
 import json
 import time
@@ -54,7 +55,7 @@ _CATALOG = "integration_test_lfc_sf"
 _SCHEMA = "sf"
 _PIPELINE_NAME = "lfc_it_sf_account"
 _SF_SOURCE_OBJECT = "Account"     # Salesforce SObject API name
-_SF_SOURCE_SCHEMA = None          # set if your connector requires it (else omitted)
+_SF_SOURCE_SCHEMA = "objects"     # Salesforce LFC addresses SObjects under schema "objects"
 _DEST_TABLE = "account"
 _PRIMARY_KEY = "Id"
 _POLL_TIMEOUT_SECONDS = 600
