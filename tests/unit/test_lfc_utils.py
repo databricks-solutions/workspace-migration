@@ -1,5 +1,5 @@
 from common.tracking import _TERMINAL_STATUSES
-from migrate.lfc_utils import build_unified_view_sql, classify_pipeline, extract_table_configs
+from migrate.lfc_utils import build_query_based_create_spec, build_unified_view_sql, classify_pipeline, extract_table_configs
 
 
 def test_lfc_stage1_statuses_are_terminal():
@@ -65,3 +65,18 @@ def test_view_scd2_is_union_all():
     )
     assert "UNION ALL" in sql
     assert "ROW_NUMBER" not in sql
+
+
+def test_build_create_spec_sets_incr_dest_and_row_filter():
+    spec = build_query_based_create_spec(
+        QB_DEF, target_connection_name="tgt_pg",
+        boundaries={"orders": "2026-06-10T00:00:00"}, name="lfc_orders_incr",
+    )
+    assert spec["channel"] == "PREVIEW"
+    idef = spec["ingestion_definition"]
+    assert idef["connection_name"] == "tgt_pg"
+    tbl = idef["objects"][0]["table"]
+    assert tbl["destination_table"] == "orders_incr"
+    assert tbl["table_configuration"]["row_filter"] == "updated_at >= '2026-06-10T00:00:00'"
+    assert tbl["table_configuration"]["cursor_column"] == "updated_at"
+    assert tbl["table_configuration"]["scd_type"] == "SCD_TYPE_1"

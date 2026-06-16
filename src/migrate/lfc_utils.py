@@ -5,6 +5,8 @@ are handled by later stages.
 """
 from __future__ import annotations
 
+import copy
+
 
 def _ingestion_def(definition: dict) -> dict:
     return ((definition or {}).get("spec") or {}).get("ingestion_definition") or {}
@@ -50,6 +52,30 @@ def extract_table_configs(definition: dict) -> list[dict]:
             "cursor_column": tc.get("cursor_column"),
         })
     return out
+
+
+def build_query_based_create_spec(
+    definition: dict, *, target_connection_name: str,
+    boundaries: dict[str, str], name: str,
+) -> dict:
+    """Build the pipelines.create spec for the recreated query-based pipeline.
+
+    boundaries maps source_table -> cursor boundary T. A table with a boundary
+    gets destination `<table>_incr` + row_filter `<cursor> >= 'T'`; a table
+    WITHOUT a boundary (batch/no-cursor) keeps the canonical destination and no
+    filter (full-load — its normal behaviour).
+    """
+    idef = copy.deepcopy(_ingestion_def(definition))
+    idef["connection_name"] = target_connection_name
+    for o in idef.get("objects") or []:
+        t = o.get("table") or {}
+        tc = t.setdefault("table_configuration", {})
+        src = t.get("source_table")
+        cursor = tc.get("cursor_column")
+        if src in boundaries and cursor:
+            t["destination_table"] = f"{t['destination_table']}_incr"
+            tc["row_filter"] = f"{cursor} >= '{boundaries[src]}'"
+    return {"name": name, "channel": "PREVIEW", "ingestion_definition": idef}
 
 
 def build_unified_view_sql(
