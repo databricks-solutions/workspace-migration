@@ -192,7 +192,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
                 "status": "failed",
                 "error_message": f"staging CTAS failed for {original_fqn}: {res.get('error', res['state'])}",
             }
-        tracker.record_staging_created(original_fqn=original_fqn, staging_fqn=staging_fqn)
+        tracker.record_staging_created(original_fqn=original_fqn, staging_fqn=staging_fqn, run_id=run_id)
 
         # Step 3: ensure share infrastructure
         # ensure_target_catalogs_and_schemas expects list[dict] with catalog_name / schema_name keys
