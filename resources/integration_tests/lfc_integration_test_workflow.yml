@@ -1,0 +1,62 @@
+resources:
+  jobs:
+    lfc_integration_test:
+      name: "${var.job_prefix}-lfc-integration-test"
+      description: |
+        LFC query-based integration test: seeds a live SQL Server-backed
+        query-based pipeline on source, runs discovery + migrate_lfc, then
+        asserts migration_status rows show lfc_table/lfc_pipeline/lfc_view
+        in their expected terminal states and that the history table and
+        unified view exist on the target workspace.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # LFC integration test: no Iceberg DDL replay, no RLS/CM staging,
+            # no Hive DBFS-root migration. catalog_filter scopes discovery to
+            # the LFC fixture catalog. lfc_target_connection_name sets the UC
+            # connection name that the recreated pipeline will use on target.
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+              catalog_filter: "integration_test_lfc"
+              lfc_target_connection_name: "integration_test_sqlserver"
+
+        - task_key: seed_lfc
+          depends_on:
+            - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_lfc_test_data.py
+
+        - task_key: discovery
+          depends_on:
+            - task_key: seed_lfc
+          notebook_task:
+            notebook_path: ../../src/discovery/discovery.py
+
+        - task_key: migrate_lfc
+          depends_on:
+            - task_key: discovery
+          run_job_task:
+            job_id: ${resources.jobs.migrate_lfc.id}
+
+        - task_key: test_lfc
+          depends_on:
+            - task_key: migrate_lfc
+          notebook_task:
+            notebook_path: ../../tests/integration/test_lfc.py
+
+        - task_key: teardown_lfc
+          depends_on:
+            - task_key: setup_test_config
+            - task_key: seed_lfc
+            - task_key: discovery
+            - task_key: migrate_lfc
+            - task_key: test_lfc
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_lfc.py
