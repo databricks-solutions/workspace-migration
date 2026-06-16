@@ -111,6 +111,8 @@ def clone_table(
     validator: Validator,
     wh_id: str,
     share_name: str,
+    target_fqn: str | None = None,
+    object_type: str = "managed_table",
 ) -> dict:
     """Deep clone a single managed table from delta share to target.
 
@@ -130,14 +132,14 @@ def clone_table(
     if len(parts) != 3:
         return {
             "object_name": obj_name,
-            "object_type": "managed_table",
+            "object_type": object_type,
             "status": "failed",
             "error_message": f"Malformed FQN: {obj_name}",
             "duration_seconds": 0.0,
         }
 
     _catalog, schema, table = parts
-    target_fqn = obj_name  # same FQN on target
+    target_fqn = target_fqn or obj_name  # default: same FQN on target
     consumer_catalog = f"{share_name}_consumer"
     fmt = (table_info.get("format") or "delta").lower()
 
@@ -146,7 +148,7 @@ def clone_table(
         [
             {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "in_progress",
                 "error_message": None,
                 "job_run_id": None,
@@ -174,7 +176,7 @@ def clone_table(
             # and 'skipped' but not status suffixes.
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "skipped_by_config",
                 "error_message": (
                     "Iceberg migration not enabled. Set iceberg_strategy='ddl_replay' "
@@ -193,7 +195,7 @@ def clone_table(
         if not create_stmt:
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "failed",
                 "error_message": "Iceberg DDL replay requires create_statement in discovery row",
                 "duration_seconds": time.time() - start,
@@ -211,7 +213,7 @@ def clone_table(
             logger.info("[DRY RUN] Would execute: %s", insert_sql)
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "skipped",
                 "error_message": "dry_run",
                 "duration_seconds": duration,
@@ -222,7 +224,7 @@ def clone_table(
         if res["state"] != "SUCCEEDED":
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "failed",
                 "error_message": f"Iceberg CREATE failed: {res.get('error', res['state'])}",
                 "duration_seconds": time.time() - start,
@@ -233,7 +235,7 @@ def clone_table(
         if res["state"] != "SUCCEEDED":
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "failed",
                 "error_message": f"Iceberg INSERT failed: {res.get('error', res['state'])}",
                 "duration_seconds": time.time() - start,
@@ -251,7 +253,7 @@ def clone_table(
             )
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": status,
                 "error_message": err,
                 "source_row_count": validation["source_count"],
@@ -261,7 +263,7 @@ def clone_table(
         except Exception as exc:  # noqa: BLE001
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "validation_failed",
                 "error_message": f"Iceberg validation error: {exc}",
                 "duration_seconds": duration,
@@ -296,7 +298,7 @@ def clone_table(
         logger.info("[DRY RUN] Would execute: %s", sql)
         return {
             "object_name": obj_name,
-            "object_type": "managed_table",
+            "object_type": object_type,
             "status": "skipped",
             "error_message": "dry_run",
             "duration_seconds": duration,
@@ -323,7 +325,7 @@ def clone_table(
         if result["state"] != "SUCCEEDED":
             return {
                 "object_name": obj_name,
-                "object_type": "managed_table",
+                "object_type": object_type,
                 "status": "failed",
                 "error_message": result.get("error", result["state"]),
                 "duration_seconds": duration,
@@ -335,7 +337,7 @@ def clone_table(
         status = "validated" if validation["match"] else "validation_failed"
         return {
             "object_name": obj_name,
-            "object_type": "managed_table",
+            "object_type": object_type,
             "status": status,
             "error_message": None
             if validation["match"]
@@ -347,7 +349,7 @@ def clone_table(
     except Exception as exc:  # noqa: BLE001
         return {
             "object_name": obj_name,
-            "object_type": "managed_table",
+            "object_type": object_type,
             "status": "validation_failed",
             "error_message": f"Validation error: {exc}",
             "duration_seconds": duration,

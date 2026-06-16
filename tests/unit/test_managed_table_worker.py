@@ -544,3 +544,23 @@ class TestStagingCopyDeepClone:
         # Original consumer path, not staging.
         assert any("`cp_migration_share_consumer`.`s`.`plain_table`" in s for s in sqls), sqls
         assert not any("cp_migration_staging" in s for s in sqls), sqls
+
+
+def test_clone_table_honours_explicit_target_fqn_and_object_type(monkeypatch):
+    # Force the "target already exists -> validate, no re-clone" path.
+    from migrate.managed_table_worker import clone_table
+    import migrate.managed_table_worker as m
+    monkeypatch.setattr(m, "_target_table_exists", lambda auth, fqn: True)
+    cfg = MagicMock(dry_run=False, overwrite_existing=False, iceberg_strategy="ddl_replay")
+    tracker = MagicMock()
+    tracker.get_staging_for_original.return_value = None
+    validator = MagicMock()
+    validator.validate_row_count.return_value = {"match": True, "source_count": 5, "target_count": 5}
+    res = clone_table(
+        {"object_name": "`c`.`s`.`account`", "format": "delta"},
+        config=cfg, auth=MagicMock(), tracker=tracker, validator=validator,
+        wh_id="w", share_name="cp_migration_share",
+        target_fqn="`c`.`s`.`account_history`", object_type="lfc_table",
+    )
+    assert res["object_type"] == "lfc_table"
+    validator.validate_row_count.assert_called_with("`c`.`s`.`account`", "`c`.`s`.`account_history`")
