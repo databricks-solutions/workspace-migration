@@ -1,9 +1,13 @@
+import pytest
+
 from common.tracking import _TERMINAL_STATUSES
 from migrate.lfc_utils import (
     build_query_based_create_spec,
+    build_recreate_spec,
     build_unified_view_sql,
     classify_pipeline,
     extract_table_configs,
+    resolve_saas_cursor,
 )
 
 
@@ -43,7 +47,22 @@ def test_classify_query_based_keys_off_source_type_not_cursor():
 
 
 def test_classify_saas_via_source_type():
-    assert classify_pipeline(SAAS_DEF) == ("saas", "tier1")
+    # WORKDAY is a non-row_filter SaaS connector → tier2
+    assert classify_pipeline(SAAS_DEF) == ("saas", "tier2")
+
+
+def _saas_def(source_type):
+    return {"spec": {"ingestion_definition": {"source_type": source_type, "connection_name": "c", "objects": []}}}
+
+
+@pytest.mark.parametrize("st", ["SALESFORCE", "GA4_RAW_DATA", "SERVICENOW"])
+def test_row_filter_saas_is_tier1(st):
+    assert classify_pipeline(_saas_def(st)) == ("saas", "tier1")
+
+
+@pytest.mark.parametrize("st", ["WORKDAY_RAAS", "SHAREPOINT", "NETSUITE", "DYNAMICS365"])
+def test_non_row_filter_saas_is_tier2(st):
+    assert classify_pipeline(_saas_def(st)) == ("saas", "tier2")
 
 
 def test_classify_cdc_is_tier2_not_this_stage():
@@ -101,3 +120,64 @@ def test_build_create_spec_sets_incr_dest_and_row_filter():
     # cursor stays in the nested field; it's the boundary source
     assert tc["query_based_connector_config"]["cursor_columns"] == ["updated_at"]
     assert tc["scd_type"] == "SCD_TYPE_1"
+
+
+def test_salesforce_cursor_priority_picks_first_present():
+    cols = ["Id", "Name", "CreatedDate", "LastModifiedDate", "SystemModstamp"]
+    assert resolve_saas_cursor("SALESFORCE", cols) == "SystemModstamp"
+
+
+def test_salesforce_cursor_falls_through_to_createddate():
+    assert resolve_saas_cursor("SALESFORCE", ["Id", "Name", "CreatedDate"]) == "CreatedDate"
+
+
+def test_salesforce_cursor_none_when_absent():
+    assert resolve_saas_cursor("SALESFORCE", ["Id", "Name"]) is None
+
+
+def test_servicenow_cursor():
+    assert resolve_saas_cursor("SERVICENOW", ["sys_id", "sys_updated_on"]) == "sys_updated_on"
+
+
+def test_ga4_cursor():
+    assert resolve_saas_cursor("GA4_RAW_DATA", ["event_date", "event_name"]) == "event_date"
+
+
+def test_resolver_case_insensitive_on_columns():
+    assert resolve_saas_cursor("SALESFORCE", ["systemmodstamp"]) == "systemmodstamp"
+
+
+def test_unknown_source_type_returns_none():
+    assert resolve_saas_cursor("WORKDAY_RAAS", ["anything"]) is None
+
+
+def _one_table_def(source_type, dest="orders", extra_tc=None):
+    tc = {"scd_type": "SCD_TYPE_1", "primary_keys": ["Id"]}
+    if extra_tc:
+        tc.update(extra_tc)
+    return {"spec": {"catalog": "bronze", "schema": "sf", "ingestion_definition": {
+        "source_type": source_type, "connection_name": "src_sf", "objects": [
+        {"table": {"source_table": dest, "destination_catalog": "bronze",
+                   "destination_schema": "sf", "destination_table": dest,
+                   "table_configuration": tc}}]}}}
+
+
+def test_saas_spec_sets_row_filter_and_incr_from_cursor_map():
+    spec = build_recreate_spec(_one_table_def("SALESFORCE"),
+                               target_connection_name="tgt_sf", name="p_migrated",
+                               row_filter_by_src={"orders": "SystemModstamp >= '2026-06-10T00:00:00.000Z'"})
+    t = spec["ingestion_definition"]["objects"][0]["table"]
+    assert t["destination_table"] == "orders_incr"
+    assert t["table_configuration"]["row_filter"] == "SystemModstamp >= '2026-06-10T00:00:00.000Z'"
+    assert "query_based_connector_config" not in t["table_configuration"]
+    assert spec["catalog"] == "bronze" and spec["schema"] == "sf"
+    assert spec["ingestion_definition"]["connection_name"] == "tgt_sf"
+
+
+def test_table_absent_from_map_keeps_canonical_name_no_filter():
+    spec = build_recreate_spec(_one_table_def("SALESFORCE"),
+                               target_connection_name="tgt_sf", name="p_migrated",
+                               row_filter_by_src={})
+    t = spec["ingestion_definition"]["objects"][0]["table"]
+    assert t["destination_table"] == "orders"
+    assert "row_filter" not in t["table_configuration"]

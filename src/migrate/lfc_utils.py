@@ -13,6 +13,11 @@ _QUERY_BASED_SOURCE_TYPES = frozenset(
     {"SQLSERVER", "MYSQL", "POSTGRESQL", "ORACLE", "TERADATA", "MARIADB"}
 )
 
+# SaaS source types that support a settable per-table row_filter on their cursor
+# column (Tier 1). Other SaaS connectors (Workday, SharePoint, NetSuite, …) have
+# no boundary handle and are Tier 2 (full re-hydrate on recreate).
+_ROW_FILTER_SAAS_SOURCE_TYPES = frozenset({"SALESFORCE", "GA4_RAW_DATA", "SERVICENOW"})
+
 
 def _ingestion_def(definition: dict) -> dict:
     return ((definition or {}).get("spec") or {}).get("ingestion_definition") or {}
@@ -25,6 +30,36 @@ def _cursor_columns(table_configuration: dict) -> list[str]:
     when none are set (e.g. connector auto-selected, or a SaaS/CDC table)."""
     qbc = (table_configuration or {}).get("query_based_connector_config") or {}
     return qbc.get("cursor_columns") or []
+
+
+# Documented incremental-cursor priority per Tier-1 SaaS connector. The connector
+# auto-selects the cursor and does NOT echo it in the pipeline spec, so we resolve
+# it from the destination table's actual columns. Salesforce order per the
+# Salesforce ingestion FAQ; row filtering is supported only on these (or Id).
+_SAAS_CURSOR_PRIORITY = {
+    "SALESFORCE": ["SystemModstamp", "LastModifiedDate", "CreatedDate", "LoginTime"],
+    "SERVICENOW": ["sys_updated_on", "sys_created_on"],
+    "GA4_RAW_DATA": ["event_date", "event_timestamp"],
+}
+
+
+def resolve_saas_cursor(source_type: str, available_columns: list[str]) -> str | None:
+    """Pick the incremental cursor column for a Tier-1 SaaS table.
+
+    SaaS connectors do not expose the resolved cursor in the pipeline spec, so we
+    match the connector's documented priority order against the columns that
+    actually exist on the (cloned) destination table. Returns the FIRST priority
+    column present (preserving its real-cased name), or None when none are present
+    (that table then full-loads — no row_filter). Column matching is
+    case-insensitive; the returned name is the real column name."""
+    priority = _SAAS_CURSOR_PRIORITY.get(str(source_type or "").upper())
+    if not priority:
+        return None
+    by_lower = {c.lower(): c for c in available_columns}
+    for cand in priority:
+        if cand.lower() in by_lower:
+            return by_lower[cand.lower()]
+    return None
 
 
 def classify_pipeline(definition: dict) -> tuple[str, str]:
@@ -41,8 +76,10 @@ def classify_pipeline(definition: dict) -> tuple[str, str]:
     source_type = str(idef.get("source_type") or "").upper()
     if source_type in _QUERY_BASED_SOURCE_TYPES:
         return ("query_based", "tier1")
-    if idef:
+    if source_type in _ROW_FILTER_SAAS_SOURCE_TYPES:
         return ("saas", "tier1")
+    if idef:
+        return ("saas", "tier2")
     return ("unknown", "tier2")
 
 
@@ -71,28 +108,26 @@ def extract_table_configs(definition: dict) -> list[dict]:
     return out
 
 
-def build_query_based_create_spec(
-    definition: dict, *, target_connection_name: str,
-    boundaries: dict[str, str], name: str,
+def build_recreate_spec(
+    definition: dict, *, target_connection_name: str, name: str,
+    row_filter_by_src: dict[str, str],
 ) -> dict:
-    """Build the pipelines.create spec for the recreated query-based pipeline.
-
-    boundaries maps source_table -> cursor boundary T. A table with a boundary
-    gets destination `<table>_incr` + row_filter `<cursor> >= 'T'`; a table
-    WITHOUT a boundary (batch/no-cursor) keeps the canonical destination and no
-    filter (full-load — its normal behaviour).
-    """
+    """Connector-agnostic Tier-1 recreate spec. ``row_filter_by_src`` maps
+    source_table -> the full row_filter predicate ("<cursor> >= 'T'"). A table in
+    the map gets destination ``<table>_incr`` + that row_filter; a table NOT in the
+    map keeps its canonical destination and no filter (full-load). The caller
+    supplies the cursor/boundary — query-based reads it from the spec, SaaS resolves
+    it via resolve_saas_cursor()."""
     spec = (definition or {}).get("spec") or {}
     idef = copy.deepcopy(_ingestion_def(definition))
     idef["connection_name"] = target_connection_name
     for o in idef.get("objects") or []:
         t = o.get("table") or {}
         tc = t.setdefault("table_configuration", {})
-        src = t.get("source_table")
-        cursors = _cursor_columns(tc)  # nested query_based_connector_config.cursor_columns (preserved by deepcopy)
-        if src in boundaries and cursors:
+        rf = row_filter_by_src.get(t.get("source_table"))
+        if rf:
             t["destination_table"] = f"{t['destination_table']}_incr"
-            tc["row_filter"] = f"{cursors[0]} >= '{boundaries[src]}'"
+            tc["row_filter"] = rf
     out = {"name": name, "channel": "PREVIEW", "ingestion_definition": idef}
     # Top-level catalog/schema are REQUIRED on create (direct publishing mode);
     # carry them over from the discovered source pipeline spec.
@@ -101,6 +136,29 @@ def build_query_based_create_spec(
     if spec.get("schema"):
         out["schema"] = spec["schema"]
     return out
+
+
+def build_query_based_create_spec(
+    definition: dict, *, target_connection_name: str,
+    boundaries: dict[str, str], name: str,
+) -> dict:
+    """Query-based recreate spec: cursor comes from the spec's nested
+    cursor_columns. Thin wrapper over build_recreate_spec.
+
+    boundaries maps source_table -> cursor boundary T. A table with a boundary
+    (and a cursor) gets destination `<table>_incr` + row_filter `<cursor> >= 'T'`;
+    a table WITHOUT a boundary (batch/no-cursor) keeps the canonical destination
+    and no filter (full-load — its normal behaviour).
+    """
+    row_filter_by_src: dict[str, str] = {}
+    for o in _ingestion_def(definition).get("objects") or []:
+        t = o.get("table") or {}
+        src = t.get("source_table")
+        cursors = _cursor_columns(t.get("table_configuration") or {})
+        if src in boundaries and cursors:
+            row_filter_by_src[src] = f"{cursors[0]} >= '{boundaries[src]}'"
+    return build_recreate_spec(definition, target_connection_name=target_connection_name,
+                               name=name, row_filter_by_src=row_filter_by_src)
 
 
 def build_unified_view_sql(
