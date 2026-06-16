@@ -123,9 +123,8 @@ def test_cleanup_staging_continues_on_per_table_failure_then_raises():
     # ALTER SHARE succeeds + DROP TABLE succeeds (second).
     spark.sql.side_effect = [None, Exception("boom"), None, None]
 
-    with _patch_config(config), _patch_tracker(tracker):
-        with pytest.raises(RuntimeError) as excinfo:
-            run(MagicMock(), spark)
+    with _patch_config(config), _patch_tracker(tracker), pytest.raises(RuntimeError) as excinfo:
+        run(MagicMock(), spark)
 
     tracker.mark_staging_drop_failed.assert_called_once()
     failed_args = tracker.mark_staging_drop_failed.call_args
