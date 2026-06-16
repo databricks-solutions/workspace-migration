@@ -164,7 +164,8 @@ class TestTrackingManager:
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
-            "'lfc_pipeline_created_incremental', 'lfc_view_created')"
+            "'lfc_pipeline_created_incremental', 'lfc_view_created', "
+            "'lfc_view_skipped_no_cursor')"
             in sql_arg
         )
         # object_type is passed via args= (parameterized), not interpolated
@@ -311,7 +312,8 @@ class TestTrackingManager:
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
-            "'lfc_pipeline_created_incremental', 'lfc_view_created')"
+            "'lfc_pipeline_created_incremental', 'lfc_view_created', "
+            "'lfc_view_skipped_no_cursor')"
             in sql
         )
         # Guard against regression to the old LIKE filter that swept up

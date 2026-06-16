@@ -30,6 +30,8 @@ class TestStatusNameAlignment:
         'skipped'."""
         import re
 
+        from common.tracking import _TERMINAL_STATUSES
+
         worker_dir = _ROOT / "src" / "migrate"
         offenders = []
         for f in worker_dir.glob("*.py"):
@@ -38,6 +40,12 @@ class TestStatusNameAlignment:
             for match in re.finditer(r'"status":\s*"([a-z_]+)"', text):
                 s = match.group(1)
                 if s in ("validated", "failed", "in_progress", "validation_failed"):
+                    continue
+                # Terminal statuses are excluded from re-runs via the explicit
+                # ``NOT IN (terminal...)`` clause in get_pending_objects, not the
+                # ``NOT LIKE 'skipped%'`` filter — so a terminal status may carry
+                # "skip" mid-name without breaking resumability.
+                if s in _TERMINAL_STATUSES:
                     continue
                 if not s.startswith("skipped") and "skip" in s:
                     offenders.append(f"{f.name}: status={s!r}")
