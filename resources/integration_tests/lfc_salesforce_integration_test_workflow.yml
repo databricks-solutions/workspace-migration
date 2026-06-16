@@ -10,7 +10,7 @@ resources:
         view exist on the target workspace.
 
         PREREQUISITE: a Salesforce UC connection named
-        'integration_test_salesforce' must already exist (OAuth, admin-authorized)
+        'hs_salesforce' must already exist (OAuth, admin-authorized)
         on BOTH the source and target workspaces. The seed task fails fast if not.
       run_as:
         service_principal_name: ${var.migration_spn_id}
@@ -28,7 +28,7 @@ resources:
               migrate_hive_dbfs_root: "false"
               hive_dbfs_target_path: ""
               catalog_filter: "integration_test_lfc_sf"
-              lfc_target_connection_name: "integration_test_salesforce"
+              lfc_target_connection_name: "hs_salesforce"
 
         - task_key: seed_lfc_salesforce
           depends_on:

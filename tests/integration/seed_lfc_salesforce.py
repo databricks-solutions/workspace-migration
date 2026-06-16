@@ -26,7 +26,7 @@ except NameError:
 #          create the recreated pipeline + unified view.
 #
 # PREREQUISITE — interactive, done once OUTSIDE this notebook:
-#   A Salesforce UC connection named ``integration_test_salesforce`` must
+#   A Salesforce UC connection named ``hs_salesforce`` must
 #   already exist on BOTH the source AND target workspaces. Salesforce LFC
 #   connections use OAuth (the connected app's first authorization must be an
 #   admin — see reference_lfc_salesforce_connected_app_install), so they cannot
@@ -49,7 +49,7 @@ from common.sql_utils import execute_and_poll, find_warehouse
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-_CONNECTION_NAME = "integration_test_salesforce"
+_CONNECTION_NAME = "hs_salesforce"
 _CATALOG = "integration_test_lfc_sf"
 _SCHEMA = "sf"
 _PIPELINE_NAME = "lfc_it_sf_account"

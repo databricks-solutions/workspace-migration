@@ -18,7 +18,7 @@ except NameError:
 #
 # Each step is individually try/excepted — nothing here raises. Order:
 # pipelines → views/tables → catalogs → share artifacts → tracking rows.
-# The OAuth Salesforce UC connection ``integration_test_salesforce`` is LEFT in
+# The OAuth Salesforce UC connection ``hs_salesforce`` is LEFT in
 # place (interactive/admin to recreate; shared across runs), as is the SF org.
 
 import contextlib
