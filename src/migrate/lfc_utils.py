@@ -50,3 +50,28 @@ def extract_table_configs(definition: dict) -> list[dict]:
             "cursor_column": tc.get("cursor_column"),
         })
     return out
+
+
+def build_unified_view_sql(
+    *, canonical: str, history: str, incr: str,
+    scd_type: str, primary_keys: list[str], cursor_column: str,
+) -> str:
+    """CREATE OR REPLACE VIEW at `canonical` over history+incr.
+
+    SCD1 -> keep one current row per PK (latest cursor wins). SCD2/APPEND_ONLY ->
+    UNION ALL (history segments are distinct rows by design).
+    """
+    if str(scd_type).upper() == "SCD_TYPE_1":
+        pk = ", ".join(primary_keys)
+        return (
+            f"CREATE OR REPLACE VIEW {canonical} AS\n"
+            f"SELECT * EXCEPT(_rn) FROM (\n"
+            f"  SELECT *, ROW_NUMBER() OVER (PARTITION BY {pk} "
+            f"ORDER BY {cursor_column} DESC) AS _rn\n"
+            f"  FROM (SELECT * FROM {history} UNION ALL SELECT * FROM {incr})\n"
+            f") WHERE _rn = 1"
+        )
+    return (
+        f"CREATE OR REPLACE VIEW {canonical} AS\n"
+        f"SELECT * FROM {history} UNION ALL SELECT * FROM {incr}"
+    )

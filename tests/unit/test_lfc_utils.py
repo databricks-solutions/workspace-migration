@@ -1,5 +1,5 @@
 from common.tracking import _TERMINAL_STATUSES
-from migrate.lfc_utils import classify_pipeline, extract_table_configs
+from migrate.lfc_utils import build_unified_view_sql, classify_pipeline, extract_table_configs
 
 
 def test_lfc_stage1_statuses_are_terminal():
@@ -41,3 +41,27 @@ def test_extract_table_configs():
         "destination_catalog": "bronze", "destination_schema": "pg", "destination_table": "orders",
         "scd_type": "SCD_TYPE_1", "primary_keys": ["order_id"], "cursor_column": "updated_at",
     }]
+
+
+def test_view_scd1_dedups_by_pk_latest_cursor():
+    sql = build_unified_view_sql(
+        canonical="`bronze`.`pg`.`orders`",
+        history="`bronze`.`pg`.`orders_history`",
+        incr="`bronze`.`pg`.`orders_incr`",
+        scd_type="SCD_TYPE_1", primary_keys=["order_id"], cursor_column="updated_at",
+    )
+    assert "CREATE OR REPLACE VIEW `bronze`.`pg`.`orders`" in sql
+    assert "PARTITION BY order_id" in sql
+    assert "ORDER BY updated_at DESC" in sql
+    assert "rn = 1" in sql
+
+
+def test_view_scd2_is_union_all():
+    sql = build_unified_view_sql(
+        canonical="`bronze`.`pg`.`orders`",
+        history="`bronze`.`pg`.`orders_history`",
+        incr="`bronze`.`pg`.`orders_incr`",
+        scd_type="SCD_TYPE_2", primary_keys=["order_id"], cursor_column="updated_at",
+    )
+    assert "UNION ALL" in sql
+    assert "ROW_NUMBER" not in sql
