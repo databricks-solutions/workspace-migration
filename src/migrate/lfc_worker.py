@@ -23,6 +23,7 @@ from migrate.lfc_utils import (
     build_unified_view_sql,
     classify_pipeline,
     extract_table_configs,
+    parse_describe_columns,
     resolve_saas_cursor,
 )
 
@@ -224,14 +225,12 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
 
     def _get_columns(fqn: str) -> list[str]:
         """Column names of an existing table on the SOURCE workspace (used to
-        resolve a SaaS cursor before migration)."""
-        res = execute_and_poll(auth, src_wh_id, f"DESCRIBE TABLE {_bt(fqn)}", use_source=True)
-        cols = []
-        for r in res.get("rows") or []:
-            name = r[0] if isinstance(r, (list, tuple)) else r.get("col_name")
-            if name and not str(name).startswith("#") and str(name).strip():
-                cols.append(name)
-        return cols
+        resolve a SaaS cursor before migration). Uses execute_and_fetch (NOT
+        execute_and_poll, which returns no rows) and parses the DESCRIBE output."""
+        res = execute_and_fetch(auth, src_wh_id, f"DESCRIBE TABLE {_bt(fqn)}", use_source=True)
+        if res["state"] != "SUCCEEDED":
+            raise RuntimeError(f"get_columns query failed for {fqn}: {res.get('error', res['state'])}")
+        return parse_describe_columns(res.get("rows") or [])
 
     def _count_rows(wh_id: str, fqn_bt: str, *, use_source: bool) -> int | None:
         """COUNT(*) over a backticked FQN on the given warehouse. Returns None on error."""

@@ -7,6 +7,7 @@ from migrate.lfc_utils import (
     build_unified_view_sql,
     classify_pipeline,
     extract_table_configs,
+    parse_describe_columns,
     resolve_saas_cursor,
 )
 
@@ -149,6 +150,28 @@ def test_resolver_case_insensitive_on_columns():
 
 def test_unknown_source_type_returns_none():
     assert resolve_saas_cursor("WORKDAY_RAAS", ["anything"]) is None
+
+
+def test_parse_describe_columns_basic():
+    rows = [["Id", "string", None], ["Name", "string", None], ["SystemModstamp", "timestamp", None]]
+    assert parse_describe_columns(rows) == ["Id", "Name", "SystemModstamp"]
+
+
+def test_parse_describe_columns_stops_at_partition_metadata():
+    # DESCRIBE TABLE re-lists partition cols under '# Partition Information';
+    # collection must stop there so they aren't double-counted.
+    rows = [
+        ["Id", "string", None], ["region", "string", None],
+        ["", "", ""], ["# Partition Information", "", ""],
+        ["# col_name", "data_type", "comment"], ["region", "string", None],
+    ]
+    assert parse_describe_columns(rows) == ["Id", "region"]
+
+
+def test_parse_describe_columns_dict_rows_and_empty():
+    assert parse_describe_columns([]) == []
+    assert parse_describe_columns([{"col_name": "Id"}, {"col_name": "SystemModstamp"}]) \
+        == ["Id", "SystemModstamp"]
 
 
 def _one_table_def(source_type, dest="orders", extra_tc=None):

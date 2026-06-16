@@ -62,6 +62,29 @@ def resolve_saas_cursor(source_type: str, available_columns: list[str]) -> str |
     return None
 
 
+def parse_describe_columns(rows: list) -> list[str]:
+    """Column names from a ``DESCRIBE TABLE`` result (rows are
+    ``[col_name, data_type, comment]``). Collection STOPS at the first metadata
+    section — a blank or ``#``-prefixed ``col_name`` (e.g. ``# Partition
+    Information``) — so partition columns re-listed there aren't double-counted.
+    Used to resolve a SaaS cursor from a table's real columns."""
+    cols: list[str] = []
+    for r in rows or []:
+        if isinstance(r, (list, tuple)):
+            name = r[0] if r else None
+        elif isinstance(r, dict):
+            name = r.get("col_name")
+        else:
+            name = None
+        if name is None:
+            continue
+        name = str(name).strip()
+        if not name or name.startswith("#"):
+            break
+        cols.append(name)
+    return cols
+
+
 def classify_pipeline(definition: dict) -> tuple[str, str]:
     """Return (connector_kind, tier).
 
