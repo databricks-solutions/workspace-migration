@@ -108,6 +108,12 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "created_resync_pending",
     # Direct Access VS index — vectors are external app state, can't recreate.
     "skipped_direct_access_unsupported",
+    # Lakeflow Connect (migrate_lfc, Tier 1): pipeline recreated on target with
+    # a per-table cursor row_filter (pulls only post-cutover rows). Terminal so
+    # re-runs don't recreate it.
+    "lfc_pipeline_created_incremental",
+    # Lakeflow Connect: unified view created over <t>_history + <t>_incr.
+    "lfc_view_created",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
