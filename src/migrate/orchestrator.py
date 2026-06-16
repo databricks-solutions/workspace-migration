@@ -71,6 +71,9 @@ LIST_TYPES = (
     # Stateful Services Phase — consumed by the migrate_vector_search job's
     # worker. Harmless for other jobs; they ignore the published list.
     "vector_search_index",
+    # Stateful Services Phase — consumed by the migrate_lfc job's worker.
+    # Harmless for other jobs; they ignore the published list.
+    "lfc_pipeline",
 )
 
 

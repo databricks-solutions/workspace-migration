@@ -187,6 +187,7 @@ _NOT_PROBED_TYPES: dict[str, str] = {
     "provider": "Delta Sharing inbound provider; worker tolerates pre-existing",
     "online_table": "deprecated; migrated to Lakebase synced tables by a separate job",
     "vector_search_index": "stateful; the VS worker create-if-missing handles the endpoint",
+    "lfc_pipeline": "stateful; the LFC worker create-if-missing handles the pipeline",
 }
 
 
