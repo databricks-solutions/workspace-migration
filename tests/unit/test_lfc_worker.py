@@ -85,3 +85,59 @@ def test_clone_failure_still_recreates_pipeline_and_records_error():
     # and we must not mask the clone error with a downstream create_view failure.
     deps.create_view.assert_not_called()
     assert not any(r["object_type"] == "lfc_view" for r in results)
+
+
+def test_triggers_pipeline_run_then_builds_view():
+    # After creating the recreated pipeline, the worker triggers its first run
+    # (so <t>_incr materialises) and THEN builds the unified view.
+    deps = MagicMock()
+    deps.compute_boundary.return_value = "2026-06-10T00:00:00"
+    deps.clone_history.return_value = {"status": "validated"}
+    deps.target_view_exists.return_value = False     # canonical view absent → not idempotent-skip
+    deps.target_table_exists.return_value = True      # <t>_incr present after the triggered run
+    deps.create_pipeline.return_value = "pid-123"
+    results = migrate_pipeline(_row(), deps=deps, target_connection_name="tgt_pg")
+    # pipeline run was triggered with the new pipeline id + the _incr target(s)
+    deps.run_pipeline_and_await.assert_called_once()
+    assert deps.run_pipeline_and_await.call_args.args[0] == "pid-123"
+    assert any("_incr" in t for t in deps.run_pipeline_and_await.call_args.args[1])
+    # view is built (not deferred)
+    views = [r for r in results if r["object_type"] == "lfc_view"]
+    assert len(views) == 1 and views[0]["status"] == "lfc_view_created"
+    deps.create_view.assert_called_once()
+
+
+def test_view_deferred_when_incr_not_materialized_after_trigger():
+    # Worker still triggers the run, but if <t>_incr never lands (e.g. the target
+    # can't reach the source / its update FAILED), the view is gracefully deferred.
+    deps = MagicMock()
+    deps.compute_boundary.return_value = "2026-06-10T00:00:00"
+    deps.clone_history.return_value = {"status": "validated"}
+    deps.target_view_exists.return_value = False
+    deps.target_table_exists.return_value = False     # <t>_incr never appeared
+    deps.create_pipeline.return_value = "pid-123"
+    results = migrate_pipeline(_row(), deps=deps, target_connection_name="tgt_pg")
+    deps.run_pipeline_and_await.assert_called_once()  # still triggered
+    views = [r for r in results if r["object_type"] == "lfc_view"]
+    assert len(views) == 1 and views[0]["status"] == "lfc_view_pending_forward_ingest"
+    deps.create_view.assert_not_called()
+
+
+def test_view_create_failure_defers_without_failing_pipeline_or_table():
+    # If create_view raises (e.g. <t>_incr streaming table not yet queryable:
+    # STREAMING_TABLE_NEEDS_REFRESH), the view is deferred — the already-created
+    # pipeline and cloned-history table rows must SURVIVE, not be discarded.
+    deps = MagicMock()
+    deps.compute_boundary.return_value = "2026-06-10T00:00:00"
+    deps.clone_history.return_value = {"status": "validated"}
+    deps.target_view_exists.return_value = False
+    deps.target_table_exists.return_value = True       # _incr object exists...
+    deps.create_pipeline.return_value = "pid-123"
+    deps.create_view.side_effect = RuntimeError("[STREAMING_TABLE_NEEDS_REFRESH] orders_incr")
+    results = migrate_pipeline(_row(), deps=deps, target_connection_name="tgt_pg")
+    assert any(r["object_type"] == "lfc_pipeline" and r["status"] == "lfc_pipeline_created_incremental"
+               for r in results)
+    assert any(r["object_type"] == "lfc_table" and r["status"] == "validated" for r in results)
+    views = [r for r in results if r["object_type"] == "lfc_view"]
+    assert len(views) == 1 and views[0]["status"] == "lfc_view_pending_forward_ingest"
+    assert "create failed" in (views[0]["error_message"] or "")

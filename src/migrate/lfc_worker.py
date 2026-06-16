@@ -81,10 +81,20 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
         definition, target_connection_name=target_connection_name,
         boundaries=boundaries, name=f"{obj_name}_migrated",
     )
-    deps.create_pipeline(spec)
+    pipeline_id = deps.create_pipeline(spec)
     results.append({"object_name": obj_name, "object_type": "lfc_pipeline",
                     "status": "lfc_pipeline_created_incremental", "error_message": None,
                     "duration_seconds": time.time() - start})
+
+    # Trigger the recreated pipeline's first (incremental) run so <t>_incr is
+    # materialised, then build the unified view below. The first run is cheap —
+    # row_filter scopes it to post-cutover rows, NOT the cloned history. Bounded
+    # wait with graceful fallback: if <t>_incr doesn't appear in time (e.g. the
+    # target can't reach the source, or its update fails), the view loop defers it.
+    incr_targets = [_bt(f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}_incr")
+                    for c in cfgs if c.get("cursor_column") and cloned_ok.get(c["source_table"])]
+    if pipeline_id and incr_targets:
+        deps.run_pipeline_and_await(pipeline_id, incr_targets)
 
     for c in cfgs:
         if not c.get("cursor_column"):
@@ -106,7 +116,17 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
             canonical=_bt(base), history=_bt(f"{base}_history"), incr=_bt(f"{base}_incr"),
             scd_type=c["scd_type"], primary_keys=c["primary_keys"], cursor_column=c["cursor_column"],
         )
-        deps.create_view(sql)
+        # A view failure must NOT fail the (already-created) pipeline/table: the
+        # recreated pipeline + cloned history are durable migration artefacts.
+        # Defer the view (it can be built once forward ingestion has run/refreshed)
+        # rather than propagate and discard the good rows.
+        try:
+            deps.create_view(sql)
+        except Exception as exc:  # noqa: BLE001
+            results.append({"object_name": base, "object_type": "lfc_view",
+                            "status": "lfc_view_pending_forward_ingest",
+                            "error_message": f"unified view deferred — create failed: {exc}"})
+            continue
         results.append({"object_name": base, "object_type": "lfc_view",
                         "status": "lfc_view_created", "error_message": None})
     return results
@@ -318,13 +338,43 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         """
         from databricks.sdk.service.pipelines import IngestionPipelineDefinition
 
-        auth.target_client.pipelines.create(
+        created = auth.target_client.pipelines.create(
             name=spec["name"],
             catalog=spec.get("catalog"),
             schema=spec.get("schema"),
             channel=spec.get("channel", "PREVIEW"),
             ingestion_definition=IngestionPipelineDefinition.from_dict(spec["ingestion_definition"]),
         )
+        return created.pipeline_id
+
+    def _run_pipeline_and_await(pipeline_id: str, incr_fqns: list[str],
+                                *, max_attempts: int = 60, sleep_seconds: float = 10.0) -> None:
+        """Trigger the recreated pipeline's first run and wait (bounded) for the
+        UPDATE to COMPLETE. The first run is cheap (row_filter scopes it to
+        post-cutover rows). We wait for COMPLETED rather than mere <t>_incr
+        existence because LFC <t>_incr is a STREAMING TABLE: the table object
+        appears as soon as the graph is resolved, but is NOT queryable until the
+        update finishes its first refresh (else SELECT raises
+        STREAMING_TABLE_NEEDS_REFRESH). Returns when the update COMPLETES, when it
+        FAILS/CANCELS, or after the budget — never raises; the caller's view loop
+        defers the view if <t>_incr still isn't queryable."""
+        try:
+            auth.target_client.pipelines.start_update(pipeline_id)
+        except Exception as exc:  # noqa: BLE001 — surface via deferral, don't abort the pipeline row
+            logger.warning("[lfc] start_update(%s) failed: %s — view will be deferred", pipeline_id, exc)
+            return
+        for _ in range(max_attempts):
+            time.sleep(sleep_seconds)
+            try:
+                ups = auth.target_client.pipelines.get(pipeline_id).latest_updates or []
+                state = str(ups[0].state).upper() if ups else ""
+            except Exception:  # noqa: BLE001 — transient; keep polling
+                continue
+            if "COMPLETED" in state:
+                return
+            if "FAILED" in state or "CANCELED" in state or "CANCELLED" in state:
+                logger.warning("[lfc] recreated pipeline %s update %s — view will be deferred", pipeline_id, state)
+                return
 
     def _create_view(sql: str) -> None:
         """Execute a CREATE OR REPLACE VIEW DDL on the TARGET warehouse."""
@@ -338,6 +388,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         target_view_exists=_target_view_exists,
         target_table_exists=_target_view_exists,  # same impl (tables.get) — checks <t>_incr presence
         create_pipeline=_create_pipeline,
+        run_pipeline_and_await=_run_pipeline_and_await,
         create_view=_create_view,
     )
 
