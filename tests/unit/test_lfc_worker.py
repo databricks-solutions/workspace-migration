@@ -141,3 +141,48 @@ def test_view_create_failure_defers_without_failing_pipeline_or_table():
     views = [r for r in results if r["object_type"] == "lfc_view"]
     assert len(views) == 1 and views[0]["status"] == "lfc_view_pending_forward_ingest"
     assert "create failed" in (views[0]["error_message"] or "")
+
+
+def _sf_row(dest="orders", source_type="SALESFORCE"):
+    sf_def = {"spec": {"catalog": "bronze", "schema": "sf", "ingestion_definition": {
+        "source_type": source_type, "connection_name": "src_sf", "objects": [
+        {"table": {"source_table": dest, "destination_catalog": "bronze",
+                   "destination_schema": "sf", "destination_table": dest,
+                   "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["Id"]}}}]}}}
+    return {"object_name": "sf_orders", "object_type": "lfc_pipeline",
+            "metadata_json": json.dumps({"definition": sf_def})}
+
+
+def test_saas_tier1_resolves_cursor_and_sets_row_filter():
+    deps = MagicMock()
+    deps.target_view_exists.return_value = False
+    deps.get_columns.return_value = ["Id", "Name", "SystemModstamp", "CreatedDate"]
+    deps.compute_boundary.return_value = "2026-06-10T00:00:00.000Z"
+    deps.clone_history.return_value = {"status": "validated"}
+    deps.target_table_exists.return_value = True
+    deps.create_pipeline.return_value = "pid-1"
+    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf")
+    # cursor resolved + boundary computed against SystemModstamp
+    deps.compute_boundary.assert_called_once()
+    assert deps.compute_boundary.call_args.args[1] == "SystemModstamp"
+    # recreate spec carries the SaaS row_filter
+    spec = deps.create_pipeline.call_args.args[0]
+    tc = spec["ingestion_definition"]["objects"][0]["table"]["table_configuration"]
+    assert tc["row_filter"] == "SystemModstamp >= '2026-06-10T00:00:00.000Z'"
+    assert any(r["object_type"] == "lfc_view" and r["status"] == "lfc_view_created" for r in results)
+
+
+def test_saas_tier1_no_cursor_clones_and_fullloads_no_filter():
+    deps = MagicMock()
+    deps.target_view_exists.return_value = False
+    deps.get_columns.return_value = ["Id", "Name"]   # no SF cursor column
+    deps.clone_history.return_value = {"status": "validated"}
+    deps.create_pipeline.return_value = "pid-1"
+    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf")
+    deps.compute_boundary.assert_not_called()
+    spec = deps.create_pipeline.call_args.args[0]
+    tc = spec["ingestion_definition"]["objects"][0]["table"]["table_configuration"]
+    assert "row_filter" not in tc
+    # a no-cursor table full-loads on the recreated pipeline: no unified view, tracked note
+    assert any(r["object_type"] == "lfc_view" and r["status"] == "lfc_view_skipped_no_cursor"
+               for r in results)

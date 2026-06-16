@@ -18,10 +18,12 @@ import logging
 import time
 
 from migrate.lfc_utils import (
-    build_query_based_create_spec,
+    _ingestion_def,
+    build_recreate_spec,
     build_unified_view_sql,
     classify_pipeline,
     extract_table_configs,
+    resolve_saas_cursor,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -50,10 +52,11 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
     """
     obj_name = row["object_name"]
     definition = (json.loads(row.get("metadata_json") or "{}") or {}).get("definition") or {}
-    kind, _tier = classify_pipeline(definition)
-    if kind != "query_based":
-        logger.info("[lfc] %s is %s — deferred to a later stage.", obj_name, kind)
+    kind, tier = classify_pipeline(definition)
+    if tier != "tier1" or kind not in ("query_based", "saas"):
+        logger.info("[lfc] %s is %s/%s — deferred to a later stage.", obj_name, kind, tier)
         return []
+    source_type = str(_ingestion_def(definition).get("source_type") or "").upper()
 
     cfgs = extract_table_configs(definition)
     canon = [f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}" for c in cfgs]
@@ -62,24 +65,43 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
                  "status": "skipped_target_pipeline_exists", "error_message": None}]
 
     results: list[dict] = []
-    boundaries: dict[str, str] = {}
+    cursor_by_src: dict[str, str] = {}   # source_table -> resolved cursor column (None/absent = full-load)
+    row_filter_by_src: dict[str, str] = {}
     cloned_ok: dict[str, bool] = {}  # source_table -> history clone landed on target?
     start = time.time()
 
     for c in cfgs:
-        if not c.get("cursor_column"):
-            continue  # batch table: no clone, recreated pipeline full-loads it
+        src = c["source_table"]
         src_table_fqn = f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}"
-        boundaries[c["source_table"]] = deps.compute_boundary(src_table_fqn, c["cursor_column"])
+        # Cursor source differs by connector kind: query-based reads it from the
+        # spec; SaaS resolves it from the destination table's actual columns
+        # (the connector doesn't echo its auto-selected cursor in the spec).
+        if kind == "query_based":
+            cursor = c.get("cursor_column")
+        else:
+            cursor = resolve_saas_cursor(source_type, deps.get_columns(src_table_fqn))
+        if not cursor:
+            # No resolvable cursor: a full-load table. Query-based batch tables are
+            # silently full-loaded (existing behaviour); SaaS no-cursor tables record
+            # a tracked note (no unified view — the recreated pipeline full-loads it).
+            if kind == "saas":
+                results.append({"object_name": src_table_fqn, "object_type": "lfc_view",
+                                "status": "lfc_view_skipped_no_cursor",
+                                "error_message": f"{src} has no resolvable SaaS cursor "
+                                                 f"({source_type}); table full-loads, no unified view"})
+            continue
+        cursor_by_src[src] = cursor
+        boundary = deps.compute_boundary(src_table_fqn, cursor)
+        row_filter_by_src[src] = f"{cursor} >= '{boundary}'"
         clone = deps.clone_history(c)
         results.append({"object_name": f"{src_table_fqn}_history", "object_type": "lfc_table",
                         "status": clone["status"], "error_message": clone.get("error_message")})
         # history exists on target iff the clone validated (or was already there)
-        cloned_ok[c["source_table"]] = clone["status"] in ("validated", "skipped_target_exists")
+        cloned_ok[src] = clone["status"] in ("validated", "skipped_target_exists")
 
-    spec = build_query_based_create_spec(
+    spec = build_recreate_spec(
         definition, target_connection_name=target_connection_name,
-        boundaries=boundaries, name=f"{obj_name}_migrated",
+        name=f"{obj_name}_migrated", row_filter_by_src=row_filter_by_src,
     )
     pipeline_id = deps.create_pipeline(spec)
     results.append({"object_name": obj_name, "object_type": "lfc_pipeline",
@@ -92,13 +114,14 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
     # wait with graceful fallback: if <t>_incr doesn't appear in time (e.g. the
     # target can't reach the source, or its update fails), the view loop defers it.
     incr_targets = [_bt(f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}_incr")
-                    for c in cfgs if c.get("cursor_column") and cloned_ok.get(c["source_table"])]
+                    for c in cfgs if cursor_by_src.get(c["source_table"]) and cloned_ok.get(c["source_table"])]
     if pipeline_id and incr_targets:
         deps.run_pipeline_and_await(pipeline_id, incr_targets)
 
     for c in cfgs:
-        if not c.get("cursor_column"):
-            continue
+        cursor = cursor_by_src.get(c["source_table"])
+        if not cursor:
+            continue  # no-cursor table: full-loaded, no unified view (note already recorded for SaaS)
         if not cloned_ok.get(c["source_table"]):
             continue  # history clone failed — can't union a missing _history table; clone row already records the error
         base = f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}"
@@ -114,7 +137,7 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
             continue
         sql = build_unified_view_sql(
             canonical=_bt(base), history=_bt(f"{base}_history"), incr=_bt(f"{base}_incr"),
-            scd_type=c["scd_type"], primary_keys=c["primary_keys"], cursor_column=c["cursor_column"],
+            scd_type=c["scd_type"], primary_keys=c["primary_keys"], cursor_column=cursor,
         )
         # A view failure must NOT fail the (already-created) pipeline/table: the
         # recreated pipeline + cloned history are durable migration artefacts.
@@ -198,6 +221,17 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         if not rows_data or not rows_data[0]:
             raise RuntimeError(f"compute_boundary returned no rows for {table_fqn}")
         return str(rows_data[0][0])
+
+    def _get_columns(fqn: str) -> list[str]:
+        """Column names of an existing table on the SOURCE workspace (used to
+        resolve a SaaS cursor before migration)."""
+        res = execute_and_poll(auth, src_wh_id, f"DESCRIBE TABLE {_bt(fqn)}", use_source=True)
+        cols = []
+        for r in res.get("rows") or []:
+            name = r[0] if isinstance(r, (list, tuple)) else r.get("col_name")
+            if name and not str(name).startswith("#") and str(name).strip():
+                cols.append(name)
+        return cols
 
     def _count_rows(wh_id: str, fqn_bt: str, *, use_source: bool) -> int | None:
         """COUNT(*) over a backticked FQN on the given warehouse. Returns None on error."""
@@ -384,6 +418,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
 
     deps = types.SimpleNamespace(
         compute_boundary=_compute_boundary,
+        get_columns=_get_columns,
         clone_history=_clone_history,
         target_view_exists=_target_view_exists,
         target_table_exists=_target_view_exists,  # same impl (tables.get) — checks <t>_incr presence
