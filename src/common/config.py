@@ -163,6 +163,11 @@ class MigrationConfig:
     #                     row filter / column mask are never altered. See
     #                     README and docs/RLS_CM_STAGING_COPY.md.
     rls_cm_strategy: str = ""
+    # Lakeflow Connect (Phase 3) — name of the pre-existing UC connection on
+    # target that the recreated query-based pipeline will use. Required only
+    # when any query-based LFC pipelines are included in the migration; left
+    # empty otherwise and the pre-check is a no-op for this field.
+    lfc_target_connection_name: str = ""
     # Hive (Phase 2) — unused in Phase 1 notebooks but fields exist so the
     # dataclass matches the full config file schema.
     migrate_hive_dbfs_root: bool = False
@@ -250,6 +255,7 @@ class MigrationConfig:
             batch_size=int(raw.get("batch_size", 50)),
             iceberg_strategy=str(raw.get("iceberg_strategy", "")),
             rls_cm_strategy=str(raw.get("rls_cm_strategy", "")),
+            lfc_target_connection_name=str(raw.get("lfc_target_connection_name", "")),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
             hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
             hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),
