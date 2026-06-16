@@ -1,5 +1,6 @@
 import json
 from unittest.mock import MagicMock
+
 from migrate.lfc_worker import migrate_pipeline
 
 DEF = {"spec": {"ingestion_definition": {"connection_name": "src_pg", "objects": [
@@ -26,8 +27,9 @@ def test_migrate_query_based_pipeline_happy_path():
         == "updated_at >= '2026-06-10T00:00:00'"
 
 def test_non_query_based_pipeline_is_skipped_this_stage():
+    cdc_def = {"spec": {"ingestion_definition": {"ingestion_gateway_id": "g"}}}
     cdc = {"object_name": "p", "object_type": "lfc_pipeline",
-           "metadata_json": json.dumps({"definition": {"spec": {"ingestion_definition": {"ingestion_gateway_id": "g"}}}})}
+           "metadata_json": json.dumps({"definition": cdc_def})}
     assert migrate_pipeline(cdc, deps=MagicMock(), target_connection_name="t") == []
 
 def test_idempotent_when_view_exists():

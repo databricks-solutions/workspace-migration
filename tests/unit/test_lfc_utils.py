@@ -1,5 +1,10 @@
 from common.tracking import _TERMINAL_STATUSES
-from migrate.lfc_utils import build_query_based_create_spec, build_unified_view_sql, classify_pipeline, extract_table_configs
+from migrate.lfc_utils import (
+    build_query_based_create_spec,
+    build_unified_view_sql,
+    classify_pipeline,
+    extract_table_configs,
+)
 
 
 def test_lfc_stage1_statuses_are_terminal():

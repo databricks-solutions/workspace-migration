@@ -1,6 +1,8 @@
 import json
 from unittest.mock import MagicMock
+
 from pre_check.pre_check_lfc import find_blockers
+
 
 def _row(defn):
     return {"object_name": "p1", "metadata_json": json.dumps({"definition": defn})}
