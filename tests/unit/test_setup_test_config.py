@@ -268,6 +268,15 @@ class TestApplyIntegrationOverridesBehavior:
         cfg = apply_integration_overrides(_baseline_config(), **ok)
         assert cfg["catalog_filter"] == ["a", "b", "c"]
 
+    def test_lfc_saas_cursor_columns_set_when_provided(self):
+        ok = dict(UC_OVERRIDES, lfc_saas_cursor_columns_raw='{"c.s.t": "SystemModstamp"}')
+        cfg = apply_integration_overrides(_baseline_config(), **ok)
+        assert cfg["lfc_saas_cursor_columns"] == '{"c.s.t": "SystemModstamp"}'
+
+    def test_lfc_saas_cursor_columns_absent_when_empty(self):
+        cfg = apply_integration_overrides(_baseline_config(), **UC_OVERRIDES)
+        assert "lfc_saas_cursor_columns" not in cfg
+
 
 class TestOverrideCycleCleanSlate:
     """S.14: the headline test.

@@ -114,6 +114,7 @@ dbutils.widgets.text("hive_dbfs_target_path", "")  # noqa: F821
 dbutils.widgets.text("batch_size", "")  # noqa: F821
 dbutils.widgets.text("catalog_filter", "")  # noqa: F821
 dbutils.widgets.text("lfc_target_connection_name", "")  # noqa: F821
+dbutils.widgets.text("lfc_saas_cursor_columns", "")  # noqa: F821
 # Negative-path injection widgets (integration X.3). Default "false" so
 # normal UC / Hive integration runs are unaffected.
 dbutils.widgets.text("inject_bad_spn_id", "false")  # noqa: F821
@@ -135,6 +136,7 @@ hive_dbfs_target_path = _get_str("hive_dbfs_target_path", "")
 batch_size_raw = _get_str("batch_size", "")
 catalog_filter_raw = _get_str("catalog_filter", "")
 lfc_target_connection_name_raw = _get_str("lfc_target_connection_name", "")
+lfc_saas_cursor_columns_raw = _get_str("lfc_saas_cursor_columns", "")
 
 # Negative-path injection toggles (integration X.3).
 inject_bad_spn_id = _get_bool("inject_bad_spn_id", "false")
@@ -162,6 +164,7 @@ cfg = apply_integration_overrides(
     batch_size_raw=batch_size_raw,
     catalog_filter_raw=catalog_filter_raw,
     lfc_target_connection_name_raw=lfc_target_connection_name_raw,
+    lfc_saas_cursor_columns_raw=lfc_saas_cursor_columns_raw,
     inject_bad_spn_id=inject_bad_spn_id,
     inject_unreachable_target=inject_unreachable_target,
 )
@@ -182,6 +185,7 @@ print(
     f"  batch_size                    = {cfg.get('batch_size', '(unchanged)')}\n"
     f"  catalog_filter                = {cfg.get('catalog_filter', '(unchanged)')}\n"
     f"  lfc_target_connection_name    = {cfg.get('lfc_target_connection_name', '(unchanged)')!r}\n"
+    f"  lfc_saas_cursor_columns       = {cfg.get('lfc_saas_cursor_columns', '(unchanged)')!r}\n"
     f"  [inject] bad_spn_id           = {inject_bad_spn_id}\n"
     f"  [inject] unreach_target       = {inject_unreachable_target}\n"
 )

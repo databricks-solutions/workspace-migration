@@ -29,6 +29,9 @@ resources:
               hive_dbfs_target_path: ""
               catalog_filter: "integration_test_lfc_sf"
               lfc_target_connection_name: "hs_salesforce"
+              # SaaS cursor is a mandatory operator input (no auto-guessing).
+              # Account's incremental cursor is SystemModstamp.
+              lfc_saas_cursor_columns: '{"integration_test_lfc_sf.sf.account": "SystemModstamp"}'
 
         - task_key: seed_lfc_salesforce
           depends_on:
