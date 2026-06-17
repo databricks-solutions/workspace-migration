@@ -323,3 +323,65 @@ def test_lakebase_defaults_and_overrides(tmp_path):
     assert cfg2.lakebase_instance_name == "lb_x"
     assert cfg2.lakebase_logical_database == "ldb"
     assert cfg2.lakebase_capacity == "CU_2"
+
+
+def test_lfc_saas_cursor_columns_default_empty(tmp_path):
+    import yaml
+
+    base = {
+        "source_workspace_url": "https://s", "target_workspace_url": "https://t",
+        "spn_client_id": "x", "spn_secret_scope": "sc", "spn_secret_key": "k",
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(base))
+    cfg = MigrationConfig.from_workspace_file(str(p))
+    assert cfg.lfc_saas_cursor_columns == {}
+
+
+def test_lfc_saas_cursor_columns_from_yaml_mapping(tmp_path):
+    import yaml
+
+    base = {
+        "source_workspace_url": "https://s", "target_workspace_url": "https://t",
+        "spn_client_id": "x", "spn_secret_scope": "sc", "spn_secret_key": "k",
+        "lfc_saas_cursor_columns": {"bronze.sf.account": "SystemModstamp"},
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(base))
+    cfg = MigrationConfig.from_workspace_file(str(p))
+    assert cfg.lfc_saas_cursor_columns == {"bronze.sf.account": "SystemModstamp"}
+
+
+def test_lfc_saas_cursor_columns_from_json_string(tmp_path):
+    # base_parameters / workspace-file values arrive as STRINGS — accept a JSON
+    # string and parse it to a dict.
+    import yaml
+
+    base = {
+        "source_workspace_url": "https://s", "target_workspace_url": "https://t",
+        "spn_client_id": "x", "spn_secret_scope": "sc", "spn_secret_key": "k",
+        "lfc_saas_cursor_columns": '{"bronze.sf.account": "SystemModstamp"}',
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(base))
+    cfg = MigrationConfig.from_workspace_file(str(p))
+    assert cfg.lfc_saas_cursor_columns == {"bronze.sf.account": "SystemModstamp"}
+
+
+def test_lfc_saas_cursor_columns_empty_string_is_empty_dict():
+    from common.config import _coerce_cursor_columns
+    assert _coerce_cursor_columns("") == {}
+    assert _coerce_cursor_columns(None) == {}
+    assert _coerce_cursor_columns({}) == {}
+
+
+def test_lfc_saas_cursor_columns_fail_loud_on_malformed_input():
+    from common.config import _coerce_cursor_columns
+    # malformed JSON string → fail loud
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns("{not valid json")
+    # valid JSON but not an object (e.g. a list/scalar) → fail loud
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns('["a", "b"]')
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns(42)

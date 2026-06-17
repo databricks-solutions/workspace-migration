@@ -114,6 +114,10 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "lfc_pipeline_created_incremental",
     # Lakeflow Connect: unified view created over <t>_history + <t>_incr.
     "lfc_view_created",
+    # Lakeflow Connect (Tier-1 SaaS): the table has no resolvable incremental
+    # cursor, so the recreated pipeline full-loads it and no unified view is built.
+    # Terminal so re-runs don't reprocess it.
+    "lfc_view_skipped_no_cursor",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
