@@ -481,6 +481,28 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         if res["state"] != "SUCCEEDED":
             raise RuntimeError(f"create_view failed: {res.get('error', res['state'])}\nSQL: {sql}")
 
+    def _create_gateway(spec):
+        """Create the recreated ingestion GATEWAY on the TARGET workspace.
+
+        A gateway pipeline is created with the typed gateway_definition only — no
+        top-level catalog/schema (its staging storage lives inside the
+        gateway_definition's gateway_storage_{catalog,schema,name})."""
+        from databricks.sdk.service.pipelines import IngestionGatewayPipelineDefinition
+
+        created = auth.target_client.pipelines.create(
+            name=spec["name"],
+            gateway_definition=IngestionGatewayPipelineDefinition.from_dict(spec["gateway_definition"]),
+        )                                      # LIVE-VALIDATION: confirm shape (no top-level catalog/schema)
+        return created.pipeline_id
+
+    def _validate_pipeline(pipeline_id):
+        """Dry-validate: analysis-only update, no data, no continuous run. Record-and-return;
+        the caller decides hard-fail only on a genuine config error."""
+        try:
+            auth.target_client.pipelines.start_update(pipeline_id, validate_only=True)  # LIVE-VALIDATION
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[lfc] validate_only(%s) failed: %s", pipeline_id, exc)
+
     deps = types.SimpleNamespace(
         compute_boundary=_compute_boundary,
         get_columns=_get_columns,
@@ -490,6 +512,8 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         create_pipeline=_create_pipeline,
         run_pipeline_and_await=_run_pipeline_and_await,
         create_view=_create_view,
+        create_gateway=_create_gateway,
+        validate_pipeline=_validate_pipeline,
     )
 
     # Read target_connection_name from config
@@ -505,10 +529,14 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
     # ---------------------------------------------------------------------------
     all_results: list[dict] = []
     saas_cursor_columns = getattr(config, "lfc_saas_cursor_columns", None) or {}
+    # Shared across rows so a CDC gateway referenced by N ingestion pipelines is
+    # recreated exactly once (source-gateway-id -> new-target-gateway-id).
+    gateway_id_map: dict[str, str] = {}
     for row in rows:
         try:
             row_results = migrate_pipeline(row, deps=deps, target_connection_name=target_connection_name,
-                                           saas_cursor_columns=saas_cursor_columns)
+                                           saas_cursor_columns=saas_cursor_columns,
+                                           gateway_id_map=gateway_id_map)
             all_results.extend(row_results)
         except Exception as exc:  # noqa: BLE001
             logger.error("[lfc_worker] pipeline %s failed: %s", row.get("object_name"), exc, exc_info=True)
