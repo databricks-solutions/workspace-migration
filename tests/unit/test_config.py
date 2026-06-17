@@ -373,3 +373,15 @@ def test_lfc_saas_cursor_columns_empty_string_is_empty_dict():
     assert _coerce_cursor_columns("") == {}
     assert _coerce_cursor_columns(None) == {}
     assert _coerce_cursor_columns({}) == {}
+
+
+def test_lfc_saas_cursor_columns_fail_loud_on_malformed_input():
+    from common.config import _coerce_cursor_columns
+    # malformed JSON string → fail loud
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns("{not valid json")
+    # valid JSON but not an object (e.g. a list/scalar) → fail loud
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns('["a", "b"]')
+    with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
+        _coerce_cursor_columns(42)

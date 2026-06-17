@@ -2,7 +2,6 @@ import pytest
 
 from common.tracking import _TERMINAL_STATUSES
 from migrate.lfc_utils import (
-    build_query_based_create_spec,
     build_recreate_spec,
     build_unified_view_sql,
     candidate_cursor_columns,
@@ -104,10 +103,11 @@ def test_view_scd2_is_union_all():
     assert "ROW_NUMBER" not in sql
 
 
-def test_build_create_spec_sets_incr_dest_and_row_filter():
-    spec = build_query_based_create_spec(
+def test_build_recreate_spec_sets_incr_dest_and_row_filter():
+    # query-based shape: worker passes the row_filter it computed from the spec cursor
+    spec = build_recreate_spec(
         QB_DEF, target_connection_name="tgt_pg",
-        boundaries={"orders": "2026-06-10T00:00:00"}, name="lfc_orders_incr",
+        name="lfc_orders_incr", row_filter_by_src={"orders": "updated_at >= '2026-06-10T00:00:00'"},
     )
     assert spec["channel"] == "PREVIEW"
     # top-level catalog/schema are REQUIRED on create (direct publishing mode)
@@ -119,7 +119,7 @@ def test_build_create_spec_sets_incr_dest_and_row_filter():
     assert tbl["destination_table"] == "orders_incr"
     tc = tbl["table_configuration"]
     assert tc["row_filter"] == "updated_at >= '2026-06-10T00:00:00'"
-    # cursor stays in the nested field; it's the boundary source
+    # cursor stays in the nested field (deep-copied through unchanged)
     assert tc["query_based_connector_config"]["cursor_columns"] == ["updated_at"]
     assert tc["scd_type"] == "SCD_TYPE_1"
 

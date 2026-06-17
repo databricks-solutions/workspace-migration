@@ -208,29 +208,6 @@ def build_recreate_spec(
     return out
 
 
-def build_query_based_create_spec(
-    definition: dict, *, target_connection_name: str,
-    boundaries: dict[str, str], name: str,
-) -> dict:
-    """Query-based recreate spec: cursor comes from the spec's nested
-    cursor_columns. Thin wrapper over build_recreate_spec.
-
-    boundaries maps source_table -> cursor boundary T. A table with a boundary
-    (and a cursor) gets destination `<table>_incr` + row_filter `<cursor> >= 'T'`;
-    a table WITHOUT a boundary (batch/no-cursor) keeps the canonical destination
-    and no filter (full-load — its normal behaviour).
-    """
-    row_filter_by_src: dict[str, str] = {}
-    for o in _ingestion_def(definition).get("objects") or []:
-        t = o.get("table") or {}
-        src = t.get("source_table")
-        cursors = _cursor_columns(t.get("table_configuration") or {})
-        if src in boundaries and cursors:
-            row_filter_by_src[src] = f"{cursors[0]} >= '{boundaries[src]}'"
-    return build_recreate_spec(definition, target_connection_name=target_connection_name,
-                               name=name, row_filter_by_src=row_filter_by_src)
-
-
 def build_unified_view_sql(
     *, canonical: str, history: str, incr: str,
     scd_type: str, primary_keys: list[str], cursor_column: str,
