@@ -239,3 +239,27 @@ def test_table_absent_from_map_keeps_canonical_name_no_filter():
     t = spec["ingestion_definition"]["objects"][0]["table"]
     assert t["destination_table"] == "orders"
     assert "row_filter" not in t["table_configuration"]
+
+
+# --- CDC (Tier-2, gateway-based) pure helpers ---
+from migrate.lfc_utils import extract_gateway_def, gateway_staging_volume_fqn  # noqa: E402
+
+_GW_SPEC = {"spec": {"gateway_definition": {
+    "connection_name": "src_sql", "gateway_storage_catalog": "stg",
+    "gateway_storage_schema": "cdc", "gateway_storage_name": "gw_vol"}}}
+
+
+def test_extract_gateway_def():
+    assert extract_gateway_def(_GW_SPEC)["gateway_storage_name"] == "gw_vol"
+
+
+def test_extract_gateway_def_none_when_absent():
+    assert extract_gateway_def({"spec": {"ingestion_definition": {}}}) is None
+
+
+def test_gateway_staging_volume_fqn():
+    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC)) == "stg.cdc.gw_vol"
+
+
+def test_gateway_staging_volume_fqn_none_on_incomplete():
+    assert gateway_staging_volume_fqn({"gateway_storage_catalog": "stg"}) is None

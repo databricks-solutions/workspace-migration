@@ -208,6 +208,18 @@ def build_recreate_spec(
     return out
 
 
+def extract_gateway_def(gateway_spec: dict) -> dict | None:
+    """The gateway_definition from a gateway pipeline's get()-dict, or None."""
+    return ((gateway_spec or {}).get("spec") or {}).get("gateway_definition") or None
+
+
+def gateway_staging_volume_fqn(gateway_def: dict) -> str | None:
+    """`cat.schema.volume` of the gateway's staging volume, or None if incomplete."""
+    gd = gateway_def or {}
+    cat, sch, vol = gd.get("gateway_storage_catalog"), gd.get("gateway_storage_schema"), gd.get("gateway_storage_name")
+    return f"{cat}.{sch}.{vol}" if (cat and sch and vol) else None
+
+
 def build_unified_view_sql(
     *, canonical: str, history: str, incr: str,
     scd_type: str, primary_keys: list[str], cursor_column: str,
