@@ -118,8 +118,10 @@ if not _staging_fqn:
     errors.append("staging_volume_fqn taskValue missing from seed")
     summary["staging_excluded"] = "FAILED_no_taskvalue"
 else:
+    # discovery records volume object_names backtick-quoted — normalize before matching.
     _inv = spark.sql(  # noqa: F821
-        f"SELECT object_type FROM {_tracking_fqn}.discovery_inventory WHERE object_name = '{_staging_fqn}'"
+        f"SELECT object_type FROM {_tracking_fqn}.discovery_inventory "
+        f"WHERE replace(object_name, '`', '') = '{_staging_fqn}'"
     ).collect()
     _types = {r["object_type"] for r in _inv}
     if "gateway_staging_volume" in _types and "volume" not in _types:

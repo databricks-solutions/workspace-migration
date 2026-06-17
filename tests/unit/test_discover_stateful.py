@@ -183,3 +183,12 @@ def test_exclude_gateway_staging_volumes_noop_when_no_fqns():
     inventory = [{"object_type": "volume", "object_name": "stg.cdc.gw_vol"}]
     assert disc._exclude_gateway_staging_volumes(inventory, set()) == []
     assert inventory[0]["object_type"] == "volume"
+
+
+def test_exclude_gateway_staging_volumes_normalizes_backticks():
+    # Discovery records volume object_names backtick-quoted; the gateway FQN is plain.
+    # Matching must normalize both sides (live-confirmed format mismatch).
+    inventory = [{"object_type": "volume", "object_name": "`stg`.`cdc`.`gw_vol`"}]
+    excluded = disc._exclude_gateway_staging_volumes(inventory, {"stg.cdc.gw_vol"})
+    assert excluded == ["`stg`.`cdc`.`gw_vol`"]
+    assert inventory[0]["object_type"] == "gateway_staging_volume"

@@ -624,9 +624,12 @@ def _exclude_gateway_staging_volumes(inventory: list[dict], gateway_fqns: set[st
     Non-volume rows with the same FQN are left untouched."""
     if not gateway_fqns:
         return []
+    # Discovery records volume object_names backtick-quoted (`cat`.`sch`.`vol`),
+    # while the gateway FQNs are plain — normalize both sides before matching.
+    norm = {f.replace("`", "") for f in gateway_fqns}
     excluded: list[str] = []
     for r in inventory:
-        if r.get("object_type") == "volume" and r.get("object_name") in gateway_fqns:
+        if r.get("object_type") == "volume" and (r.get("object_name") or "").replace("`", "") in norm:
             r["object_type"] = "gateway_staging_volume"
             excluded.append(r["object_name"])
     return excluded

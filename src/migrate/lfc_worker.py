@@ -549,8 +549,28 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
             if "COMPLETED" in state:
                 return "validated"
             if "FAILED" in state or "CANCELED" in state or "CANCELLED" in state:
-                return "failed"
+                return _classify_validate_failure(pipeline_id)
         return "inconclusive"
+
+    def _classify_validate_failure(pipeline_id) -> str:
+        """A FAILED validate update is 'failed' (genuine config error) UNLESS its
+        cause is the gateway not being fully staged — "waiting for global metadata"
+        / "Ingestion Gateway pipeline is running". That timeout means the config +
+        gateway link RESOLVED but the (intentionally not-run) gateway has no staged
+        metadata yet → 'inconclusive', not a config error."""
+        gateway_not_ready = ("waiting for global metadata", "ingestion gateway pipeline is running")
+        try:
+            from itertools import islice
+            for e in islice(auth.target_client.pipelines.list_pipeline_events(pipeline_id), 50):
+                texts = [(e.message or "").lower()]
+                err = getattr(e, "error", None)
+                texts += [(getattr(ex, "message", "") or "").lower()
+                          for ex in (getattr(err, "exceptions", None) or [])]
+                if any(any(k in t for k in gateway_not_ready) for t in texts):
+                    return "inconclusive"
+        except Exception:  # noqa: BLE001
+            pass
+        return "failed"
 
     def _stop_pipeline(pipeline_id) -> None:
         """Stop a (continuous) pipeline — used to halt the auto-started gateway so
