@@ -23,6 +23,14 @@ migrations, account consolidations, or moving between Azure regions.
 - Databases, managed + external tables, views, functions, grants
 - Migrated by the standalone `migrate_hive` job (run only when needed)
 
+**Lakeflow Connect ingestion pipelines** (optional `migrate_lfc` job)
+- Query-based DB + SaaS row_filter (Salesforce/GA4/ServiceNow): clone history,
+  recreate with a `row_filter` cursor boundary, unified view
+- CDC / gateway DB: recreate the gateway + ingestion pipeline (create-only;
+  customer starts the re-hydrate at cutover)
+- Cross-workspace LFC is a cut-over, not an in-place move (`SET PIPELINE_ID` is
+  blocked); see the user guide, Step 9
+
 ## Layout
 
 ```
