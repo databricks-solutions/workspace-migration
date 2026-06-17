@@ -43,11 +43,17 @@ migrations, account consolidations, or moving between Azure regions.
 
 ## Usage
 
-`config.yaml` ships in the repo with **placeholder values only** so the
-source tree never carries environment-specific identifiers. Operators
-fill in real values in their **local** `config.yaml` before deploying;
-`databricks bundle deploy` syncs that local copy to the workspace at
-`${workspace.file_path}/config.yaml`.
+Only `config.example.yaml` ships in the repo. `config.yaml` is **git-ignored**
+so the source tree never carries environment-specific identifiers (workspace
+URLs, SPN client id). Operators **copy the example and fill in real values**:
+
+```bash
+cp config.example.yaml config.yaml   # then edit config.yaml with real values
+```
+
+`databricks bundle deploy` syncs your local `config.yaml` to the workspace at
+`${workspace.file_path}/config.yaml` (DAB syncs working-tree files, so the
+git-ignored config still deploys).
 
 > **Don't edit the workspace copy directly.** The workspace copy is a
 > mirror of your local copy — any workspace-side edit will be
@@ -106,16 +112,19 @@ databricks bundle deploy -t dev
 ### Deploy + configure flow
 
 1. Clone this repo
-2. Edit the local `config.yaml` with real values (or keep your own
-   filled-in copy out-of-tree and copy it in before each deploy):
+2. `cp config.example.yaml config.yaml` and fill in real values (the file is
+   git-ignored, so your real values never get committed):
    - `source_workspace_url` / `target_workspace_url`
    - `spn_client_id` + `spn_secret_scope`/`spn_secret_key` (OAuth service
      principal with access to both workspaces)
    - optional: `catalog_filter`, `schema_filter`, `iceberg_strategy`,
-     `migrate_hive_dbfs_root`, `hive_dbfs_target_path`
+     `migrate_hive_dbfs_root`, `hive_dbfs_target_path`,
+     `overwrite_existing` (default false), `transfer_ownership` (default true)
 3. `databricks bundle deploy -t dev --var migration_spn_id=<your-app-id>`
-   (syncs your local `config.yaml` to the workspace along with the
-   workflow definitions)
+   (optionally `--var migration_admin_group=<your-admin-group>` to scope job
+   management to a dedicated group instead of the default `admins`). This
+   syncs your local `config.yaml` to the workspace along with the workflow
+   definitions.
 4. Run the `pre_check` workflow to validate connectivity and grants
 5. Run `discovery` to inventory source objects
 6. Re-run `pre_check` — the second run detects **target collisions**:

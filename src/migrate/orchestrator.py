@@ -42,6 +42,40 @@ from migrate.reconciliation import (  # noqa: E402
     resolve_current_job_run_id,
 )
 
+# Authoritative set of UC object types this tool migrates. Module-level so
+# collision detection's coverage guard test (review finding #6) can assert
+# every migrated type is either collision-probed or explicitly exempted —
+# adding a new migrated type here forces that decision.
+BATCHED_TYPES = ("managed_table", "external_table", "volume", "mv", "st")
+LIST_TYPES = (
+    "function",
+    "view",
+    # Phase 3 governance object types — published even when counts
+    # are zero so downstream worker tasks always have a valid JSON
+    # payload to consume. ``comment`` is intentionally excluded:
+    # comments_worker reads discovery_inventory directly because
+    # comments span table / view / column / volume / schema / catalog
+    # and a flat ``comment_list`` was never a natural fit.
+    "tag",
+    "row_filter",
+    "column_mask",
+    "policy",
+    "monitor",
+    "registered_model",
+    "connection",
+    "foreign_catalog",
+    "share",
+    "recipient",
+    "provider",
+    "online_table",
+    # Stateful Services Phase — consumed by the migrate_vector_search job's
+    # worker. Harmless for other jobs; they ignore the published list.
+    "vector_search_index",
+    # Stateful Services Phase — consumed by the migrate_lfc job's worker.
+    # Harmless for other jobs; they ignore the published list.
+    "lfc_pipeline",
+)
+
 
 def check_collision_gate(spark, config) -> None:
     """Raise when the latest pre_check_results has any target_collision FAILs.
@@ -151,32 +185,6 @@ if _is_notebook():
     tracker = TrackingManager(spark_session, config)
 
     # Read discovery inventory and collect pending objects per type
-    BATCHED_TYPES = ("managed_table", "external_table", "volume", "mv", "st")
-    LIST_TYPES = (
-        "function",
-        "view",
-        # Phase 3 governance object types — published even when counts
-        # are zero so downstream worker tasks always have a valid JSON
-        # payload to consume. ``comment`` is intentionally excluded:
-        # comments_worker reads discovery_inventory directly because
-        # comments span table / view / column / volume / schema / catalog
-        # and a flat ``comment_list`` was never a natural fit.
-        "tag",
-        "row_filter",
-        "column_mask",
-        "policy",
-        "monitor",
-        "registered_model",
-        "connection",
-        "foreign_catalog",
-        "share",
-        "recipient",
-        "provider",
-        "online_table",
-        # Stateful Services Phase — consumed by the migrate_vector_search job's
-        # worker. Harmless for other jobs; they ignore the published list.
-        "vector_search_index",
-    )
 
     batch_output: dict[str, list[str]] = {}
     list_output: dict[str, str] = {}

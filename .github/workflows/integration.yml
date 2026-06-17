@@ -44,6 +44,21 @@ jobs:
         run: databricks bundle run uc_integration_test -t test
       - name: Run Hive integration test
         run: databricks bundle run hive_integration_test -t test
+      # Previously-unwired suites (review finding #11) — these job definitions
+      # existed in resources/integration_tests/ but CI never ran them.
+      - name: Run governance integration test
+        run: databricks bundle run governance_integration_test -t test
+      - name: Run negative-paths integration test
+        run: databricks bundle run negative_paths_integration_test -t test
+      - name: Run online-tables integration test
+        run: databricks bundle run online_tables_integration_test -t test
+      - name: Run vector-search integration test
+        run: databricks bundle run vector_search_integration_test -t test
+      # TODO(#11 follow-up): wire test_retry_resumability + test_collision_handling.
+      # Both are notebook tests with no DAB workflow yet — they need a
+      # seed -> migrate(test_kill_after) -> resume -> assert chain authored in
+      # resources/integration_tests/ (tracked with the integration-test
+      # expansion). Until then the crash-recovery + collision suites don't run.
       - name: Cleanup
         if: always()
         run: databricks bundle destroy -t test --auto-approve

@@ -30,8 +30,10 @@ from datetime import datetime, timezone
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
+from common.sql_utils import find_warehouse, write_discovery_inventory_via_warehouse
 from common.stateful_utils import CAPABILITY, StatefulExplorer
 from common.tracking import TrackingManager, discovery_row, discovery_schema
+from migrate.reconciliation import resolve_current_job_run_id
 
 # COMMAND ----------
 
@@ -546,25 +548,65 @@ def _discover_stateful(config, stateful, now) -> list[dict]:
 # COMMAND ----------
 
 
+def _read_scope(dbutils) -> str:
+    """Discovery scope, from the ``discovery_scope`` widget. Values:
+
+    * ``all``  (default) — UC + hive + stateful on one (serverless) compute,
+      writing inventory via spark. Back-compat for non-hive-on-ADLS suites.
+    * ``uc``   — UC + stateful only (skip hive). Use for the serverless pass
+      when hive lives on ADLS and is discovered separately on classic compute.
+    * ``hive`` — hive only, reading source on the (classic, NON-UC) cluster's
+      spark and writing inventory through the SQL warehouse. hive_metastore
+      tables on ADLS can't be read on serverless/UC compute (their Delta log
+      lives on ADLS), so this scope runs on a classic No-Isolation cluster.
+    """
+    try:
+        dbutils.widgets.text("discovery_scope", "all")
+        v = (dbutils.widgets.get("discovery_scope") or "all").strip().lower()
+        return v if v in ("all", "uc", "hive") else "all"
+    except Exception:  # noqa: BLE001 — not in a notebook / no widget
+        return "all"
+
+
 def run(dbutils, spark):  # noqa: D103
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
-    tracker = TrackingManager(spark, config)
+    scope = _read_scope(dbutils)
+    job_run_id = resolve_current_job_run_id(dbutils)
     explorer = CatalogExplorer(spark, auth)
+    now = datetime.now(tz=timezone.utc)
+    print(f"[discovery] scope = {scope}")
 
+    # --- hive-only scope: classic compute, warehouse-routed inventory write ---
+    # No UC spark access here (NON-UC cluster), so we DON'T init tracking tables
+    # (the uc/all pass already created them) and DON'T write via spark.
+    if scope == "hive":
+        print("[hive] Scanning hive_metastore (classic compute)...")
+        hive_rows = _discover_hive(config, explorer, now)
+        print(f"\nTotal hive objects discovered: {len(hive_rows)}")
+        # Tracking catalog is on the SOURCE metastore — use a source warehouse.
+        wh_id = find_warehouse(auth, use_source=True)
+        tracking_fqn = f"{config.tracking_catalog}.{config.tracking_schema}"
+        write_discovery_inventory_via_warehouse(auth, wh_id, tracking_fqn, hive_rows, source_type="hive")
+        print("Hive discovery inventory written via warehouse.")
+        return hive_rows
+
+    tracker = TrackingManager(spark, config)
+    tracker.job_run_id = job_run_id
     tracker.init_tracking_tables()
 
-    now = datetime.now(tz=timezone.utc)
     inventory: list[dict] = []
+    dlt_count = 0
 
-    # Both scopes always scan — workflow split removed scope flags.
-    # Empty scan results (e.g., no Hive metastore on this workspace) are a normal no-op.
     print("[uc] Scanning UC catalogs...")
     uc_rows, dlt_count = _discover_uc(config, explorer, now)
     inventory.extend(uc_rows)
 
-    print("[hive] Scanning hive_metastore...")
-    inventory.extend(_discover_hive(config, explorer, now))
+    # scope 'uc' skips hive (it's discovered separately on classic compute);
+    # scope 'all' keeps the legacy single-compute behaviour.
+    if scope == "all":
+        print("[hive] Scanning hive_metastore...")
+        inventory.extend(_discover_hive(config, explorer, now))
 
     print("[stateful] Scanning stateful-service surfaces...")
     stateful_explorer = StatefulExplorer(auth)

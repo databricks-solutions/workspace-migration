@@ -410,6 +410,42 @@ class TestPoliciesWorker:
         assert "/policies" in path
 
     @patch("migrate.policies_worker.time")
+    def test_strips_readonly_fields_before_post(self, mock_time):
+        """Live: the GET policy definition carries server-generated read-only
+        fields (id, created_at, created_by, updated_at, updated_by) that POST
+        /policies must not receive. The worker strips them, keeping the spec."""
+        from migrate.policies_worker import apply_policy
+
+        mock_time.time.side_effect = [100.0, 101.0]
+        auth = MagicMock()
+        auth.target_client.api_client.do.return_value = {"ok": True}
+
+        res = apply_policy(
+            {
+                "name": "p1",
+                "on_securable_type": "TABLE",
+                "on_securable_fullname": "c.s.t",
+                "to_principals": ["account users"],
+                "policy_type": "POLICY_TYPE_ROW_FILTER",
+                "row_filter": {"function_name": "c.s.rf0"},
+                "id": "abc-123",
+                "created_at": 123,
+                "created_by": "someone@x.com",
+                "updated_at": 456,
+                "updated_by": "someone@x.com",
+            },
+            auth=auth,
+            dry_run=False,
+        )
+        assert res["status"] == "validated"
+        body = auth.target_client.api_client.do.call_args.kwargs["body"]
+        for ro in ("id", "created_at", "created_by", "updated_at", "updated_by"):
+            assert ro not in body, f"{ro} must be stripped before POST"
+        assert body["name"] == "p1"
+        assert body["row_filter"] == {"function_name": "c.s.rf0"}
+        assert body["to_principals"] == ["account users"]
+
+    @patch("migrate.policies_worker.time")
     def test_records_error_on_api_failure(self, mock_time):
         from migrate.policies_worker import apply_policy
 
@@ -450,6 +486,10 @@ class TestMonitorsWorker:
         body = auth.target_client.api_client.do.call_args.kwargs["body"]
         assert "table_name" not in body  # stripped
         assert "status" not in body
+        # assets_dir is REQUIRED by the create API — the worker must set a
+        # fresh deterministic target path, not strip it (the source path is
+        # meaningless on target). Live failure was "assets_dir is required".
+        assert body["assets_dir"] == "/Workspace/Shared/cp_migration_monitor_assets/c.s.t"
         assert "schedule" in body
 
 
@@ -603,10 +643,15 @@ class TestModelsWorker:
 class TestConnectionsWorker:
     @patch("migrate.connections_worker.time")
     def test_creates_connection_and_flags_missing_credentials(self, mock_time):
+        from databricks.sdk.errors import NotFound
+
         from migrate.connections_worker import apply_connection
 
         mock_time.time.side_effect = [100.0, 101.0]
         auth = MagicMock()
+        # Connection absent on target → exercise the create path (not the
+        # idempotent target-existence short-circuit).
+        auth.target_client.connections.get.side_effect = NotFound("not found")
         auth.target_client.connections.create.return_value = MagicMock()
 
         res = apply_connection(
@@ -619,10 +664,13 @@ class TestConnectionsWorker:
 
     @patch("migrate.connections_worker.time")
     def test_validated_when_no_secret_options(self, mock_time):
+        from databricks.sdk.errors import NotFound
+
         from migrate.connections_worker import apply_connection
 
         mock_time.time.side_effect = [100.0, 101.0]
         auth = MagicMock()
+        auth.target_client.connections.get.side_effect = NotFound("not found")
         auth.target_client.connections.create.return_value = MagicMock()
 
         res = apply_connection(
@@ -656,30 +704,37 @@ class TestForeignCatalogsWorker:
 
 
 class TestOnlineTablesWorker:
-    """Phase 4: online tables are hard-excluded from the core migration
-    tool. ``apply_online_table`` short-circuits to
-    ``skipped_by_stateful_service_migration`` without touching the
-    target — index state is runtime state that the Stateful Services
-    Phase (separate future job) handles via proper sync-rebuild
-    semantics. See ``docs/stateful_services_phase.md``."""
+    """Real migration: ``migrate_online_table`` converts the online table into a
+    Lakebase synced table via create_synced_database_table. object_name is the
+    plain FQN; a shared Lakebase instance is ensured before creation."""
 
-    @patch("migrate.online_tables_worker.time")
-    def test_apply_online_table_hard_excludes(self, mock_time):
-        from migrate.online_tables_worker import apply_online_table
+    def test_migrate_online_table_created_resync_pending(self):
+        import json
 
-        mock_time.time.side_effect = [100.0, 100.1]
-        auth = MagicMock()
+        from migrate.online_tables_worker import migrate_online_table
 
-        res = apply_online_table(
-            {"online_table_fqn": "c.s.online_t", "definition": {"spec": {"source_table_full_name": "c.s.t"}}},
-            auth=auth,
-            dry_run=False,
-        )
-        assert res["status"] == "skipped_by_stateful_service_migration"
-        assert res["object_name"] == "ONLINE_TABLE_c.s.online_t"
-        assert "Stateful Services Phase" in res["error_message"]
-        # No POST issued — that's the entire point of hard-exclusion.
-        auth.target_client.api_client.do.assert_not_called()
+        client = MagicMock()
+        ready_inst = MagicMock()
+        ready_inst.state = "AVAILABLE"
+        client.database.get_database_instance.return_value = ready_inst
+        config = MagicMock()
+        config.lakebase_instance_name = "lb1"
+        config.lakebase_logical_database = "ldb"
+        config.lakebase_capacity = "CU_1"
+        definition = {
+            "name": "c.s.online_t",
+            "spec": {"source_table_full_name": "c.s.t", "primary_key_columns": ["id"], "run_triggered": {}},
+        }
+        row = {
+            "object_name": "c.s.online_t",
+            "object_type": "online_table",
+            "metadata_json": json.dumps({"definition": definition}),
+        }
+        res = migrate_online_table(client, row, config, sleep_fn=lambda s: None, max_attempts=1, sleep_seconds=0)
+        assert res["status"] == "created_resync_pending"
+        assert res["object_name"] == "c.s.online_t"
+        st_arg = client.database.create_synced_database_table.call_args.args[0]
+        assert st_arg.spec.source_table_full_name == "c.s.t"
 
 
 # ---------------------------------------------------- Sharing ---------

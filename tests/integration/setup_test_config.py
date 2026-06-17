@@ -34,6 +34,11 @@
 #                              so UC discovery ignores the parallel
 #                              ``integration_test_hive_ucref`` fixture
 #                              seeded for the cross-catalog view test.
+#   lfc_target_connection_name — UC connection name on target for the
+#                              recreated query-based LFC pipeline. Empty
+#                              → leave the existing value in config.yaml
+#                              unchanged. LFC integration passes
+#                              "integration_test_sqlserver".
 #
 # --- Negative-path injections (integration X.3) ---
 # These intentionally corrupt the config so a downstream task fails loud
@@ -108,6 +113,7 @@ dbutils.widgets.text("migrate_hive_dbfs_root", "false")  # noqa: F821
 dbutils.widgets.text("hive_dbfs_target_path", "")  # noqa: F821
 dbutils.widgets.text("batch_size", "")  # noqa: F821
 dbutils.widgets.text("catalog_filter", "")  # noqa: F821
+dbutils.widgets.text("lfc_target_connection_name", "")  # noqa: F821
 # Negative-path injection widgets (integration X.3). Default "false" so
 # normal UC / Hive integration runs are unaffected.
 dbutils.widgets.text("inject_bad_spn_id", "false")  # noqa: F821
@@ -128,6 +134,7 @@ migrate_hive_dbfs_root = _get_bool("migrate_hive_dbfs_root", "false")
 hive_dbfs_target_path = _get_str("hive_dbfs_target_path", "")
 batch_size_raw = _get_str("batch_size", "")
 catalog_filter_raw = _get_str("catalog_filter", "")
+lfc_target_connection_name_raw = _get_str("lfc_target_connection_name", "")
 
 # Negative-path injection toggles (integration X.3).
 inject_bad_spn_id = _get_bool("inject_bad_spn_id", "false")
@@ -154,6 +161,7 @@ cfg = apply_integration_overrides(
     hive_dbfs_target_path=hive_dbfs_target_path,
     batch_size_raw=batch_size_raw,
     catalog_filter_raw=catalog_filter_raw,
+    lfc_target_connection_name_raw=lfc_target_connection_name_raw,
     inject_bad_spn_id=inject_bad_spn_id,
     inject_unreachable_target=inject_unreachable_target,
 )
@@ -167,12 +175,13 @@ with open(config_path, "w") as f:
 
 print(
     f"Overrode {config_path} for this integration test run:\n"
-    f"  iceberg_strategy         = {iceberg_strategy!r}\n"
-    f"  rls_cm_strategy          = {rls_cm_strategy!r}\n"
-    f"  migrate_hive_dbfs_root   = {migrate_hive_dbfs_root}\n"
-    f"  hive_dbfs_target_path    = {cfg.get('hive_dbfs_target_path', '')!r}\n"
-    f"  batch_size               = {cfg.get('batch_size', '(unchanged)')}\n"
-    f"  catalog_filter           = {cfg.get('catalog_filter', '(unchanged)')}\n"
-    f"  [inject] bad_spn_id      = {inject_bad_spn_id}\n"
-    f"  [inject] unreach_target  = {inject_unreachable_target}\n"
+    f"  iceberg_strategy              = {iceberg_strategy!r}\n"
+    f"  rls_cm_strategy               = {rls_cm_strategy!r}\n"
+    f"  migrate_hive_dbfs_root        = {migrate_hive_dbfs_root}\n"
+    f"  hive_dbfs_target_path         = {cfg.get('hive_dbfs_target_path', '')!r}\n"
+    f"  batch_size                    = {cfg.get('batch_size', '(unchanged)')}\n"
+    f"  catalog_filter                = {cfg.get('catalog_filter', '(unchanged)')}\n"
+    f"  lfc_target_connection_name    = {cfg.get('lfc_target_connection_name', '(unchanged)')!r}\n"
+    f"  [inject] bad_spn_id           = {inject_bad_spn_id}\n"
+    f"  [inject] unreach_target       = {inject_unreachable_target}\n"
 )

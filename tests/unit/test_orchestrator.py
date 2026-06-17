@@ -338,6 +338,12 @@ class TestOrchestratorCollisionGate:
             check_collision_gate(spark, self._mock_config())
 
 
+def test_lfc_pipeline_is_published_as_a_list_type():
+    from migrate.orchestrator import LIST_TYPES
+
+    assert "lfc_pipeline" in LIST_TYPES
+
+
 def test_vector_search_index_is_a_list_type():
     # The shared orchestrator must publish a vector_search_index_list task value
     # for the migrate_vector_search job's worker to consume.

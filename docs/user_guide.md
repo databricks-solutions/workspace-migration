@@ -87,6 +87,8 @@ flowchart LR
 | `migrate_hive` job | Hive (legacy): databases, tables, views, functions, grants — migrated into a UC target catalog. |
 | `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
 | `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
+| `migrate_online_tables` job | Optional add-on: converts each discovered legacy online table into a **Lakebase synced table** on the target (legacy online tables are deprecated; creation is blocked platform-wide). Re-syncs from the already-migrated source Delta table into a Lakebase database instance the job creates. |
+| `migrate_lfc` job | Optional add-on (Stage 1): migrates **query-based** Lakeflow Connect pipelines (SQL Server, PostgreSQL, MySQL, Redshift, etc.) via a clone-history + recreate-with-row_filter + unified-view pattern. SaaS connectors and CDC/gateway connectors are later stages. |
 | `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
 | Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
 
@@ -139,7 +141,9 @@ next section):
 
 - Streaming Tables (Kafka / Auto Loader checkpoints don't transfer)
 - Materialized Views (rebuild semantics)
-- Online Tables (preview, rebuild semantics)
+
+Online Tables were previously hard-skipped here; they are now migrated
+by the standalone `migrate_online_tables` job (see Section 6, Step 8).
 
 ### Coming in Phase 3 — stateful services
 
@@ -148,14 +152,15 @@ next section):
 | DLT pipelines | Spec + rebuild from UC (if UC-sourced) | Customer-owned definitions; checkpoints don't transfer |
 | Streaming Tables | Source-cutover | Re-create + cutover watermark; previously hard-skipped |
 | Materialized Views | Spec + rebuild | Re-create + REFRESH; previously hard-skipped |
-| Online Tables | Spec + rebuild | Re-create + sync; previously hard-skipped |
+| Online Tables | Convert to Lakebase synced table | Legacy online tables are deprecated (creation blocked platform-wide). **Available now** via `migrate_online_tables` job (see Section 6, Step 8): converts each online table to a Lakebase **synced table** re-syncing from the migrated source Delta table. Consumer repoint is operator-owned. |
 | Vector Search indexes | Spec + rebuild | Delta Sync indexes: **available now** via `migrate_vector_search` job (see Section 6, Step 7). Direct Access indexes remain deferred. |
 | Lakebase | Dump / restore | `pg_dump` / `pg_restore` out-of-band |
 | Online Feature Store | Dump / restore | Out-of-band state move |
 | Apps | Spec-only re-create | Read source app spec, POST to target |
 | Model Serving endpoints | Spec-only re-create | Pure config replay |
 | Genie spaces | Spec-only re-create | Configuration replay |
-| Lakeflow Connect pipelines | Source-cutover | Cutover watermark via `START_DATE` or `row_filter` |
+| Lakeflow Connect pipelines (query-based) | Clone-history + recreate-with-row_filter + unified view | **Available now** via `migrate_lfc` job (see Section 6, Step 9): Stage 1 covers query-based connectors. CDC/gateway + SaaS connectors remain later stages. |
+| Lakeflow Connect pipelines (CDC/gateway + SaaS) | Source-cutover | Cutover watermark via `START_DATE` or `row_filter`; later stages (not yet in this tool) |
 | Agent Bricks | AI compound | Wraps Model Serving + VS + KA + prompt config |
 
 Current scope and cutover notes live in
@@ -325,9 +330,9 @@ databricks bundle deploy -t dev \
 
 This creates:
 
-- The six workflows: `pre_check`, `discovery`, `migrate_uc`,
-  `migrate_hive`, `migrate_governance`, `migrate_vector_search` (plus
-  integration-test workflows).
+- The eight workflows: `pre_check`, `discovery`, `migrate_uc`,
+  `migrate_hive`, `migrate_governance`, `migrate_vector_search`,
+  `migrate_online_tables`, `migrate_lfc` (plus integration-test workflows).
 - The Lakeview dashboard at `/Shared/cp_migration/dev`.
 - The `config.yaml` file at `/Workspace/Shared/cp_migration/config.yaml`.
 
@@ -337,7 +342,8 @@ This creates:
 
 The recommended order: `pre_check` → `discovery` → `pre_check` (again,
 for collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
-`migrate_governance` → `migrate_vector_search` (optional).
+`migrate_governance` → `migrate_vector_search` (optional) →
+`migrate_online_tables` (optional) → `migrate_lfc` (optional).
 
 ### Step 1 — `pre_check`
 
@@ -486,7 +492,184 @@ ORDER BY status, object_name;
   `databricks-gte-large-en`) are available by default and are
   unaffected.
 
-### Step 8 — Verify
+### Step 8 — `migrate_online_tables` (optional)
+
+Converts each discovered legacy online table into a **Lakebase synced
+table** on the target workspace. Legacy UC online tables are deprecated
+and can no longer be created platform-wide; this job re-syncs the same
+data from the already-migrated source Delta table into a Lakebase
+database instance. Running this job is itself the opt-in — there is no
+configuration flag to enable or disable it.
+
+**Paid resource — Lakebase database instance.** The job provisions a
+Lakebase database instance (configured via `lakebase_instance_name`,
+`lakebase_logical_database`, and `lakebase_capacity` in `config.yaml`),
+creating it if it does not exist. This is a **paid resource** that
+persists after the migration completes. Factor this into your cost
+planning; decommission the instance manually if it is no longer needed.
+
+**Precondition:** run `migrate_uc` first (Step 4). The job performs an
+up-front pre-check that verifies every online table's source Delta
+table **exists on the target** — it fails loudly if the source table is
+missing. The primary-key requirement is enforced at runtime: if the
+migrated source table lacks a primary key, synced-table creation fails
+and the object is recorded `failed`. Ensure the source Delta table was
+migrated with its primary key intact.
+
+**Consumer repoint is operator-owned.** Once a synced table is
+created, consumer applications must be updated to connect to the new
+Lakebase Postgres endpoint. This cut-over is outside the scope of the
+tool.
+
+```bash
+databricks jobs run-now --job-id <migrate_online_tables_job_id> --profile target-workspace
+```
+
+Monitor progress in `migration_status`:
+
+```sql
+SELECT object_name, status, error_message
+FROM migration_tracking.cp_migration.migration_status
+WHERE object_type = 'online_table'
+ORDER BY status, object_name;
+```
+
+**Status values**
+
+| Status | Meaning |
+|---|---|
+| `created_resync_pending` | Synced table created on target; re-sync from the source Delta table is in progress. The table is not queryable until the sync completes. |
+| `skipped_target_exists` | A synced table with this name already exists on the target (set by a previous run or pre-existing). No action taken. |
+| `skipped_instance_not_ready` | The Lakebase database instance was still provisioning when this table was processed. Re-run the job — idempotency will retry the table once the instance is ready. |
+| `failed` | Synced table creation failed (e.g. missing primary key on the source Delta table). Inspect `error_message` and the workflow run logs, then re-run. |
+
+**Known limitations**
+
+- **Consumer repoint required.** Downstream applications that read
+  from the old online table endpoint must be reconfigured to use the
+  new Lakebase Postgres endpoint — this is an operator action outside
+  the tool's scope.
+- **Primary key mandatory.** If the source Delta table was migrated
+  without a primary key, synced-table creation will fail. Verify the
+  target table schema before running.
+- **Auto CDF preview for incremental sync.** Online tables in
+  **triggered** or **continuous** sync mode map to synced tables that
+  need incremental sync, which requires the **auto_cdf preview** enabled
+  on the target workspace. If it is not enabled, the synced-table
+  creation fails with a clear `failed` status (message: *"Incremental
+  sync ... requires Auto CDF ... Enable the auto_cdf preview for this
+  workspace or use snapshot scheduling policy"*). Enable the preview on
+  the target, or migrate those as **snapshot** mode. Snapshot-mode online
+  tables are unaffected.
+
+### Step 9 — `migrate_lfc` (Stage 1: query-based connectors) (optional)
+
+Migrates **query-based** Lakeflow Connect pipelines — SQL Server, PostgreSQL,
+MySQL, Redshift, and any other connector that uses a pull-based cursor (as
+opposed to CDC change-data-capture or a SaaS connector). Running this job is
+itself the opt-in — there is no configuration flag to enable or disable it.
+
+**What it does**
+
+For each query-based LFC pipeline discovered on the source the job:
+
+1. **Clones the landed destination table to `<table>_history`** — using the
+   same Delta Sharing staging + `DEEP CLONE` approach as `migrate_uc`, so no
+   intermediate object storage is needed. This preserves every row that had
+   already been ingested up to the moment of cutover.
+
+2. **Recreates the pipeline on the target** writing to `<table>_incr`, with a
+   per-table `row_filter = "<cursor_column> >= '<T>'"` where `T` is the
+   `MAX(cursor_column)` from the cloned history. This ensures the new pipeline
+   pulls only post-cutover rows — there is no re-pull of history that would
+   cause duplicates. The pipeline is created with `channel=PREVIEW` to
+   enable the server-side `row_filter` push-down.
+
+3. **Creates a unified view at the canonical name `<table>`**:
+   - SCD1 tables: primary-key dedup merge (latest cursor value wins).
+   - SCD2 / append tables: `UNION ALL` across `_history` and `_incr`.
+
+Batch / formula tables (no usable cursor column) are treated differently:
+the recreated pipeline full-loads them from scratch on its first run, which
+is their normal behaviour. No `_history` clone or unified view is created for
+these tables.
+
+**Table layout after migration**
+
+| Object | What it is |
+|---|---|
+| `<catalog>.<schema>.<table>_history` | Deep-cloned snapshot of all rows landed before cutover. |
+| `<catalog>.<schema>.<table>_incr` | Streaming table written by the new target LFC pipeline (post-cutover rows only). |
+| `<catalog>.<schema>.<table>` | Unified view — canonical name consumers should use after cutover. |
+
+**Prerequisites**
+
+1. Run `migrate_uc` (Step 4) first — the destination schemas that the LFC
+   pipelines write into must already exist on the target.
+2. Run `migrate_governance` (Step 6) first if any LFC destination tables carry
+   RLS / column masks — governance is applied before the view is created.
+3. Create the UC connection on the target workspace before running this job.
+   The tool does **not** create connections automatically; set
+   `lfc_target_connection_name` in `config.yaml` to the name of the
+   pre-existing target connection.
+
+**`config.yaml` field**
+
+```yaml
+# Name of the pre-existing UC connection on the target workspace that
+# the recreated LFC pipelines will use.
+lfc_target_connection_name: "my_sqlserver_connection"
+```
+
+```bash
+databricks jobs run-now --job-id <migrate_lfc_job_id> --profile target-workspace
+```
+
+Monitor progress in `migration_status`:
+
+```sql
+SELECT object_type, object_name, status, error_message
+FROM migration_tracking.cp_migration.migration_status
+WHERE object_type IN ('lfc_table', 'lfc_pipeline', 'lfc_view')
+ORDER BY object_type, status, object_name;
+```
+
+**Status values**
+
+| `object_type` | Status | Meaning |
+|---|---|---|
+| `lfc_table` | `validated` | `_history` clone completed and verified. |
+| `lfc_pipeline` | `lfc_pipeline_created_incremental` | New pipeline created on target with `row_filter` cursor boundary. |
+| `lfc_pipeline` | `skipped_target_pipeline_exists` | A pipeline for this table already exists on the target (idempotent re-run). |
+| `lfc_view` | `lfc_view_created` | Unified view created at the canonical table name. |
+
+**Known limitations / caveats**
+
+- **Post-cutover source deletes are not propagated.** Lakeflow Connect
+  `row_filter` is a push-down filter for new rows — it has no mechanism to
+  propagate `DELETE` operations that occur on the source after the cursor
+  boundary. The SCD1 unified view may therefore show ghost rows for
+  post-cutover source deletes until a manual reconcile is performed.
+
+- **SCD1 dedup by primary key, SCD2/append by UNION ALL.** The unified view
+  for SCD1 tables uses a primary-key dedup merge (latest cursor value wins);
+  this means if the same PK appears in both `_history` and `_incr` the
+  `_incr` row is preferred. SCD2 and append-mode tables use a simple
+  `UNION ALL`, preserving all versions.
+
+- **Batch / formula tables full-load on the recreated pipeline.** Tables that
+  have no usable cursor column (batch-mode or formula-column tables) cannot
+  use the `row_filter` boundary. The recreated target pipeline will perform a
+  full load on its first run. No `_history` clone or unified view is created
+  for these tables.
+
+- **Stage 1 covers query-based connectors only.** CDC / change-data-capture
+  connectors (Salesforce CDC, SQL Server CDC via gateway) and SaaS connectors
+  (GA4, ServiceNow, Workday, etc.) are **not** migrated by this job. They are
+  deferred to later stages. Running `migrate_lfc` against a workspace that
+  contains only CDC or SaaS pipelines will produce no output.
+
+### Step 10 — Verify
 
 Confirm via the dashboard and these checks:
 
@@ -499,9 +682,13 @@ WHERE status NOT IN ('validated', 'skipped_by_config',
                      'skipped_by_pipeline_migration',
                      'skipped_by_stateful_service_migration',
                      'skipped_target_exists',
+                     'skipped_target_pipeline_exists',
                      'skipped_direct_access_unsupported',
                      'skipped_endpoint_not_ready',
+                     'skipped_instance_not_ready',
                      'created_resync_pending',
+                     'lfc_pipeline_created_incremental',
+                     'lfc_view_created',
                      'dry_run')
 GROUP BY object_type, status, error_message
 ORDER BY n DESC;

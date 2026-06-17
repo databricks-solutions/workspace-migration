@@ -108,6 +108,12 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "created_resync_pending",
     # Direct Access VS index — vectors are external app state, can't recreate.
     "skipped_direct_access_unsupported",
+    # Lakeflow Connect (migrate_lfc, Tier 1): pipeline recreated on target with
+    # a per-table cursor row_filter (pulls only post-cutover rows). Terminal so
+    # re-runs don't recreate it.
+    "lfc_pipeline_created_incremental",
+    # Lakeflow Connect: unified view created over <t>_history + <t>_incr.
+    "lfc_view_created",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
@@ -120,6 +126,13 @@ class TrackingManager:
         self.config = config
         self._catalog = config.tracking_catalog
         self._schema = config.tracking_schema
+        # Run-level job run id (review finding #7). Workers set this once in
+        # run() via resolve_current_job_run_id(dbutils); append_migration_status
+        # then stamps it on any status row that left job_run_id None, so
+        # reconciliation's "only reset prior runs" guard can tell a current-run
+        # in_progress row from a genuine prior-run orphan. None when not in a
+        # Jobs context (interactive / pytest) — never invented.
+        self.job_run_id: str | None = None
 
     @property
     def _fqn(self) -> str:
@@ -255,6 +268,19 @@ class TrackingManager:
             WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})
         """)
 
+    def _stamp_job_run_id(self, records: list[dict]) -> list[dict]:
+        """Return copies of ``records`` with ``job_run_id`` filled from the
+        run-level ``self.job_run_id`` wherever it was left None (review
+        finding #7). An explicit per-record value is preserved; if no
+        run-level id is set, None stays None (never invented)."""
+        stamped: list[dict] = []
+        for r in records:
+            rr = dict(r)
+            if rr.get("job_run_id") is None:
+                rr["job_run_id"] = self.job_run_id
+            stamped.append(rr)
+        return stamped
+
     def append_migration_status(self, records: list[dict]) -> None:
         """Append migration status records with a current timestamp."""
         from pyspark.sql.functions import current_timestamp
@@ -273,6 +299,10 @@ class TrackingManager:
                 StructField("duration_seconds", DoubleType(), True),
             ]
         )
+        # Stamp the run-level job_run_id (#7) on the source records BEFORE
+        # field projection — so an explicit value is preserved and a None is
+        # filled, independent of the schema field list.
+        records = self._stamp_job_run_id(records)
         # Only keep known fields; coerce missing to None
         field_names = [f.name for f in schema.fields]
         normalized = [{k: r.get(k) for k in field_names} for r in records]

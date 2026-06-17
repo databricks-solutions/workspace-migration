@@ -36,6 +36,7 @@ import logging
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 SHARE_NAME = "cp_migration_share"
 
@@ -59,6 +60,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
 
     auth = AuthManager(config, dbutils)  # noqa: F841 — kept for symmetry
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     stagings = tracker.get_active_stagings()
     if not stagings:

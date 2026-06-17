@@ -1,0 +1,54 @@
+resources:
+  jobs:
+    online_tables_integration_test:
+      name: "${var.job_prefix}-online-tables-integration-test"
+      description: |
+        Online Tables → Synced Tables integration test: seeds a synthetic
+        online_table discovery row (no real online table required), invokes the
+        migrate_online_tables job to create a real Lakebase synced table on
+        target, then asserts migration_status is created_resync_pending and
+        the synced table exists. skipped_instance_not_ready is treated as a
+        non-failure (Lakebase may not be available in the test workspace).
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/setup_test_config.py
+            # OT integration test: no Iceberg DDL replay, no RLS/CM staging,
+            # no Hive DBFS-root migration. catalog_filter scopes the synthetic
+            # discovery row to the OT fixture catalog.
+            base_parameters:
+              iceberg_strategy: ""
+              rls_cm_strategy: ""
+              migrate_hive_dbfs_root: "false"
+              hive_dbfs_target_path: ""
+              catalog_filter: "integration_test_src"
+
+        - task_key: seed_online_tables
+          depends_on:
+            - task_key: setup_test_config
+          notebook_task:
+            notebook_path: ../../tests/integration/seed_online_tables_test_data.py
+
+        - task_key: migrate_online_tables
+          depends_on:
+            - task_key: seed_online_tables
+          run_job_task:
+            job_id: ${resources.jobs.migrate_online_tables.id}
+
+        - task_key: test_online_tables
+          depends_on:
+            - task_key: migrate_online_tables
+          notebook_task:
+            notebook_path: ../../tests/integration/test_online_tables.py
+
+        - task_key: teardown_online_tables
+          depends_on:
+            - task_key: setup_test_config
+            - task_key: seed_online_tables
+            - task_key: migrate_online_tables
+            - task_key: test_online_tables
+          run_if: ALL_DONE
+          notebook_task:
+            notebook_path: ../../tests/integration/teardown_online_tables.py

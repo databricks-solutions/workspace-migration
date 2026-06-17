@@ -165,6 +165,16 @@ def _run_cleanup(
             object_name,
         )
         return None
+    # dry_run must NOT mutate the target (review finding #9). The cleanup
+    # hooks delete volumes / drop models — gate them on dry_run so a dry-run
+    # reconcile reports intent without destroying target objects.
+    if getattr(config, "dry_run", False):
+        logger.info(
+            "[DRY RUN] Would run cleanup hook for %s %r; skipping (dry_run).",
+            object_type,
+            object_name,
+        )
+        return None
     try:
         hook(object_name, auth=auth, spark=spark, config=config)
         logger.info("Cleanup hook %s succeeded for %s", object_type, object_name)

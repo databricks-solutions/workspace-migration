@@ -24,10 +24,7 @@ logger = logging.getLogger(__name__)
 def _split_fqn(fqn: str) -> tuple[str, str, str]:
     """Split a backtick or unquoted three-part FQN into (catalog, schema, name)."""
     clean = fqn.strip("`")
-    if "`.`" in clean:
-        parts = clean.split("`.`")
-    else:
-        parts = clean.split(".")
+    parts = clean.split("`.`") if "`.`" in clean else clean.split(".")
     if len(parts) != 3:
         raise ValueError(f"Malformed FQN {fqn!r}: expected three parts")
     return parts[0], parts[1], parts[2]

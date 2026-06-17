@@ -40,6 +40,7 @@ def apply_integration_overrides(
     hive_dbfs_target_path: str,
     batch_size_raw: str,
     catalog_filter_raw: str,
+    lfc_target_connection_name_raw: str = "",
     inject_bad_spn_id: bool = False,
     inject_unreachable_target: bool = False,
 ) -> dict[str, Any]:
@@ -69,6 +70,8 @@ def apply_integration_overrides(
         cfg["catalog_filter"] = [
             x.strip() for x in catalog_filter_raw.split(",") if x.strip()
         ]
+    if lfc_target_connection_name_raw:
+        cfg["lfc_target_connection_name"] = lfc_target_connection_name_raw
 
     # --- Negative-path injections (integration X.3) ---
     # Applied AFTER the scope overrides so we are corrupting the

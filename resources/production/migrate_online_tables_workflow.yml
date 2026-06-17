@@ -1,0 +1,49 @@
+resources:
+  jobs:
+    migrate_online_tables:
+      name: "${var.job_prefix}-migrate-online-tables"
+      description: |
+        Online Table migration: discovers all legacy online tables registered
+        in discovery_inventory and converts each into a Lakebase synced table
+        on the target workspace (legacy online tables are deprecated and
+        uncreatable; Lakebase synced tables are the Databricks-recommended
+        replacement). Ensures a Lakebase database instance exists on target
+        (creates it if missing) then creates each synced table to re-sync from
+        its source Delta table. Trust-the-operator: source Delta tables must
+        already exist on target (run migrate_uc first). pre_check_online_tables
+        validates that each online table's source Delta table exists on target.
+        Standalone-runnable for online table conversion.
+      run_as:
+        service_principal_name: ${var.migration_spn_id}
+      tasks:
+        - task_key: pre_check_online_tables
+          notebook_task:
+            notebook_path: ../../src/pre_check/pre_check_online_tables.py
+
+        # The orchestrator publishes per-object-type lists via taskValues
+        # that the online tables worker consumes. Workers look for these
+        # under taskKey="orchestrator", so the orchestrator task must run
+        # inside the same job.
+        - task_key: orchestrator
+          depends_on:
+            - task_key: pre_check_online_tables
+          notebook_task:
+            notebook_path: ../../src/migrate/orchestrator.py
+
+        - task_key: migrate_online_tables
+          depends_on:
+            - task_key: orchestrator
+          notebook_task:
+            notebook_path: ../../src/migrate/online_tables_worker.py
+
+        - task_key: summary_online_tables
+          run_if: ALL_DONE
+          depends_on:
+            - task_key: migrate_online_tables
+          notebook_task:
+            notebook_path: ../../src/migrate/summary.py
+            base_parameters:
+              # WS-2: Per-workflow filter — only online table object types.
+              # Values match what the online tables worker emits into
+              # migration_status.
+              object_types: "online_table"

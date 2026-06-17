@@ -92,6 +92,44 @@ class TestTrackingManager:
             "migration_tracking.cp_migration.migration_status"
         )
 
+    def test_stamp_job_run_id_fills_none_and_preserves_explicit(self, mock_spark, mock_config):
+        """Review finding #7: workers stamp job_run_id=None on in_progress rows,
+        which defeats reconciliation's 'only reset prior runs' guard. The
+        tracker fills a run-level job_run_id on any row that left it None, while
+        preserving an explicitly-set value. (Tested on the pure helper because
+        the unit env stubs pyspark schema types, collapsing field projection.)"""
+        mgr = TrackingManager(mock_spark, mock_config)
+        mgr.job_run_id = "run-99"
+
+        out = mgr._stamp_job_run_id([
+            {"object_name": "c.s.a", "object_type": "managed_table",
+             "status": "in_progress", "job_run_id": None},
+            {"object_name": "c.s.b", "object_type": "managed_table",
+             "status": "validated", "job_run_id": "explicit-run"},
+        ])
+        by_name = {r["object_name"]: r for r in out}
+        assert by_name["c.s.a"]["job_run_id"] == "run-99"  # filled
+        assert by_name["c.s.b"]["job_run_id"] == "explicit-run"  # preserved
+
+    def test_stamp_job_run_id_none_when_unset(self, mock_spark, mock_config):
+        """If no run-level job_run_id is set (e.g. interactive / pytest), a
+        None stays None — never invents an id."""
+        mgr = TrackingManager(mock_spark, mock_config)
+        out = mgr._stamp_job_run_id(
+            [{"object_name": "c.s.a", "object_type": "managed_table",
+              "status": "in_progress", "job_run_id": None}]
+        )
+        assert out[0]["job_run_id"] is None
+
+    def test_stamp_job_run_id_does_not_mutate_input(self, mock_spark, mock_config):
+        """The helper returns copies — the caller's records are untouched."""
+        mgr = TrackingManager(mock_spark, mock_config)
+        mgr.job_run_id = "run-99"
+        original = {"object_name": "c.s.a", "object_type": "managed_table",
+                    "status": "in_progress", "job_run_id": None}
+        mgr._stamp_job_run_id([original])
+        assert original["job_run_id"] is None
+
     def test_get_pending_objects_filters_completed(self, mock_spark, mock_config):
         mgr = TrackingManager(mock_spark, mock_config)
 
@@ -125,7 +163,8 @@ class TestTrackingManager:
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
             "'failed_batch_oversize', 'created_resync_pending', "
-            "'skipped_direct_access_unsupported')"
+            "'skipped_direct_access_unsupported', "
+            "'lfc_pipeline_created_incremental', 'lfc_view_created')"
             in sql_arg
         )
         # object_type is passed via args= (parameterized), not interpolated
@@ -271,7 +310,8 @@ class TestTrackingManager:
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
             "'failed_batch_oversize', 'created_resync_pending', "
-            "'skipped_direct_access_unsupported')"
+            "'skipped_direct_access_unsupported', "
+            "'lfc_pipeline_created_incremental', 'lfc_view_created')"
             in sql
         )
         # Guard against regression to the old LIKE filter that swept up

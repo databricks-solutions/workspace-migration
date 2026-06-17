@@ -24,10 +24,30 @@ except NameError:
 from common.auth import AuthManager  # noqa: E402
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
+from migrate.hive_common import configure_adls_account_key
 
 config = MigrationConfig.from_workspace_file()
 
+
+
+
 # COMMAND ----------
+
+# Clean any stale fixtures from a prior interrupted run. DBFS-root managed-table
+# files can be orphaned when a run is cancelled: teardown_hive runs on serverless
+# and can't always delete DBFS-root managed-table data, so a later
+# CREATE TABLE fails with "location is not empty and also not a Delta table".
+# This seed runs on a classic cluster (hive_adls_classic) that CAN delete those
+# files, so drop the database CASCADE here (clears managed locations) and rm the
+# warehouse dir for good measure before re-creating the fixtures.
+import contextlib  # noqa: E402
+
+spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive CASCADE")  # noqa: F821
+# The managed-non-DBFS db lives on ADLS; drop it too (this classic cluster can
+# reach the abfss data to clean it).
+spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive_nd CASCADE")  # noqa: F821
+with contextlib.suppress(Exception):
+    dbutils.fs.rm("dbfs:/user/hive/warehouse/integration_test_hive.db", True)  # type: ignore[name-defined]  # noqa: F821
 
 spark.sql("CREATE DATABASE IF NOT EXISTS hive_metastore.integration_test_hive")  # noqa: F821
 
@@ -80,15 +100,24 @@ spark.sql(  # noqa: F821
 # The ADLS path reuses the external location used by DBFS-root
 # migration, gated on the same config fields.
 
+_ND_DB = "integration_test_hive_nd"  # dedicated db with a non-DBFS LOCATION
 _hive_external_location: str | None = None
-_hive_nondbfs_location: str | None = None
+_hive_nondbfs_db_location: str | None = None
 if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path:
     _base = config.hive_dbfs_target_path.rstrip("/")
     _hive_external_location = f"{_base}/hive_external_invoices"
-    _hive_nondbfs_location = f"{_base}/hive_nondbfs_sales"
+    _hive_nondbfs_db_location = f"{_base}/hive_nondbfs_db"
 
 _has_hive_external = False
 _has_hive_nondbfs = False
+
+# hive_metastore tables at an abfss LOCATION need the legacy account-key Hadoop
+# conf (UC vending doesn't cover hive_metastore LOCATION). Set it at runtime
+# from secret migration/adls-account-key — only works on classic compute (this
+# task runs on the hive_adls_classic cluster); no-op/warns on serverless, in
+# which case the CREATEs below fail and has_*=false (guard exempts with reason).
+if _hive_external_location:
+    configure_adls_account_key(spark, dbutils, _hive_external_location)  # noqa: F821
 
 if _hive_external_location:
     try:
@@ -116,33 +145,38 @@ if _hive_external_location:
     except Exception as _exc:  # noqa: BLE001
         print(f"Skipped Hive external seed: {_exc}")
 
-if _hive_nondbfs_location:
+if _hive_nondbfs_db_location:
     try:
-        # MANAGED non-DBFS — in hive_metastore, a managed table with an
-        # explicit LOCATION off DBFS root. Covers the hive_managed_nondbfs
-        # worker's path (legacy mount / non-default cluster config).
+        # MANAGED non-DBFS: a managed table whose storage is off the DBFS root.
+        # In hive_metastore, CREATE TABLE ... LOCATION makes an EXTERNAL table —
+        # so the only way to get a MANAGED table at a non-default location is to
+        # give the *database* a non-DBFS LOCATION, then create a managed table
+        # (no LOCATION) that inherits it. categorize_hive_table then classifies
+        # it as hive_managed_nondbfs (MANAGED + abfss location), not external.
+        spark.sql(  # noqa: F821
+            f"CREATE DATABASE IF NOT EXISTS hive_metastore.{_ND_DB} LOCATION '{_hive_nondbfs_db_location}'"
+        )
         spark.sql(  # noqa: F821
             f"""
-            CREATE TABLE IF NOT EXISTS hive_metastore.integration_test_hive.nondbfs_sales (
+            CREATE TABLE IF NOT EXISTS hive_metastore.{_ND_DB}.nondbfs_sales (
                 sale_id INT,
                 amount DOUBLE
             )
             USING DELTA
-            LOCATION '{_hive_nondbfs_location}'
             """
         )
         spark.sql(  # noqa: F821
-            """
-            INSERT OVERWRITE TABLE hive_metastore.integration_test_hive.nondbfs_sales VALUES
+            f"""
+            INSERT OVERWRITE TABLE hive_metastore.{_ND_DB}.nondbfs_sales VALUES
                 (201, 50.0),
                 (202, 75.0),
                 (203, 90.0)
             """
         )
         _has_hive_nondbfs = True
-        print(f"Created Hive managed non-DBFS table at {_hive_nondbfs_location}.")
+        print(f"Created Hive MANAGED non-DBFS table hive_metastore.{_ND_DB}.nondbfs_sales (db LOCATION {_hive_nondbfs_db_location}).")
     except Exception as _exc:  # noqa: BLE001
-        print(f"Skipped Hive managed-nondbfs seed: {_exc}")
+        print(f"!! Skipped Hive managed-nondbfs seed: {_exc}")
 
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_hive_external", value="true" if _has_hive_external else "false"
@@ -247,77 +281,6 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_multi_upstream_view", value="true" if _has_multi_upstream_view else "false"
 )
 
-# COMMAND ----------
-# --- 2.11 cross-catalog view (references a UC catalog, not hive_metastore) ---
-# Seeds a parallel UC catalog on BOTH source and target so the Hive view's
-# non-hive reference resolves on both sides. rewrite_hive_namespace only
-# rewrites ``hive_metastore.`` prefixes — a ``<other_catalog>.`` reference
-# must pass through verbatim.
-
-_HIVE_UCREF_CATALOG = "integration_test_hive_ucref"
-_HIVE_UCREF_SCHEMA = "ucref_schema"
-_HIVE_UCREF_TABLE = "uc_dim_products"
-_HIVE_UCREF_FQN = f"{_HIVE_UCREF_CATALOG}.{_HIVE_UCREF_SCHEMA}.{_HIVE_UCREF_TABLE}"
-
-_has_cross_catalog_view = False
-if config.spn_client_id:
-    try:
-        auth_ucref = AuthManager(config, dbutils)  # noqa: F821
-        wh_ucref = find_warehouse(auth_ucref)
-
-        # Create UC ref catalog/schema/table on BOTH source and target.
-        # Source: via spark SQL (same metastore).
-        spark.sql(f"CREATE CATALOG IF NOT EXISTS `{_HIVE_UCREF_CATALOG}`")  # noqa: F821
-        spark.sql(  # noqa: F821
-            f"CREATE SCHEMA IF NOT EXISTS `{_HIVE_UCREF_CATALOG}`.`{_HIVE_UCREF_SCHEMA}`"
-        )
-        spark.sql(  # noqa: F821
-            f"""
-            CREATE TABLE IF NOT EXISTS {_HIVE_UCREF_FQN} (
-                id INT,
-                category STRING
-            ) USING DELTA
-            """
-        )
-        spark.sql(  # noqa: F821
-            f"""
-            INSERT OVERWRITE TABLE {_HIVE_UCREF_FQN} VALUES
-                (1, 'alpha'), (2, 'beta'), (3, 'gamma')
-            """
-        )
-
-        # Target: via SQL warehouse. Rows aren't required for view resolution;
-        # only the table shape matters for the view's CREATE to succeed.
-        for _s in (
-            f"CREATE CATALOG IF NOT EXISTS `{_HIVE_UCREF_CATALOG}`",
-            f"CREATE SCHEMA IF NOT EXISTS `{_HIVE_UCREF_CATALOG}`.`{_HIVE_UCREF_SCHEMA}`",
-            f"CREATE TABLE IF NOT EXISTS {_HIVE_UCREF_FQN} (id INT, category STRING) USING DELTA",
-            f"GRANT USE CATALOG ON CATALOG `{_HIVE_UCREF_CATALOG}` TO `{config.spn_client_id}`",
-            f"GRANT USE SCHEMA ON SCHEMA `{_HIVE_UCREF_CATALOG}`.`{_HIVE_UCREF_SCHEMA}` TO `{config.spn_client_id}`",
-            f"GRANT SELECT ON TABLE {_HIVE_UCREF_FQN} TO `{config.spn_client_id}`",
-        ):
-            _r = execute_and_poll(auth_ucref, wh_ucref, _s)
-            if _r["state"] != "SUCCEEDED":
-                raise RuntimeError(f"Target UC ref setup failed on '{_s[:60]}...': {_r.get('error')}")
-
-        # Source-side grant so the view body can resolve SELECT during DESCRIBE.
-        spark.sql(f"GRANT SELECT ON TABLE {_HIVE_UCREF_FQN} TO `{config.spn_client_id}`")  # noqa: F821
-
-        spark.sql(  # noqa: F821
-            f"""
-            CREATE OR REPLACE VIEW hive_metastore.integration_test_hive.mixed_ref_view AS
-            SELECT o.order_id, o.amount, u.category
-            FROM hive_metastore.integration_test_hive.managed_orders o
-            JOIN {_HIVE_UCREF_FQN} u ON o.order_id = u.id
-            """
-        )
-        _has_cross_catalog_view = True
-        print(f"2.11 seeded: mixed_ref_view referencing {_HIVE_UCREF_FQN} (cross-catalog).")
-    except Exception as _exc:  # noqa: BLE001
-        print(f"2.11 skipped: {_exc}")
-dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
-    key="has_cross_catalog_view", value="true" if _has_cross_catalog_view else "false"
-)
 
 # COMMAND ----------
 # --- 2.12 DBFS-root managed table with nested partition directories ---

@@ -18,6 +18,13 @@ except NameError:
 # Hive teardown: drop the source Hive database and the UC-target upgrade catalog.
 
 spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive CASCADE")  # noqa: F821
+# The managed-non-DBFS db is on ADLS — this teardown runs on serverless and may
+# not be able to delete the abfss data, so best-effort (seed_hive self-cleans it
+# on the classic cluster at the start of each run regardless).
+try:
+    spark.sql("DROP DATABASE IF EXISTS hive_metastore.integration_test_hive_nd CASCADE")  # noqa: F821
+except Exception as _nd_exc:  # noqa: BLE001
+    print(f"nd db drop skipped (expected on serverless — seed self-cleans): {_nd_exc}")
 
 from common.auth import AuthManager  # noqa: E402
 from common.config import MigrationConfig

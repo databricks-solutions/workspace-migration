@@ -22,7 +22,11 @@ from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
-from pre_check.collision_detection import build_skip_status_rows, detect_collisions
+from pre_check.collision_detection import (
+    build_skip_status_rows,
+    detect_collisions,
+    unprobed_types_present,
+)
 
 # COMMAND ----------
 
@@ -519,6 +523,27 @@ def run(dbutils, spark):  # noqa: D103
                 f"Target has no pre-existing object among {len(discovery_dicts)} discovered source objects.",
             )
         else:
+            # Fail CLOSED (review finding #10): records the probe couldn't
+            # verify (PermissionDenied / transient) are surfaced as a FAIL
+            # regardless of policy — we must never proceed against a target we
+            # couldn't confirm is clear, and must never silently skip it.
+            check_failures = [c for c in collisions if c.get("check_failed")]
+            collisions = [c for c in collisions if not c.get("check_failed")]
+            if check_failures:
+                cf_sample = [
+                    f"{c['object_type']} {c['target_fqn']}: {c.get('error', 'unknown error')}"
+                    for c in check_failures[:5]
+                ]
+                _add(
+                    "check_target_collisions",
+                    "FAIL",
+                    f"{len(check_failures)} target object(s) could not be collision-checked "
+                    f"(probe errored — failing closed). Sample: {cf_sample}",
+                    "The migration SPN likely lacks read access on the target, or a "
+                    "transient error occurred. Grant the SPN read on the target objects "
+                    "and re-run pre-check; do NOT migrate until collision detection completes.",
+                )
+        if collisions:
             policy = (config.on_target_collision or "fail").lower()
             grouped: dict[str, list[str]] = {}
             for c in collisions:
@@ -546,6 +571,19 @@ def run(dbutils, spark):  # noqa: D103
                     "Rename, drop, or move the colliding target object(s); or set "
                     "on_target_collision=skip to proceed without overwriting them.",
                 )
+        # Surface coverage (review finding #6): name the in-scope object types
+        # that were NOT collision-checked, so a clean result isn't misread as
+        # "everything is safe".
+        unprobed = unprobed_types_present(discovery_dicts)
+        if unprobed:
+            _add(
+                "check_collision_coverage",
+                "PASS",
+                f"NOT collision-checked: {', '.join(unprobed)}. These target object "
+                "types were not probed for pre-existence (see collision_detection "
+                "._NOT_PROBED_TYPES for the rationale per type); verify manually if "
+                "reusing a populated target.",
+            )
     except Exception as e:  # noqa: BLE001 — discovery_inventory absent / transient
         # discovery_inventory / migration_status may not exist yet on a
         # first-ever pre_check run. init_tracking_tables above created

@@ -31,6 +31,7 @@ import time
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("connections_worker")
@@ -85,11 +86,48 @@ def apply_connection(conn: dict, *, auth: AuthManager, dry_run: bool) -> dict:
             "duration_seconds": time.time() - start,
         }
 
-    # Best-effort ConnectionType coercion; fall back to raw string.
+    # Coerce to a ConnectionType enum. raw_type may be "SQLSERVER",
+    # "sqlserver", or the enum repr "ConnectionType.SQLSERVER" (discovery
+    # stores str(connection_type)). The SDK's connections.create() calls
+    # .value on connection_type, so a passed-through string raises
+    # "'str' object has no attribute 'value'" — NEVER fall back to a string.
+    _type_str = str(raw_type).split(".")[-1].upper()
     try:
-        conn_type_enum = ConnectionType(raw_type.upper())  # type: ignore[arg-type]
-    except Exception:  # noqa: BLE001
-        conn_type_enum = raw_type  # SDK accepts strings too on newer versions
+        conn_type_enum = ConnectionType(_type_str)
+    except ValueError:
+        try:
+            conn_type_enum = ConnectionType[_type_str]
+        except KeyError:
+            return {
+                "object_name": obj_key,
+                "object_type": "connection",
+                "status": "failed",
+                "error_message": (
+                    f"Unsupported connection_type {raw_type!r} (normalized to {_type_str!r}); "
+                    f"not a known ConnectionType."
+                ),
+                "duration_seconds": time.time() - start,
+            }
+
+    # Idempotency / credential-gap pre-check. UC's GET never returns secret
+    # options (e.g. user+password for SQLSERVER), so the worker cannot
+    # recreate such a connection from the discovered options alone. If the
+    # connection already exists on target — the operator recreated it with
+    # credentials per the migration runbook, or a prior run made it — treat
+    # as validated WITHOUT attempting create. Fail-closed: only short-circuit
+    # on a definite hit (mirrors managed_table's _target_table_exists).
+    try:
+        existing = auth.target_client.connections.get(name=name)
+    except Exception:  # noqa: BLE001 — NotFound / not checkable → proceed to create
+        existing = None
+    if existing is not None:
+        return {
+            "object_name": obj_key,
+            "object_type": "connection",
+            "status": "validated",
+            "error_message": "already existed on target",
+            "duration_seconds": time.time() - start,
+        }
 
     try:
         auth.target_client.connections.create(
@@ -100,6 +138,21 @@ def apply_connection(conn: dict, *, auth: AuthManager, dry_run: bool) -> dict:
         )
     except Exception as exc:  # noqa: BLE001
         err_text = str(exc).lower()
+        if "must include" in err_text and "option" in err_text:
+            # Mandatory credential options (user/password) are not exportable
+            # from source — this is the known secret limitation, not an
+            # unexpected error. Surface validation_failed (manual recreation
+            # with credentials required), never a hard failure.
+            return {
+                "object_name": obj_key,
+                "object_type": "connection",
+                "status": "validation_failed",
+                "error_message": (
+                    f"Connection requires credentials not exportable from source "
+                    f"({exc}). Recreate on target with credentials."
+                ),
+                "duration_seconds": time.time() - start,
+            }
         if not ("already" in err_text and "exists" in err_text):
             return {
                 "object_name": obj_key,
@@ -131,6 +184,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     rows_json = dbutils.jobs.taskValues.get(taskKey="orchestrator", key="connection_list")
     rows: list[dict] = json.loads(rows_json)

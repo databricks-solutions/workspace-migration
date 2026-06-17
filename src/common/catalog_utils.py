@@ -581,13 +581,14 @@ class CatalogExplorer:
         seen: set[str] = set()
         for sec_type, full_name in securables:
             try:
+                # ABAC policies are addressed by PATH params, not query params:
+                # GET /api/2.1/unity-catalog/policies/{securable_type}/{fullname}.
+                # The query-param form returns "No API found" — that 404 was
+                # being swallowed here, which is why policies never appeared in
+                # discovery (root cause of the always-NONE policy coverage).
                 resp = client.do(
                     "GET",
-                    "/api/2.1/unity-catalog/policies",
-                    query={
-                        "on_securable_type": sec_type,
-                        "on_securable_fullname": full_name,
-                    },
+                    f"/api/2.1/unity-catalog/policies/{sec_type}/{full_name}",
                 )
             except Exception:  # noqa: BLE001 — preview absent, perms, etc.
                 continue
@@ -682,10 +683,14 @@ class CatalogExplorer:
         try:
             client = self.auth_manager.source_client  # type: ignore[attr-defined]
             for c in client.connections.list():
+                _ct = getattr(c, "connection_type", "")
+                # Store the clean value ("SQLSERVER"), not the enum repr
+                # ("ConnectionType.SQLSERVER") — the latter breaks the worker's
+                # ConnectionType coercion. ``.value`` for an enum, else str.
                 results.append(
                     {
                         "connection_name": c.name,
-                        "connection_type": str(getattr(c, "connection_type", "")),
+                        "connection_type": getattr(_ct, "value", str(_ct)),
                         "options": dict(getattr(c, "options", {}) or {}),
                         "comment": getattr(c, "comment", None),
                     }
@@ -773,7 +778,14 @@ class CatalogExplorer:
         results: list[dict] = []
         try:
             client = self.auth_manager.source_client  # type: ignore[attr-defined]
-            for s in client.shares.list():  # type: ignore[attr-defined]
+            # SDK compat: SharesAPI.list() was renamed to list_shares() in
+            # newer databricks-sdk (the pin is >=0.30, unbounded). Calling the
+            # missing name raises AttributeError, which the outer except below
+            # swallowed → shares ALWAYS came back empty (recipients use the
+            # still-present .list(), which is why recipient migrated but share
+            # never did). Prefer the new name, fall back to the old.
+            _share_lister = getattr(client.shares, "list_shares", None) or client.shares.list
+            for s in _share_lister():  # type: ignore[attr-defined]
                 if s.name in exclude_names:
                     continue
                 objects = []
@@ -1049,19 +1061,33 @@ class CatalogExplorer:
     def list_hive_functions(self, database: str) -> list[str]:
         """Return user-defined functions in a Hive database (fully-qualified)."""
         try:
+            # SHOW USER FUNCTIONS IN <cat>.<db> requires the CURRENT CATALOG to
+            # be <cat> on current runtimes ("target schema is not in the current
+            # catalog"), unlike SHOW TABLES. Set the catalog on the (persistent)
+            # session first, then query with the bare db name. Without this the
+            # call errored and was swallowed → hive functions were never found.
+            self.spark.sql(f"USE CATALOG `{HIVE_CATALOG}`")  # type: ignore[attr-defined]
             rows = self.spark.sql(  # type: ignore[attr-defined]
-                f"SHOW USER FUNCTIONS IN `{HIVE_CATALOG}`.`{database}`"
+                f"SHOW USER FUNCTIONS IN `{database}`"
             ).collect()
         except Exception:  # noqa: BLE001
             return []
         out = []
+        db_lower = database.lower()
         for row in rows:
             # `function` column name varies by DBR version — probe common ones.
             name = getattr(row, "function", None) or getattr(row, "name", None)
             if not name:
                 continue
-            # Skip built-ins that leak into SHOW USER FUNCTIONS on some versions.
-            if "." not in name:
+            # SHOW USER FUNCTIONS IN <db> is scoped to user functions in that
+            # database (built-ins are global, not in a named db, so they don't
+            # appear here). Names come back qualified (cat.db.fn / db.fn) OR bare
+            # (fn) depending on DBR — keep bare names (they're user funcs in the
+            # scoped db) and qualified names that belong to THIS db; drop names
+            # qualified to a different db. (The old "skip if no dot" rule wrongly
+            # dropped bare user functions — that's why hive_function was empty.)
+            parts = name.split(".")
+            if len(parts) >= 2 and parts[-2].lower() != db_lower:
                 continue
-            out.append(f"`{HIVE_CATALOG}`.`{database}`.`{name.split('.')[-1]}`")
+            out.append(f"`{HIVE_CATALOG}`.`{database}`.`{parts[-1]}`")
         return out

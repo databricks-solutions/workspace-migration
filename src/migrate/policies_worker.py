@@ -30,6 +30,7 @@ import time
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("policies_worker")
@@ -58,11 +59,19 @@ def apply_policy(definition: dict, *, auth: AuthManager, dry_run: bool) -> dict:
             "duration_seconds": time.time() - start,
         }
 
+    # Strip server-generated read-only fields — the GET response carries them
+    # but POST /policies rejects/ignores them. Keep the policy spec
+    # (name, on_securable_*, to_principals, policy_type, row_filter/
+    # column_mask, for_securable_type, comment, when_condition, match_columns,
+    # use_session_identity, except_principals).
+    _readonly = {"id", "created_at", "created_by", "updated_at", "updated_by"}
+    body = {k: v for k, v in definition.items() if k not in _readonly}
+
     try:
         auth.target_client.api_client.do(
             "POST",
             "/api/2.1/unity-catalog/policies",
-            body=definition,
+            body=body,
         )
         return {
             "object_name": obj_key,
@@ -96,6 +105,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     rows_json = dbutils.jobs.taskValues.get(taskKey="orchestrator", key="policy_list")
     rows: list[dict] = json.loads(rows_json)

@@ -158,9 +158,9 @@ class TestListPolicies:
         auth = MagicMock()
 
         def do(method, path, query=None):
-            q = query or {}
-            sec = q.get("on_securable_fullname")
-            typ = q.get("on_securable_type")
+            # ABAC policies are addressed by PATH params:
+            # GET /api/2.1/unity-catalog/policies/{type}/{fullname}
+            typ, _, sec = path.split("/policies/", 1)[1].partition("/")
             if typ == "TABLE" and sec == "c.s.t":
                 return {
                     "policies": [
@@ -196,8 +196,8 @@ class TestListPolicies:
         auth = MagicMock()
 
         def do(method, path, query=None):
-            q = query or {}
-            if q.get("on_securable_fullname") == "c.s.t":
+            typ, _, sec = path.split("/policies/", 1)[1].partition("/")
+            if sec == "c.s.t":
                 raise Exception("404 Not Found")
             return {
                 "policies": [
@@ -368,17 +368,19 @@ class TestListOnlineTables:
 
 
 class TestListShares:
+    @staticmethod
+    def _share(name):
+        s = MagicMock()
+        s.name = name
+        return s
+
     def test_excludes_migration_share(self):
         auth = MagicMock()
 
-        def _share(name):
-            s = MagicMock()
-            s.name = name
-            return s
-
-        auth.source_client.shares.list.return_value = [
-            _share("cp_migration_share"),
-            _share("customer_share_a"),
+        # Current SDK exposes list_shares() (not list()).
+        auth.source_client.shares.list_shares.return_value = [
+            self._share("cp_migration_share"),
+            self._share("customer_share_a"),
         ]
         full = MagicMock()
         full.objects = []
@@ -389,6 +391,41 @@ class TestListShares:
 
         assert len(shares) == 1
         assert shares[0]["share_name"] == "customer_share_a"
+
+    def test_uses_list_shares_when_present(self):
+        """Live regression: discovery must call list_shares() on the current
+        SDK — the old .list() name is gone (AttributeError was being swallowed,
+        so shares ALWAYS came back empty while recipients worked)."""
+        auth = MagicMock()
+        shares_api = auth.source_client.shares
+        shares_api.list_shares.return_value = [self._share("customer_share_a")]
+        full = MagicMock()
+        full.objects = []
+        shares_api.get.return_value = full
+
+        explorer = _explorer(MagicMock(), auth)
+        result = explorer.list_shares()
+
+        shares_api.list_shares.assert_called_once()
+        assert [s["share_name"] for s in result] == ["customer_share_a"]
+
+    def test_falls_back_to_legacy_list(self):
+        """Older databricks-sdk (>=0.30) still exposes .list() — the shim
+        falls back to it when list_shares is absent."""
+        auth = MagicMock()
+        # Build a shares API object that has .list() but NOT list_shares.
+        shares_api = MagicMock(spec=["list", "get"])
+        shares_api.list.return_value = [self._share("customer_share_a")]
+        full = MagicMock()
+        full.objects = []
+        shares_api.get.return_value = full
+        auth.source_client.shares = shares_api
+
+        explorer = _explorer(MagicMock(), auth)
+        result = explorer.list_shares()
+
+        shares_api.list.assert_called_once()
+        assert [s["share_name"] for s in result] == ["customer_share_a"]
 
 
 class TestListRecipients:

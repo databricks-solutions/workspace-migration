@@ -30,6 +30,7 @@ import time
 from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("monitors_worker")
@@ -61,7 +62,7 @@ def apply_monitor(mon: dict, *, auth: AuthManager, dry_run: bool) -> dict:
             "dashboard_id",
             "drift_metrics_table_name",
             "profile_metrics_table_name",
-            "assets_dir",  # re-created on target
+            "assets_dir",  # source path — replaced with a fresh target path below
         )
     }
 
@@ -69,6 +70,12 @@ def apply_monitor(mon: dict, *, auth: AuthManager, dry_run: bool) -> dict:
     # any literal backtick inside a name (``fqn.replace("`", "")`` would
     # silently collapse ``cat.sch.foo`bar`` -> ``cat.sch.foobar``).
     clean = table_fqn.strip("`").replace("`.`", ".")
+
+    # assets_dir is REQUIRED by the create API ("`assets_dir` is required but
+    # missing"), but the source path is meaningless on target — set a fresh
+    # deterministic workspace path so the monitor's generated assets land in a
+    # predictable place. One dir per table avoids collisions.
+    body["assets_dir"] = f"/Workspace/Shared/cp_migration_monitor_assets/{clean}"
     start = time.time()
     if dry_run:
         logger.info("[DRY RUN] Would POST monitor for %s", table_fqn)
@@ -117,6 +124,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     rows_json = dbutils.jobs.taskValues.get(taskKey="orchestrator", key="monitor_list")
     rows: list[dict] = json.loads(rows_json)

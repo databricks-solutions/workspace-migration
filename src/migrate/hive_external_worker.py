@@ -29,9 +29,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
-from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
-from common.tracking import TrackingManager
-from migrate.hive_common import rewrite_hive_fqn, rewrite_hive_namespace
+from common.sql_utils import (
+    append_migration_status_via_warehouse,
+    execute_and_poll,
+    find_warehouse,
+    rewrite_ddl,
+    warehouse_table_count,
+)
+from migrate.hive_common import configure_adls_account_key, rewrite_hive_fqn, rewrite_hive_namespace
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_external_worker")
@@ -60,29 +66,35 @@ def migrate_hive_external_table(
     *,
     config: MigrationConfig,
     auth: AuthManager,
-    tracker: TrackingManager,
     explorer: CatalogExplorer,
-    target_explorer: CatalogExplorer,
     wh_id: str,
+    tracking_fqn: str,
+    job_run_id: str | None,
+    status_wh_id: str,
 ) -> dict:
-    """Recreate a Hive external table on the target as a UC external table."""
+    """Recreate a Hive external table on the target as a UC external table.
+
+    Runs on NON-UC (No Isolation) compute so it can read the source
+    hive_metastore table on ADLS via the legacy account key (UC clusters ignore
+    fs.azure.account.key). Status writes and the target row-count therefore go
+    through the SQL warehouse (UC-capable), not the worker's spark session.
+    """
     source_fqn = table_info["object_name"]
     target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
 
-    tracker.append_migration_status(
+    append_migration_status_via_warehouse(
+        auth,
+        status_wh_id,
+        tracking_fqn,
         [
             {
                 "object_name": source_fqn,
                 "object_type": "hive_external",
                 "status": "in_progress",
                 "error_message": None,
-                "job_run_id": None,
-                "task_run_id": None,
-                "source_row_count": None,
-                "target_row_count": None,
-                "duration_seconds": None,
             }
-        ]
+        ],
+        job_run_id=job_run_id,
     )
 
     start = time.time()
@@ -131,7 +143,7 @@ def migrate_hive_external_table(
     # Validate row count: source (hive_metastore) vs target (UC)
     try:
         source_count = explorer.get_table_row_count(source_fqn)
-        target_count = target_explorer.get_table_row_count(target_fqn)
+        target_count = warehouse_table_count(auth, wh_id, target_fqn)
         match = source_count == target_count
         status = "validated" if match else "validation_failed"
         return {
@@ -162,11 +174,11 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     spark_session = spark
-    tracker = TrackingManager(spark_session, config)
+    job_run_id = resolve_current_job_run_id(dbutils)
+    tracking_fqn = f"{config.tracking_catalog}.{config.tracking_schema}"
+    # Source reads only — this worker runs on NON-UC compute (account-key ADLS
+    # access). Target reads + status writes go through the warehouse.
     explorer = CatalogExplorer(spark_session, auth)
-
-    # Build a target explorer for validation (shares the same spark session)
-    target_explorer = CatalogExplorer(spark_session, auth)
 
     # Parse batch from for_each_task input widget
     dbutils.widgets.text("batch", "[]")
@@ -174,7 +186,17 @@ def run(dbutils, spark) -> None:
     batch: list[dict] = json.loads(batch_json)
     logger.info("Received batch of %d Hive external tables.", len(batch))
 
+    # hive_metastore EXTERNAL tables on ADLS need the legacy account-key Hadoop
+    # conf (UC vending doesn't cover hive_metastore LOCATION). Set it per source
+    # storage account before reading — only works on classic compute (this task
+    # runs on the hive_adls_classic cluster); no-op/warns on serverless.
+    for _tbl in batch:
+        configure_adls_account_key(spark_session, dbutils, _tbl.get("storage_location"))
+
     wh_id = find_warehouse(auth)
+    # Tracking catalog is on the SOURCE metastore — status writes use a
+    # source warehouse; target table ops use wh_id (target).
+    status_wh_id = find_warehouse(auth, use_source=True)
 
     # Process batch with thread pool
 
@@ -187,10 +209,11 @@ def run(dbutils, spark) -> None:
                 tbl,
                 config=config,
                 auth=auth,
-                tracker=tracker,
                 explorer=explorer,
-                target_explorer=target_explorer,
                 wh_id=wh_id,
+                tracking_fqn=tracking_fqn,
+                job_run_id=job_run_id,
+                status_wh_id=status_wh_id,
             ): tbl
             for tbl in batch
         }
@@ -209,9 +232,9 @@ def run(dbutils, spark) -> None:
             results.append(res)
             logger.info("Table %s -> %s", res["object_name"], res["status"])
 
-    # Record final statuses
+    # Record final statuses (via warehouse — worker runs on NON-UC compute)
 
-    tracker.append_migration_status(results)
+    append_migration_status_via_warehouse(auth, status_wh_id, tracking_fqn, results, job_run_id=job_run_id)
     logger.info(
         "Hive external worker complete. %d succeeded, %d failed.",
         sum(1 for r in results if r["status"] == "validated"),

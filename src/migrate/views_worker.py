@@ -29,6 +29,7 @@ from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("views_worker")
@@ -143,6 +144,7 @@ def run(dbutils, spark) -> None:
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
     explorer = CatalogExplorer(spark_session, auth)
 
     # Parse view list from task values

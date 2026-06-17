@@ -66,7 +66,7 @@ def build_batches(objects: list[dict], batch_size: int) -> tuple[list[str], list
             current = []
             current_bytes = 2
 
-    for obj, original in zip(minimized, objects):
+    for obj, original in zip(minimized, objects, strict=True):
         obj_bytes = len(json.dumps(obj, default=str).encode("utf-8"))
 
         if obj_bytes + 2 > MAX_BATCH_BYTES:

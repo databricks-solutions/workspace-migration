@@ -29,6 +29,7 @@ from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
 from migrate.hive_common import HIVE_TO_UC_PRIVILEGES, rewrite_hive_fqn
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_grants_worker")
@@ -76,6 +77,7 @@ def _emit_grant(
     auth: AuthManager,
     wh_id: str,
     dry_run: bool,
+    transfer_ownership: bool = True,
 ) -> dict:
     """Build and emit a GRANT statement. Returns the migration_status record."""
     # Map Hive action to UC privilege.
@@ -83,18 +85,55 @@ def _emit_grant(
     obj_key = f"GRANT_{action_type}_{securable_keyword}_{target_fqn}_{principal}"
 
     if action_type.upper() == "OWN":
-        logger.info(
-            "Skipping OWN grant for %s on %s %s (ownership transfer not supported).",
-            principal,
-            securable_keyword,
-            target_fqn,
-        )
+        # Transfer ownership to the original owner (review finding #5). The
+        # migration SPN is a workspace admin, so it can ALTER OWNER regardless
+        # of order. Gated on transfer_ownership; fail-loud per row.
+        if not transfer_ownership:
+            logger.info(
+                "transfer_ownership=False: leaving %s %s owned by the migration SPN "
+                "(original owner %s not restored).",
+                securable_keyword, target_fqn, principal,
+            )
+            return {
+                "object_name": obj_key,
+                "object_type": "hive_grant",
+                "status": "skipped",
+                "error_message": "transfer_ownership disabled",
+                "duration_seconds": 0.0,
+            }
+        owner_obj_key = f"OWNER_{securable_keyword}_{target_fqn}_{principal}"
+        owner_sql = f"ALTER {securable_keyword} {target_fqn} OWNER TO `{principal}`"
+        if dry_run:
+            logger.info("[DRY RUN] Would transfer ownership: %s", owner_sql)
+            return {
+                "object_name": owner_obj_key,
+                "object_type": "hive_grant",
+                "status": "skipped",
+                "error_message": "dry_run",
+                "duration_seconds": 0.0,
+            }
+        start = time.time()
+        logger.info("Transferring ownership: %s", owner_sql)
+        result = execute_and_poll(auth, wh_id, owner_sql)
+        duration = time.time() - start
+        if result["state"] == "SUCCEEDED":
+            return {
+                "object_name": owner_obj_key,
+                "object_type": "hive_grant",
+                "status": "validated",
+                "error_message": None,
+                "duration_seconds": duration,
+            }
         return {
-            "object_name": obj_key,
+            "object_name": owner_obj_key,
             "object_type": "hive_grant",
-            "status": "skipped",
-            "error_message": "ownership transfer not supported",
-            "duration_seconds": 0.0,
+            "status": "failed",
+            "error_message": (
+                f"Ownership transfer to '{principal}' failed "
+                f"(does the principal exist on target?): "
+                f"{result.get('error', result['state'])}"
+            ),
+            "duration_seconds": duration,
         }
 
     if uc_priv is None:
@@ -155,14 +194,23 @@ def _process_show_grants_rows(
     auth: AuthManager,
     wh_id: str,
     dry_run: bool,
+    transfer_ownership: bool = True,
 ) -> list[dict]:
-    """Iterate SHOW GRANTS output rows and emit UC grants."""
+    """Iterate SHOW GRANTS output rows and emit UC grants.
+
+    Non-OWN grants are emitted first, then OWN rows (ownership transfer) last,
+    so the migration SPN keeps MANAGE while granting (review finding #5).
+    """
     out: list[dict] = []
+    deferred_own: list[tuple[str, str]] = []
     for row in rows:
         principal = row["Principal"] if "Principal" in row.asDict() else row[0]
         action_type = row["ActionType"] if "ActionType" in row.asDict() else row[1]
         if _skip_principal(principal):
             logger.info("Skipping system principal %s.", principal)
+            continue
+        if action_type.upper() == "OWN":
+            deferred_own.append((action_type, principal))
             continue
         out.append(
             _emit_grant(
@@ -173,6 +221,20 @@ def _process_show_grants_rows(
                 auth=auth,
                 wh_id=wh_id,
                 dry_run=dry_run,
+                transfer_ownership=transfer_ownership,
+            )
+        )
+    for action_type, principal in deferred_own:
+        out.append(
+            _emit_grant(
+                action_type=action_type,
+                securable_keyword=securable_keyword,
+                target_fqn=target_fqn,
+                principal=principal,
+                auth=auth,
+                wh_id=wh_id,
+                dry_run=dry_run,
+                transfer_ownership=transfer_ownership,
             )
         )
     return out
@@ -187,10 +249,12 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
     wh_id = find_warehouse(auth)
 
     target_catalog = config.hive_target_catalog
     dry_run = config.dry_run
+    transfer_ownership = config.transfer_ownership
 
     results: list[dict] = []
 
@@ -207,6 +271,7 @@ def run(dbutils, spark) -> None:
                 auth=auth,
                 wh_id=wh_id,
                 dry_run=dry_run,
+                transfer_ownership=transfer_ownership,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -267,6 +332,7 @@ def run(dbutils, spark) -> None:
                     auth=auth,
                     wh_id=wh_id,
                     dry_run=dry_run,
+                    transfer_ownership=transfer_ownership,
                 )
             )
         except Exception as exc:  # noqa: BLE001

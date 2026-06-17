@@ -200,48 +200,6 @@ return handler(x)
     """
 )
 
-# COMMAND ----------
-
-# --- Phase 2.5.D: SQL-created materialized view ---
-# Wrapped in try/except because MV support requires a compatible DBR.
-_has_mv = False
-try:
-    spark.sql(  # noqa: F821
-        """
-        CREATE OR REPLACE MATERIALIZED VIEW integration_test_src.test_schema.mv_high_value
-        AS SELECT * FROM integration_test_src.test_schema.managed_orders WHERE amount > 100
-        """
-    )
-    _has_mv = True
-    print("Created materialized view mv_high_value.")
-except Exception as _exc:  # noqa: BLE001
-    print(f"Skipped MV seed (unsupported on this runtime): {_exc}")
-
-dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
-    key="has_mv", value="true" if _has_mv else "false"
-)
-
-# COMMAND ----------
-
-# --- Phase 2.5.D: SQL-created streaming table ---
-# Requires a streaming source. Wrapped because not all runtimes support
-# CREATE STREAMING TABLE from a warehouse / notebook context.
-_has_st = False
-try:
-    spark.sql(  # noqa: F821
-        """
-        CREATE OR REPLACE STREAMING TABLE integration_test_src.test_schema.st_orders
-        AS SELECT * FROM STREAM(integration_test_src.test_schema.managed_orders)
-        """
-    )
-    _has_st = True
-    print("Created streaming table st_orders.")
-except Exception as _exc:  # noqa: BLE001
-    print(f"Skipped ST seed (unsupported on this runtime): {_exc}")
-
-dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
-    key="has_st", value="true" if _has_st else "false"
-)
 
 # COMMAND ----------
 
@@ -779,18 +737,24 @@ try:
     # can't see the share, the 3.24 hard assertion in
     # ``test_uc_end_to_end.py`` fails loud with a clear message.
     if config.spn_client_id:
-        with contextlib.suppress(Exception):
+        # NOTE: do NOT suppress these — a swallowed failure here is exactly
+        # how the share silently vanishes from discovery (recipient lands
+        # green, share goes missing). Surface the error to the run log so
+        # the cause is visible instead of guessed.
+        try:
             spark.sql(  # noqa: F821
                 f"ALTER SHARE `{_CUSTOMER_SHARE}` OWNER TO `{config.spn_client_id}`"
             )
-        with contextlib.suppress(Exception):
+            print(f"Share '{_CUSTOMER_SHARE}' OWNER TO {config.spn_client_id} OK.")
+        except Exception as _own_exc:  # noqa: BLE001
+            print(f"!! Share OWNER TO FAILED: {_own_exc}")
+        try:
             spark.sql(  # noqa: F821
                 f"ALTER RECIPIENT `{_CUSTOMER_RECIPIENT}` OWNER TO `{config.spn_client_id}`"
             )
-        print(
-            f"Transferred ownership of share '{_CUSTOMER_SHARE}' + recipient "
-            f"'{_CUSTOMER_RECIPIENT}' to SPN {config.spn_client_id}."
-        )
+            print(f"Recipient '{_CUSTOMER_RECIPIENT}' OWNER TO {config.spn_client_id} OK.")
+        except Exception as _own_exc:  # noqa: BLE001
+            print(f"!! Recipient OWNER TO FAILED: {_own_exc}")
     _has_customer_share = True
     print(f"Created customer share '{_CUSTOMER_SHARE}' with recipient '{_CUSTOMER_RECIPIENT}'.")
 except Exception as _exc:  # noqa: BLE001
@@ -806,6 +770,58 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 )
 
 # COMMAND ----------
+# --- 3.21 / 3.22 UC connection + foreign catalog (SQL Server federation) ---
+# Create a UC connection to the test Azure SQL Server + a foreign catalog so
+# discovery finds them and migrate_connections / migrate_foreign_catalogs
+# exercise them. MUST run via a SERVERLESS warehouse: the connection reaches
+# the SQL server over the NCC private endpoint (serverless-only egress) —
+# classic-cluster spark.sql egresses via the workspace VNet, which has no
+# route to the (private-link-only-reachable) SQL server. Password comes from
+# the ``migration`` secret scope (never committed).
+_CONN_NAME = "integration_test_sqlserver"
+_FC_NAME = "integration_test_fc_sqlserver"
+_SQL_HOST = "sqlsrv-wsm-test-ne.database.windows.net"
+_SQL_DB = "sqldb-wsm-test"
+_has_connection = False
+try:
+    from databricks.sdk import WorkspaceClient as _ConnWC  # noqa: E402
+    from databricks.sdk.service.sql import StatementState as _ConnSS  # noqa: E402
+
+    _conn_wc = _ConnWC()
+    _sql_pwd = dbutils.secrets.get(scope="migration", key="sqltest-password")  # type: ignore[name-defined]  # noqa: F821
+
+    def _conn_run(sql: str) -> None:
+        import time as _t
+
+        _whs = [w for w in _conn_wc.warehouses.list() if getattr(w, "enable_serverless_compute", False)]
+        _whs = _whs or list(_conn_wc.warehouses.list())
+        _wh = _whs[0]
+        _r = _conn_wc.statement_execution.execute_statement(warehouse_id=_wh.id, statement=sql, wait_timeout="50s")
+        _sid = _r.statement_id
+        for _ in range(120):
+            _s = _conn_wc.statement_execution.get_statement(_sid)
+            if _s.status.state == _ConnSS.SUCCEEDED:
+                return
+            if _s.status.state in (_ConnSS.FAILED, _ConnSS.CANCELED, _ConnSS.CLOSED):
+                raise RuntimeError(_s.status.error.message if _s.status.error else str(_s.status.state))
+            _t.sleep(2)
+        raise RuntimeError("connection-seed statement timed out")
+
+    _conn_run(
+        f"CREATE CONNECTION IF NOT EXISTS {_CONN_NAME} TYPE sqlserver "
+        f"OPTIONS (host '{_SQL_HOST}', port '1433', user 'wsmtestadmin', password '{_sql_pwd}')"
+    )
+    _conn_run(
+        f"CREATE FOREIGN CATALOG IF NOT EXISTS {_FC_NAME} "
+        f"USING CONNECTION {_CONN_NAME} OPTIONS (database '{_SQL_DB}')"
+    )
+    _has_connection = True
+    print(f"Created UC connection '{_CONN_NAME}' + foreign catalog '{_FC_NAME}' (SQL Server federation).")
+except Exception as _exc:  # noqa: BLE001
+    print(f"Skipped connection/foreign-catalog seed: {_exc}")
+dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
+    key="has_connection", value="true" if _has_connection else "false"
+)
 
 # COMMAND ----------
 
@@ -825,36 +841,77 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 
 _has_abac = False
 try:
+    # A 0-arg row-filter function needs no column binding, so the policy
+    # parses without MATCH/USING COLUMNS (those require the tag-driven
+    # has_tag_value() form, which needs account-level governed tag policies).
+    # A coarse admin-gate filter is a valid ABAC row filter and exercises the
+    # full discover -> migrate -> assert path.
     spark.sql(  # noqa: F821
         """
-        CREATE OR REPLACE FUNCTION integration_test_src.test_schema.abac_filter(region STRING)
+        CREATE OR REPLACE FUNCTION integration_test_src.test_schema.abac_filter()
         RETURNS BOOLEAN
-        RETURN region IS NOT NULL
+        RETURN is_account_group_member('admins')
         """
     )
-    # The SET ABAC POLICY shape is the canonical attach form. Policy
-    # name is scoped to the securable so it's fine to reuse a fixed
-    # value across re-runs — idempotent via CREATE OR REPLACE shape
-    # where supported; otherwise we swallow ``already exists``.
+    # Canonical ABAC attach form (preview GA 2026-05):
+    #   CREATE POLICY <name> ON TABLE <t> ROW FILTER <fn> TO <principals> FOR TABLES
+    # The older ``ALTER TABLE ... SET ABAC POLICY`` shape is not accepted on
+    # current runtimes; ``USING COLUMNS``/``MATCH COLUMNS`` are parse errors
+    # unless the filter binds tagged columns. Discovery reads policies via
+    # GET /api/2.1/unity-catalog/policies/{type}/{fullname} (probes TABLE
+    # securables, discovery.py:178). Do NOT swallow the error — if the attach
+    # fails we must see why, not silently degrade to has_abac=false.
     spark.sql(  # noqa: F821
         """
-        ALTER TABLE integration_test_src.test_schema.managed_orders
-        SET ABAC POLICY abac_orders_policy
+        CREATE OR REPLACE POLICY abac_orders_policy
+        ON TABLE integration_test_src.test_schema.managed_orders
         COMMENT 'integration-test ABAC policy'
-        MATCH columns (region)
-        ON ROW FILTER integration_test_src.test_schema.abac_filter
+        ROW FILTER integration_test_src.test_schema.abac_filter
+        TO `account users`
+        FOR TABLES
         """
     )
     _has_abac = True
     print("Applied ABAC policy abac_orders_policy to managed_orders.")
 except Exception as _exc:  # noqa: BLE001
-    # Some workspace runtimes reject the SET ABAC POLICY syntax entirely;
-    # others only reject specific clauses. Either way, the assertion path
-    # is gated — no need to fail the whole seed.
-    print(f"Skipped ABAC seed (unsupported on this runtime): {_exc}")
+    print(f"!! ABAC policy seed FAILED: {_exc}")
 
 dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
     key="has_abac", value="true" if _has_abac else "false"
+)
+
+# COMMAND ----------
+
+# --- 3.17 Lakehouse quality monitor ---
+# Attach a snapshot monitor to ``managed_orders`` so discovery's
+# list_monitors (GET /tables/{fqn}/monitor) returns a row and the
+# monitors_worker re-creates it on target. A snapshot monitor needs no
+# timestamp/granularity config — simplest shape that still exercises the
+# full discover -> migrate -> assert path. The monitor's metric tables
+# land in the same schema (output_schema_name). Create is async (monitor
+# provisions PENDING -> ACTIVE) but the GET returns the definition as soon
+# as it exists, so discovery finds it without waiting for ACTIVE.
+_has_monitor = False
+try:
+    from databricks.sdk.service.catalog import MonitorSnapshot  # noqa: E402
+
+    _MON_TABLE = "integration_test_src.test_schema.managed_orders"
+    # Idempotency: drop any monitor left by a prior run so create is clean.
+    with contextlib.suppress(Exception):
+        _w_seed.quality_monitors.delete(table_name=_MON_TABLE)
+    _w_seed.quality_monitors.create(
+        table_name=_MON_TABLE,
+        assets_dir="/Workspace/Shared/cp_migration_monitor_assets/managed_orders",
+        output_schema_name="integration_test_src.test_schema",
+        snapshot=MonitorSnapshot(),
+    )
+    _has_monitor = True
+    print(f"Created snapshot monitor on {_MON_TABLE}.")
+except Exception as _exc:  # noqa: BLE001
+    print(f"!! Monitor seed FAILED: {_exc}")
+
+dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
+    key="has_monitor", value="true" if _has_monitor else "false"
 )
 
 # COMMAND ----------

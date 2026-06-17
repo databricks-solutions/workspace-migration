@@ -299,3 +299,27 @@ on_target_collision: SKIP
         )
         config = MigrationConfig.from_workspace_file(str(path))
         assert config.on_target_collision == "skip"
+
+
+def test_lakebase_defaults_and_overrides(tmp_path):
+    import yaml
+
+    from common.config import MigrationConfig
+
+    base = {
+        "source_workspace_url": "https://s", "target_workspace_url": "https://t",
+        "spn_client_id": "x", "spn_secret_scope": "sc", "spn_secret_key": "k",
+    }
+    p = tmp_path / "config.yaml"
+    p.write_text(yaml.safe_dump(base))
+    cfg = MigrationConfig.from_workspace_file(str(p))
+    assert cfg.lakebase_instance_name == "cp-migration-lakebase"
+    assert cfg.lakebase_logical_database == "databricks_postgres"
+    assert cfg.lakebase_capacity == "CU_1"
+
+    p.write_text(yaml.safe_dump({**base, "lakebase_instance_name": "lb_x",
+                                 "lakebase_logical_database": "ldb", "lakebase_capacity": "CU_2"}))
+    cfg2 = MigrationConfig.from_workspace_file(str(p))
+    assert cfg2.lakebase_instance_name == "lb_x"
+    assert cfg2.lakebase_logical_database == "ldb"
+    assert cfg2.lakebase_capacity == "CU_2"

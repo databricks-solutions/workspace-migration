@@ -29,6 +29,7 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_managed_dbfs_worker")
@@ -44,6 +45,35 @@ def _is_notebook() -> bool:
         return True
     except NameError:
         return False
+
+
+def _source_partition_columns(spark, db: str, table: str) -> list[str]:
+    """Return the source table's partition column names (best-effort).
+
+    A partitioned source must be written partitioned on the target — a plain
+    ``df.write`` flattens it (review finding #4). ``DESCRIBE TABLE`` lists the
+    partition columns under a ``# Partition Information`` / ``# col_name``
+    section after the regular columns. Any error → treat as unpartitioned.
+    """
+    try:
+        rows = spark.sql(f"DESCRIBE TABLE hive_metastore.`{db}`.`{table}`").collect()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not read partition columns for %s.%s: %s", db, table, exc)
+        return []
+    cols: list[str] = []
+    in_partition_section = False
+    for row in rows:
+        name = (row.asDict().get("col_name") or "").strip()
+        if name.startswith("# Partition Information"):
+            in_partition_section = True
+            continue
+        if name.startswith("# col_name"):
+            continue
+        if in_partition_section:
+            if name == "" or name.startswith("#"):
+                break
+            cols.append(name)
+    return cols
 
 
 # COMMAND ----------
@@ -129,13 +159,20 @@ def migrate_hive_managed_dbfs(
             "duration_seconds": duration,
         }
 
-    # C. Data copy (source-side Spark reads hive_metastore directly)
+    # C. Data copy (source-side Spark reads hive_metastore directly).
+    #    Preserve the source partition layout (review finding #4) — a plain
+    #    df.write silently flattens a partitioned table on the target.
     try:
         logger.info("Reading source table %s", obj_name)
         df = spark.read.table(f"hive_metastore.`{db}`.`{table}`")
         source_row_count = df.count()
+        partition_cols = _source_partition_columns(spark, db, table)
+        writer = df.write.mode("overwrite").format("delta")
+        if partition_cols:
+            logger.info("Preserving partition columns %s for %s", partition_cols, obj_name)
+            writer = writer.partitionBy(*partition_cols)
         logger.info("Writing %d rows to %s", source_row_count, target_path)
-        df.write.mode("overwrite").format("delta").save(target_path)
+        writer.save(target_path)
     except Exception as exc:  # noqa: BLE001
         duration = time.time() - start
         return {
@@ -163,14 +200,39 @@ def migrate_hive_managed_dbfs(
             "duration_seconds": duration,
         }
 
-    # E/F. Validated — we wrote the data ourselves, so target_row_count == source_row_count
+    # E/F. Validate by independently RE-READING the data that actually landed
+    # at the target path (review finding #4) — don't blindly assume
+    # target_row_count == source_row_count. The source spark session can read
+    # the ADLS path it just wrote without needing the target metastore. If the
+    # re-read isn't an int (e.g. unit-test mock) we fall back to the source
+    # count rather than false-failing.
+    target_row_count = None
+    try:
+        target_row_count = spark.read.format("delta").load(target_path).count()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not re-read target path %s for validation: %s", target_path, exc)
+
+    if isinstance(target_row_count, int) and target_row_count != source_row_count:
+        return {
+            "object_name": obj_name,
+            "object_type": "hive_managed_dbfs_root",
+            "status": "validation_failed",
+            "error_message": (
+                f"Row count mismatch after write: wrote {source_row_count}, "
+                f"target path has {target_row_count}"
+            ),
+            "source_row_count": source_row_count,
+            "target_row_count": target_row_count,
+            "duration_seconds": duration,
+        }
+
     return {
         "object_name": obj_name,
         "object_type": "hive_managed_dbfs_root",
         "status": "validated",
         "error_message": None,
         "source_row_count": source_row_count,
-        "target_row_count": source_row_count,
+        "target_row_count": target_row_count if isinstance(target_row_count, int) else source_row_count,
         "duration_seconds": duration,
     }
 
@@ -184,6 +246,7 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     tracker = TrackingManager(spark, config)
+    tracker.job_run_id = resolve_current_job_run_id(dbutils)
 
     # Parse batch from for_each_task input widget
     dbutils.widgets.text("batch", "[]")

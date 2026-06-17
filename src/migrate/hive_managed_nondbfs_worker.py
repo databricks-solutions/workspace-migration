@@ -30,10 +30,15 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
-from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
-from common.tracking import TrackingManager
-from common.validation import Validator
-from migrate.hive_common import rewrite_hive_fqn, rewrite_hive_namespace
+from common.sql_utils import (
+    append_migration_status_via_warehouse,
+    execute_and_poll,
+    find_warehouse,
+    rewrite_ddl,
+    warehouse_table_count,
+)
+from migrate.hive_common import configure_adls_account_key, rewrite_hive_fqn, rewrite_hive_namespace
+from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("hive_managed_nondbfs_worker")
@@ -84,34 +89,37 @@ def migrate_hive_managed_nondbfs(
     *,
     config: MigrationConfig,
     auth: AuthManager,
-    tracker: TrackingManager,
     explorer: CatalogExplorer,
-    validator: Validator,
     wh_id: str,
+    tracking_fqn: str,
+    job_run_id: str | None,
+    status_wh_id: str,
 ) -> dict:
     """Recreate a Hive MANAGED non-DBFS-root table as a UC EXTERNAL table.
 
     The target points at the same storage path as the source — no data copy.
+    Runs on NON-UC (No Isolation) compute for legacy account-key ADLS access to
+    the source; status writes and the target row-count go through the SQL
+    warehouse (UC-capable), not the worker's spark session.
     """
-    source_fqn = record["fqn"]
+    source_fqn = record["object_name"]
     storage_location = record.get("storage_location", "")
     provider = (record.get("provider") or "").lower()
     target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
 
-    tracker.append_migration_status(
+    append_migration_status_via_warehouse(
+        auth,
+        status_wh_id,
+        tracking_fqn,
         [
             {
                 "object_name": source_fqn,
                 "object_type": "hive_managed_nondbfs",
                 "status": "in_progress",
                 "error_message": None,
-                "job_run_id": None,
-                "task_run_id": None,
-                "source_row_count": None,
-                "target_row_count": None,
-                "duration_seconds": None,
             }
-        ]
+        ],
+        job_run_id=job_run_id,
     )
 
     start = time.time()
@@ -188,19 +196,22 @@ def migrate_hive_managed_nondbfs(
 
     duration = time.time() - start
 
-    # Validate row count — source under hive_metastore, target under UC catalog.
+    # Validate row count — source read on the worker's (NON-UC) spark via the
+    # legacy account key; target read through the warehouse (UC-capable).
     try:
-        validation = validator.validate_row_count(source_fqn, target_fqn)
-        status = "validated" if validation["match"] else "validation_failed"
+        source_count = explorer.get_table_row_count(source_fqn)
+        target_count = warehouse_table_count(auth, wh_id, target_fqn)
+        match = source_count == target_count
+        status = "validated" if match else "validation_failed"
         return {
             "object_name": source_fqn,
             "object_type": "hive_managed_nondbfs",
             "status": status,
             "error_message": None
-            if validation["match"]
-            else (f"Row count mismatch: source={validation['source_count']}, target={validation['target_count']}"),
-            "source_row_count": validation["source_count"],
-            "target_row_count": validation["target_count"],
+            if match
+            else (f"Row count mismatch: source={source_count}, target={target_count}"),
+            "source_row_count": source_count,
+            "target_row_count": target_count,
             "duration_seconds": duration,
         }
     except Exception as exc:  # noqa: BLE001
@@ -222,12 +233,11 @@ def run(dbutils, spark) -> None:
     config = MigrationConfig.from_workspace_file()
     auth = AuthManager(config, dbutils)
     spark_session = spark
-    tracker = TrackingManager(spark_session, config)
+    job_run_id = resolve_current_job_run_id(dbutils)
+    tracking_fqn = f"{config.tracking_catalog}.{config.tracking_schema}"
+    # Source reads only — this worker runs on NON-UC compute (account-key ADLS
+    # access). Target reads + status writes go through the warehouse.
     explorer = CatalogExplorer(spark_session, auth)
-
-    # Build a target explorer for validation (shares the same spark session)
-    target_explorer = CatalogExplorer(spark_session, auth)
-    validator = Validator(explorer, target_explorer)
 
     # Parse batch from for_each_task input widget
     dbutils.widgets.text("batch", "[]")
@@ -235,7 +245,17 @@ def run(dbutils, spark) -> None:
     batch: list[dict] = json.loads(batch_json)
     logger.info("Received batch of %d hive managed non-DBFS tables.", len(batch))
 
+    # hive_metastore managed-non-DBFS tables live on ADLS; set the legacy
+    # account-key Hadoop conf per source storage account before reading (UC
+    # vending doesn't cover hive_metastore LOCATION). Classic compute only
+    # (this task runs on hive_adls_classic); no-op/warns on serverless.
+    for _rec in batch:
+        configure_adls_account_key(spark_session, dbutils, _rec.get("storage_location"))
+
     wh_id = find_warehouse(auth)
+    # Tracking catalog is on the SOURCE metastore — status writes use a
+    # source warehouse; target table ops use wh_id (target).
+    status_wh_id = find_warehouse(auth, use_source=True)
 
     # Process batch with thread pool
 
@@ -248,10 +268,11 @@ def run(dbutils, spark) -> None:
                 rec,
                 config=config,
                 auth=auth,
-                tracker=tracker,
                 explorer=explorer,
-                validator=validator,
                 wh_id=wh_id,
+                tracking_fqn=tracking_fqn,
+                job_run_id=job_run_id,
+                status_wh_id=status_wh_id,
             ): rec
             for rec in batch
         }
@@ -261,7 +282,7 @@ def run(dbutils, spark) -> None:
                 res = future.result()
             except Exception as exc:  # noqa: BLE001
                 res = {
-                    "object_name": rec_info["fqn"],
+                    "object_name": rec_info["object_name"],
                     "object_type": "hive_managed_nondbfs",
                     "status": "failed",
                     "error_message": str(exc),
@@ -270,9 +291,9 @@ def run(dbutils, spark) -> None:
             results.append(res)
             logger.info("Table %s -> %s", res["object_name"], res["status"])
 
-    # Record final statuses
+    # Record final statuses (via warehouse — worker runs on NON-UC compute)
 
-    tracker.append_migration_status(results)
+    append_migration_status_via_warehouse(auth, status_wh_id, tracking_fqn, results, job_run_id=job_run_id)
     logger.info(
         "Hive managed non-DBFS worker complete. %d succeeded, %d failed.",
         sum(1 for r in results if r["status"] == "validated"),

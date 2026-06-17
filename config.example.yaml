@@ -58,6 +58,12 @@ iceberg_strategy: ""
 #                   a workspace admin (admin-bypass in the source filter).
 rls_cm_strategy: ""
 
+# --- Online Tables -> Lakebase synced table migration (migrate_online_tables) ---
+# The job creates this Lakebase database instance if it does not exist.
+lakebase_instance_name: cp-migration-lakebase
+lakebase_logical_database: databricks_postgres
+lakebase_capacity: CU_1
+
 # --- Target pre-existing state / collision handling (X.4) ---
 # What to do when a discovered source object has the same FQN as an
 # object already on target, and no migration_status row says we
@@ -74,3 +80,15 @@ rls_cm_strategy: ""
 #             so workers skip each one. Target object is left untouched.
 on_target_collision: "fail"
 
+# Overwrite protection (review finding #2). When false (default), workers that
+# issue destructive CREATE OR REPLACE / DEEP CLONE skip a target object that
+# already exists and validate it instead — protecting a post-cutover target
+# from being clobbered on a resume / re-trigger. Set true only for a
+# deliberate re-migration that should replace target data.
+overwrite_existing: false
+
+# Ownership transfer (review finding #5). When true (default), the grants
+# workers transfer each migrated object's ownership to its original owner via
+# ALTER ... OWNER TO (after the other grants). Set false to leave every
+# migrated object owned by the migration SPN.
+transfer_ownership: true

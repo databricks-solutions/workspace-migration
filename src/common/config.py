@@ -132,6 +132,18 @@ class MigrationConfig:
     tracking_schema: str = "cp_migration"
     dry_run: bool = False
     batch_size: int = 50
+    # Overwrite protection (review finding #2). When False (default), workers
+    # that issue destructive CREATE OR REPLACE / DEEP CLONE skip re-creating a
+    # target object that already exists and validate it instead — protecting a
+    # post-cutover target from being clobbered on a resume / re-trigger. Set to
+    # True only for a deliberate re-migration that should replace target data.
+    overwrite_existing: bool = False
+    # Ownership transfer (review finding #5). When True (default), the grants
+    # workers transfer each migrated securable's ownership to its original
+    # owner via ALTER ... OWNER TO (applied after the other grants so the
+    # migration SPN keeps MANAGE while granting). Set False to leave every
+    # migrated object owned by the migration SPN.
+    transfer_ownership: bool = True
     # Iceberg (Phase 2.5) — set to "ddl_replay" to opt into Option A for
     # UC-managed Iceberg tables (DDL replay + re-ingest via cp_migration_share).
     # Leaving this empty blocks Iceberg migration so customers have to
@@ -151,11 +163,21 @@ class MigrationConfig:
     #                     row filter / column mask are never altered. See
     #                     README and docs/RLS_CM_STAGING_COPY.md.
     rls_cm_strategy: str = ""
+    # Lakeflow Connect (Phase 3) — name of the pre-existing UC connection on
+    # target that the recreated query-based pipeline will use. Required only
+    # when any query-based LFC pipelines are included in the migration; left
+    # empty otherwise and the pre-check is a no-op for this field.
+    lfc_target_connection_name: str = ""
     # Hive (Phase 2) — unused in Phase 1 notebooks but fields exist so the
     # dataclass matches the full config file schema.
     migrate_hive_dbfs_root: bool = False
     hive_dbfs_target_path: str = ""
     hive_target_catalog: str = "hive_upgraded"
+    # Online Tables → Lakebase synced table migration (migrate_online_tables).
+    # The job creates this Lakebase database instance if it does not exist.
+    lakebase_instance_name: str = "cp-migration-lakebase"
+    lakebase_logical_database: str = "databricks_postgres"
+    lakebase_capacity: str = "CU_1"
     # Target pre-existing state / collision handling (X.4).
     #
     # When a source object has the same FQN as an object on target AND no
@@ -228,12 +250,18 @@ class MigrationConfig:
             tracking_catalog=str(raw.get("tracking_catalog", "migration_tracking")),
             tracking_schema=str(raw.get("tracking_schema", "cp_migration")),
             dry_run=_coerce_bool(raw.get("dry_run")),
+            overwrite_existing=_coerce_bool(raw.get("overwrite_existing")),
+            transfer_ownership=_coerce_bool(raw.get("transfer_ownership", True)),
             batch_size=int(raw.get("batch_size", 50)),
             iceberg_strategy=str(raw.get("iceberg_strategy", "")),
             rls_cm_strategy=str(raw.get("rls_cm_strategy", "")),
+            lfc_target_connection_name=str(raw.get("lfc_target_connection_name", "")),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
             hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
             hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),
+            lakebase_instance_name=str(raw.get("lakebase_instance_name", "cp-migration-lakebase")),
+            lakebase_logical_database=str(raw.get("lakebase_logical_database", "databricks_postgres")),
+            lakebase_capacity=str(raw.get("lakebase_capacity", "CU_1")),
             on_target_collision=_coerce_collision_policy(raw.get("on_target_collision", "fail")),
             test_kill_after=_coerce_test_kill_after(raw.get("test_kill_after")),
         )
