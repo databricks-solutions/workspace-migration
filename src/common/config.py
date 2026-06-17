@@ -23,6 +23,30 @@ def _coerce_list(raw: object) -> list[str]:
     return []
 
 
+def _coerce_cursor_columns(raw: object) -> dict[str, str]:
+    """Parse the ``lfc_saas_cursor_columns`` field to a ``{dest_fqn: cursor}`` dict.
+
+    Accepts a dict (the config.yaml mapping path) OR a JSON string (the
+    workspace-file / job ``base_parameters`` path — base_parameters values are
+    always strings). Empty string / None / empty mapping → ``{}``. A non-empty
+    string that isn't a JSON object, or any other type, raises ``ValueError`` so
+    a typo surfaces at config-load time rather than silently dropping cursors."""
+    if raw is None or raw == "" or raw == {}:
+        return {}
+    if isinstance(raw, str):
+        import json
+
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            msg = f"lfc_saas_cursor_columns must be a JSON object string, got {raw!r}"
+            raise ValueError(msg) from exc
+    if not isinstance(raw, dict):
+        msg = f"lfc_saas_cursor_columns must be a mapping of dest_fqn -> cursor, got {raw!r}"
+        raise ValueError(msg)
+    return {str(k): str(v) for k, v in raw.items()}
+
+
 def _coerce_bool(raw: object) -> bool:
     if isinstance(raw, bool):
         return raw
@@ -168,6 +192,15 @@ class MigrationConfig:
     # when any query-based LFC pipelines are included in the migration; left
     # empty otherwise and the pre-check is a no-op for this field.
     lfc_target_connection_name: str = ""
+    # Lakeflow Connect Tier-1 SaaS (Salesforce/GA4/ServiceNow) — MANDATORY,
+    # operator-supplied incremental cursor per migrated SaaS table. Maps the
+    # destination-table FQN (``cat.schema.table``) -> cursor column name. SaaS
+    # connectors do NOT echo their auto-selected cursor in the pipeline spec, so
+    # the operator must declare it (run discovery first; it prints the candidate
+    # timestamp/numeric columns per table). A SaaS table absent from this map
+    # full-loads (no row_filter); the tool does NOT guess. Accepts a YAML mapping
+    # or, on the base_parameters path, a JSON string.
+    lfc_saas_cursor_columns: dict[str, str] = field(default_factory=dict)
     # Hive (Phase 2) — unused in Phase 1 notebooks but fields exist so the
     # dataclass matches the full config file schema.
     migrate_hive_dbfs_root: bool = False
@@ -256,6 +289,7 @@ class MigrationConfig:
             iceberg_strategy=str(raw.get("iceberg_strategy", "")),
             rls_cm_strategy=str(raw.get("rls_cm_strategy", "")),
             lfc_target_connection_name=str(raw.get("lfc_target_connection_name", "")),
+            lfc_saas_cursor_columns=_coerce_cursor_columns(raw.get("lfc_saas_cursor_columns")),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
             hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
             hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),
