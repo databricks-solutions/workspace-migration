@@ -142,22 +142,16 @@ else:
     _vr = _view_rows[0]
     _vs = _vr["status"]
     _ve = _vr["error_message"]
-    # The unified view needs <t>_incr, produced by the recreated pipeline's forward
-    # ingestion. This lab's target workspace has no NCC egress to the source DB, so
-    # the recreated pipeline can't run and _incr never lands — the worker correctly
-    # DEFERS the view ('lfc_view_pending_forward_ingest'). Accept either: created
-    # (full path, when target can ingest) or deferred (this lab).
+    # End-to-end: the recreated pipeline must run (target reaches the source DB via
+    # the NCC PE + NSP service-tag rule) so <t>_incr lands and the unified view is
+    # CREATED. A deferred view is NOT accepted here — that would mean forward
+    # ingestion didn't complete, which is a failure of the end-to-end path.
     if _vs == "lfc_view_created":
         summary["lfc_view"] = "asserted_ok"
         print(f"[test-lfc] lfc_view ok: {_vr['object_name']} lfc_view_created")
-    elif _vs == "lfc_view_pending_forward_ingest":
-        summary["lfc_view"] = "asserted_ok (deferred — no target ingestion in this lab)"
-        print(f"[test-lfc] lfc_view deferred (expected without target NCC): {_ve}")
     else:
-        errors.append(f"lfc_view {_ORDERS_FQN!r}: status={_vs!r}, expected created or pending. error_message={_ve!r}")
-        summary["lfc_view"] = "FAILED_wrong_status"
-
-_view_deferred = bool(_view_rows) and _view_rows[0]["status"] == "lfc_view_pending_forward_ingest"
+        errors.append(f"lfc_view {_ORDERS_FQN!r}: status={_vs!r}, expected 'lfc_view_created' (end-to-end). error_message={_ve!r}")
+        summary["lfc_view"] = "FAILED_not_created"
 
 # COMMAND ----------
 # --- Assert TARGET: orders_history exists with expected row count ---
@@ -190,35 +184,30 @@ else:
         print(f"[test-lfc] target orders_history ok: {_hist_count} rows")
 
 # COMMAND ----------
-# --- Assert TARGET: unified view orders exists (skipped when the view was deferred) ---
-if _view_deferred:
-    summary["target_view"] = "skipped (view deferred — no target ingestion in this lab)"
-    print("[test-lfc] target unified view check skipped — view deferred pending forward ingestion")
+# --- Assert TARGET: unified view orders exists AND its row count matches source ---
+# SCD1 view = orders_history UNION orders_incr, deduped by PK → COUNT(*) must equal
+# the source orders row count (distinct order_id). This proves the view resolves
+# (both legs queryable) and the union/dedup produces the right cardinality.
+_view_cnt_res = execute_and_fetch(
+    _auth, _tgt_wh,
+    f"SELECT COUNT(*) AS n FROM `{_CATALOG}`.`{_SCHEMA}`.`orders`",
+    use_source=False,
+)
+if _view_cnt_res["state"] != "SUCCEEDED":
+    errors.append(f"target unified view {_ORDERS_FQN!r} not queryable: {_view_cnt_res.get('error', _view_cnt_res['state'])}")
+    summary["target_view"] = "FAILED_not_queryable"
 else:
-    _view_res = execute_and_fetch(
-        _auth, _tgt_wh,
-        f"SHOW VIEWS IN `{_CATALOG}`.`{_SCHEMA}`",
-        use_source=False,
-    )
-    _view_exists = False
-    if _view_res["state"] == "SUCCEEDED":
-        _view_names = [row[1] if len(row) > 1 else row[0] for row in (_view_res.get("rows") or [])]
-        _view_exists = "orders" in _view_names
-    else:
-        # Fallback: try SELECT 1 FROM the view — succeeds if it exists.
-        _fallback = execute_and_fetch(
-            _auth, _tgt_wh,
-            f"SELECT 1 AS _exists FROM `{_CATALOG}`.`{_SCHEMA}`.`orders` LIMIT 1",
-            use_source=False,
+    _vc_raw = (_view_cnt_res.get("rows") or [[None]])[0]
+    _view_count = int(_vc_raw[0]) if _vc_raw and _vc_raw[0] is not None else 0
+    if _seed_orders_rows > 0 and _view_count != _seed_orders_rows:
+        errors.append(
+            f"target unified view {_ORDERS_FQN!r}: row count {_view_count} != source orders {_seed_orders_rows} "
+            "(SCD1 view should dedup to the source cardinality)"
         )
-        _view_exists = _fallback["state"] == "SUCCEEDED"
-
-    if not _view_exists:
-        errors.append(f"target unified view {_ORDERS_FQN!r} does not exist on target workspace")
-        summary["target_view"] = "FAILED_not_found"
+        summary["target_view"] = f"FAILED_count_mismatch ({_view_count} vs {_seed_orders_rows})"
     else:
-        summary["target_view"] = "asserted_ok"
-        print(f"[test-lfc] target unified view {_ORDERS_FQN!r} exists")
+        summary["target_view"] = f"asserted_ok ({_view_count} rows)"
+        print(f"[test-lfc] target unified view {_ORDERS_FQN!r} ok: {_view_count} rows == source {_seed_orders_rows}")
 
 # COMMAND ----------
 # --- Assert TARGET: recreated pipeline object exists (creation only, not ingestion) ---
