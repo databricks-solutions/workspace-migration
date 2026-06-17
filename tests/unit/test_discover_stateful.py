@@ -159,3 +159,27 @@ def test_discover_uc_online_table_reclassified_as_stateful():
     meta = json.loads(ot["metadata_json"])
     assert meta["capability"] == "online_store"
     assert meta["source_table_fqn"] == "cat.s.src"
+
+
+def test_exclude_gateway_staging_volumes_retags_matching_volume():
+    """The pure reconcile helper retags a 'volume' inventory row whose FQN matches
+    a gateway staging volume to object_type='gateway_staging_volume', leaving every
+    other row (and non-matching volumes) untouched."""
+    inventory = [
+        {"object_type": "volume", "object_name": "stg.cdc.gw_vol"},   # the gateway staging volume
+        {"object_type": "volume", "object_name": "other.s.v"},        # unrelated volume
+        {"object_type": "managed_table", "object_name": "stg.cdc.gw_vol"},  # same FQN, different type
+    ]
+    excluded = disc._exclude_gateway_staging_volumes(inventory, {"stg.cdc.gw_vol"})
+    assert excluded == ["stg.cdc.gw_vol"]
+    by = {(r["object_type"], r["object_name"]) for r in inventory}
+    assert ("gateway_staging_volume", "stg.cdc.gw_vol") in by   # retagged
+    assert ("volume", "other.s.v") in by                        # untouched
+    assert ("managed_table", "stg.cdc.gw_vol") in by            # untouched (only volumes retagged)
+    assert ("volume", "stg.cdc.gw_vol") not in by               # no longer a plain volume
+
+
+def test_exclude_gateway_staging_volumes_noop_when_no_fqns():
+    inventory = [{"object_type": "volume", "object_name": "stg.cdc.gw_vol"}]
+    assert disc._exclude_gateway_staging_volumes(inventory, set()) == []
+    assert inventory[0]["object_type"] == "volume"

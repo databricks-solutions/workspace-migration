@@ -166,11 +166,24 @@ class StatefulExplorer:
                 spec = getattr(full, "spec", None)
                 if spec is None or getattr(spec, "ingestion_definition", None) is None:
                     continue  # not an LFC ingestion pipeline
+                definition = _as_dict(full)
+                # CDC (Tier-2): the ingestion pipeline references a gateway pipeline
+                # via ingestion_gateway_id. Nest the gateway's full get()-dict so the
+                # worker can recreate the gateway without re-fetching. Skip-and-log on
+                # a failed gateway get() — the ingestion row is still useful.
+                gw_id = (((definition.get("spec") or {}).get("ingestion_definition")) or {}).get(
+                    "ingestion_gateway_id"
+                )
+                if gw_id:
+                    try:
+                        definition["gateway_spec"] = _as_dict(client.pipelines.get(gw_id))
+                    except Exception as exc:  # noqa: BLE001
+                        print(f"[stateful][warn] gateway pipeline {gw_id} get() failed — skipping nest ({exc})")
                 results.append(
                     {
                         "pipeline_name": full.name,
                         "pipeline_id": p.pipeline_id,
-                        "definition": _as_dict(full),
+                        "definition": definition,
                     }
                 )
             return results

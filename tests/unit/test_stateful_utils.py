@@ -263,3 +263,54 @@ class TestLfcPipelines:
         auth.source_client.pipelines.list_pipelines.side_effect = Exception("403")
         assert StatefulExplorer(auth).list_lfc_pipelines() == []
         assert "lakeflow connect" in capsys.readouterr().out
+
+    def test_cdc_pipeline_nests_gateway_spec(self):
+        # An ingestion pipeline carrying ingestion_gateway_id gets its gateway's
+        # full get()-dict nested under definition["gateway_spec"].
+        auth = MagicMock()
+        client = auth.source_client
+        client.pipelines.list_pipelines.return_value = [_sdk_obj(pipeline_id="ing1", name="cdc_ing")]
+
+        def _get(pipeline_id):
+            if pipeline_id == "ing1":
+                spec = MagicMock()
+                spec.ingestion_definition = MagicMock()
+                return _sdk_obj(
+                    as_dict={"name": "cdc_ing", "spec": {"ingestion_definition": {
+                        "ingestion_gateway_id": "gw1"}}},
+                    name="cdc_ing", spec=spec,
+                )
+            # the gateway pipeline get()
+            return _sdk_obj(
+                as_dict={"name": "gw", "spec": {"gateway_definition": {"connection_name": "src_sql"}}},
+                name="gw", spec=MagicMock(),
+            )
+
+        client.pipelines.get.side_effect = _get
+        rows = StatefulExplorer(auth).list_lfc_pipelines()
+        assert len(rows) == 1
+        gw_spec = rows[0]["definition"]["gateway_spec"]
+        assert gw_spec["spec"]["gateway_definition"]["connection_name"] == "src_sql"
+
+    def test_cdc_pipeline_gateway_get_failure_skips_nest(self, capsys):
+        # If the gateway get() fails, the ingestion row survives WITHOUT gateway_spec.
+        auth = MagicMock()
+        client = auth.source_client
+        client.pipelines.list_pipelines.return_value = [_sdk_obj(pipeline_id="ing1", name="cdc_ing")]
+
+        def _get(pipeline_id):
+            if pipeline_id == "ing1":
+                spec = MagicMock()
+                spec.ingestion_definition = MagicMock()
+                return _sdk_obj(
+                    as_dict={"name": "cdc_ing", "spec": {"ingestion_definition": {
+                        "ingestion_gateway_id": "gw1"}}},
+                    name="cdc_ing", spec=spec,
+                )
+            raise RuntimeError("gateway gone")
+
+        client.pipelines.get.side_effect = _get
+        rows = StatefulExplorer(auth).list_lfc_pipelines()
+        assert len(rows) == 1
+        assert "gateway_spec" not in rows[0]["definition"]
+        assert "gateway pipeline gw1" in capsys.readouterr().out

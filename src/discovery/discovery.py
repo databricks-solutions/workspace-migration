@@ -36,7 +36,9 @@ from common.tracking import TrackingManager, discovery_row, discovery_schema
 from migrate.lfc_utils import (
     candidate_cursor_columns,
     classify_pipeline,
+    extract_gateway_def,
     extract_table_configs,
+    gateway_staging_volume_fqn,
     resolve_saas_cursor,
 )
 from migrate.reconciliation import resolve_current_job_run_id
@@ -591,6 +593,42 @@ def _discover_stateful(config, stateful, now, *, describe_columns=None) -> list[
 # COMMAND ----------
 
 
+def _gateway_staging_volume_fqns(inventory: list[dict]) -> set[str]:
+    """Collect the staging-volume FQNs of every CDC gateway nested in the
+    discovered lfc_pipeline rows (``metadata.definition.gateway_spec``)."""
+    import json as _json
+
+    fqns: set[str] = set()
+    for r in inventory:
+        if r.get("object_type") != "lfc_pipeline" or not r.get("metadata_json"):
+            continue
+        try:
+            meta = _json.loads(r["metadata_json"])
+        except _json.JSONDecodeError:
+            continue
+        gw_spec = ((meta.get("definition") or {}).get("gateway_spec")) or {}
+        fqn = gateway_staging_volume_fqn(extract_gateway_def(gw_spec))
+        if fqn:
+            fqns.add(fqn)
+    return fqns
+
+
+def _exclude_gateway_staging_volumes(inventory: list[dict], gateway_fqns: set[str]) -> list[str]:
+    """Retag (in place) each ``object_type='volume'`` inventory row whose FQN is a
+    gateway staging volume to ``object_type='gateway_staging_volume'`` so the
+    volume worker (work-list ``object_type=volume``) never picks it up — the
+    recreated gateway owns its own staging volume. Returns the FQNs retagged.
+    Non-volume rows with the same FQN are left untouched."""
+    if not gateway_fqns:
+        return []
+    excluded: list[str] = []
+    for r in inventory:
+        if r.get("object_type") == "volume" and r.get("object_name") in gateway_fqns:
+            r["object_type"] = "gateway_staging_volume"
+            excluded.append(r["object_name"])
+    return excluded
+
+
 def _read_scope(dbutils) -> str:
     """Discovery scope, from the ``discovery_scope`` widget. Values:
 
@@ -669,6 +707,14 @@ def run(dbutils, spark):  # noqa: D103
 
     inventory.extend(_discover_stateful(config, stateful_explorer, now,
                                         describe_columns=_describe_columns))
+
+    # Exclude each CDC gateway's staging volume from volume migration: the
+    # recreated gateway creates its own. Retag the matching volume row in place
+    # (object_type='gateway_staging_volume') before the single inventory write so
+    # the volume worker's object_type='volume' slice never sees it.
+    gw_fqns = _gateway_staging_volume_fqns(inventory)
+    for fqn in _exclude_gateway_staging_volumes(inventory, gw_fqns):
+        print(f"[stateful][lfc] excluding gateway staging volume from volume migration: {fqn}")
 
     print(f"\nTotal objects discovered: {len(inventory)}")
 
