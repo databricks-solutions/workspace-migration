@@ -44,9 +44,45 @@ def _bt(fqn: str) -> str:
     return ".".join(f"`{p}`" for p in fqn.split("."))
 
 
+def _migrate_cdc(row, definition, *, deps, target_connection_name, gateway_id_map):
+    """Migrate one Tier-2 CDC (gateway-based) lfc_pipeline row: recreate its
+    gateway (once per unique source gateway, via the shared gateway_id_map), then
+    recreate the ingestion pipeline pointing at the new gateway (full-reload, no
+    row_filter), dry-validating each. Does NOT start a real run."""
+    from migrate.lfc_utils import (
+        build_cdc_ingestion_recreate_spec,
+        build_gateway_recreate_spec,
+        extract_gateway_def,
+    )
+    obj = row["object_name"]
+    results = []
+    src_gw_id = _ingestion_def(definition).get("ingestion_gateway_id")
+    gw_def = extract_gateway_def((definition or {}).get("gateway_spec") or {})
+    if not src_gw_id or not gw_def:
+        return [{"object_name": obj, "object_type": "lfc_pipeline", "status": "failed",
+                 "error_message": "CDC pipeline missing gateway id / nested gateway_spec"}]
+    # Gateway-first: recreate each unique source gateway once.
+    tgt_gw_id = gateway_id_map.get(src_gw_id)
+    if tgt_gw_id is None:
+        gw_name = f"{(gw_def.get('gateway_storage_name') or 'gateway')}_migrated"
+        gw_spec = build_gateway_recreate_spec(gw_def, target_connection_name=target_connection_name, name=gw_name)
+        tgt_gw_id = deps.create_gateway(gw_spec)
+        gateway_id_map[src_gw_id] = tgt_gw_id
+        deps.validate_pipeline(tgt_gw_id)   # dry-validate; record-and-continue
+        results.append({"object_name": gw_name, "object_type": "lfc_gateway",
+                        "status": "lfc_gateway_created", "error_message": None})
+    ing_spec = build_cdc_ingestion_recreate_spec(definition, target_gateway_id=tgt_gw_id, name=f"{obj}_migrated")
+    tgt_ing_id = deps.create_pipeline(ing_spec)
+    deps.validate_pipeline(tgt_ing_id)
+    results.append({"object_name": obj, "object_type": "lfc_pipeline",
+                    "status": "lfc_pipeline_created_fullreload", "error_message": None})
+    return results
+
+
 def migrate_pipeline(row: dict, *, deps, target_connection_name: str,
-                     saas_cursor_columns: dict[str, str] | None = None) -> list[dict]:
-    """Migrate one Tier-1 query-based or SaaS lfc_pipeline row. Returns status dicts.
+                     saas_cursor_columns: dict[str, str] | None = None,
+                     gateway_id_map: dict[str, str] | None = None) -> list[dict]:
+    """Migrate one lfc_pipeline row. Returns status dicts.
 
     ``saas_cursor_columns`` maps a destination-table FQN (``cat.schema.table``)
     -> the operator-supplied incremental cursor column. It is MANDATORY for
@@ -55,13 +91,20 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str,
     full-loads (no row_filter, no unified view). Query-based tables ignore this
     map (their cursor is read from the spec's nested cursor_columns).
 
-    Non-Tier-1 / cdc / unknown rows return [] (left for a later stage).
-    Per-pipeline isolation is the caller's job (it wraps this in try/except).
+    ``gateway_id_map`` (source-gateway-id -> new-target-gateway-id) is shared
+    across rows by ``run()`` so a CDC gateway referenced by N ingestion pipelines
+    is recreated exactly once. Tier-1 rows ignore it.
+
+    Unknown rows return [] (left for a later stage). Per-pipeline isolation is the
+    caller's job (it wraps this in try/except).
     """
     saas_cursor_columns = saas_cursor_columns or {}
     obj_name = row["object_name"]
     definition = (json.loads(row.get("metadata_json") or "{}") or {}).get("definition") or {}
     kind, tier = classify_pipeline(definition)
+    if kind == "cdc":
+        return _migrate_cdc(row, definition, deps=deps, target_connection_name=target_connection_name,
+                            gateway_id_map=gateway_id_map if gateway_id_map is not None else {})
     if tier != "tier1" or kind not in ("query_based", "saas"):
         logger.info("[lfc] %s is %s/%s — deferred to a later stage.", obj_name, kind, tier)
         return []
