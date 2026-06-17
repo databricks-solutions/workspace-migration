@@ -24,7 +24,6 @@ from migrate.lfc_utils import (
     classify_pipeline,
     extract_table_configs,
     parse_describe_columns,
-    resolve_saas_cursor,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -45,12 +44,21 @@ def _bt(fqn: str) -> str:
     return ".".join(f"`{p}`" for p in fqn.split("."))
 
 
-def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[dict]:
-    """Migrate one query-based lfc_pipeline row. Returns status dicts.
+def migrate_pipeline(row: dict, *, deps, target_connection_name: str,
+                     saas_cursor_columns: dict[str, str] | None = None) -> list[dict]:
+    """Migrate one Tier-1 query-based or SaaS lfc_pipeline row. Returns status dicts.
 
-    Non-query-based rows return [] (left for a later stage). Per-pipeline
-    isolation is the caller's job (it wraps this in try/except per row).
+    ``saas_cursor_columns`` maps a destination-table FQN (``cat.schema.table``)
+    -> the operator-supplied incremental cursor column. It is MANDATORY for
+    Tier-1 SaaS tables — the connector does not echo its auto-selected cursor in
+    the spec and the tool never guesses. A SaaS table absent from the map
+    full-loads (no row_filter, no unified view). Query-based tables ignore this
+    map (their cursor is read from the spec's nested cursor_columns).
+
+    Non-Tier-1 / cdc / unknown rows return [] (left for a later stage).
+    Per-pipeline isolation is the caller's job (it wraps this in try/except).
     """
+    saas_cursor_columns = saas_cursor_columns or {}
     obj_name = row["object_name"]
     definition = (json.loads(row.get("metadata_json") or "{}") or {}).get("definition") or {}
     kind, tier = classify_pipeline(definition)
@@ -75,21 +83,36 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str) -> list[di
         src = c["source_table"]
         src_table_fqn = f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}"
         # Cursor source differs by connector kind: query-based reads it from the
-        # spec; SaaS resolves it from the destination table's actual columns
-        # (the connector doesn't echo its auto-selected cursor in the spec).
+        # spec; SaaS reads it from the operator-supplied saas_cursor_columns map
+        # (keyed by destination FQN) — the connector doesn't echo its
+        # auto-selected cursor in the spec and the tool never guesses.
         if kind == "query_based":
             cursor = c.get("cursor_column")
         else:
-            cursor = resolve_saas_cursor(source_type, deps.get_columns(src_table_fqn))
-        if not cursor:
-            # No resolvable cursor: a full-load table. Query-based batch tables are
-            # silently full-loaded (existing behaviour); SaaS no-cursor tables record
-            # a tracked note (no unified view — the recreated pipeline full-loads it).
-            if kind == "saas":
+            supplied = saas_cursor_columns.get(src_table_fqn)
+            if not supplied:
+                # No operator-supplied cursor: a full-load table. Record a tracked
+                # note (no unified view — the recreated pipeline full-loads it).
                 results.append({"object_name": src_table_fqn, "object_type": "lfc_view",
                                 "status": "lfc_view_skipped_no_cursor",
-                                "error_message": f"{src} has no resolvable SaaS cursor "
-                                                 f"({source_type}); table full-loads, no unified view"})
+                                "error_message": f"{src} ({source_type}): no cursor supplied in "
+                                                 "lfc_saas_cursor_columns; table full-loads, no unified view"})
+                continue
+            # Validate the supplied cursor against the table's real columns
+            # (case-insensitive); use the real-cased name in the row_filter.
+            by_lower = {col.lower(): col for col in deps.get_columns(src_table_fqn)}
+            cursor = by_lower.get(supplied.lower())
+            if not cursor:
+                # Bad cursor: skip clone+view, do NOT set a wrong row_filter.
+                results.append({"object_name": src_table_fqn, "object_type": "lfc_view",
+                                "status": "lfc_view_skipped_no_cursor",
+                                "error_message": f"{src} ({source_type}): supplied cursor "
+                                                 f"{supplied!r} is not a column of {src_table_fqn}; "
+                                                 "skipped (set a valid cursor in lfc_saas_cursor_columns)"})
+                continue
+        if not cursor:
+            # Query-based batch tables with no cursor are silently full-loaded
+            # (existing behaviour); SaaS no-cursor cases are handled above.
             continue
         cursor_by_src[src] = cursor
         boundary = deps.compute_boundary(src_table_fqn, cursor)
@@ -438,9 +461,11 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
     # Process each pipeline row with per-row isolation
     # ---------------------------------------------------------------------------
     all_results: list[dict] = []
+    saas_cursor_columns = getattr(config, "lfc_saas_cursor_columns", None) or {}
     for row in rows:
         try:
-            row_results = migrate_pipeline(row, deps=deps, target_connection_name=target_connection_name)
+            row_results = migrate_pipeline(row, deps=deps, target_connection_name=target_connection_name,
+                                           saas_cursor_columns=saas_cursor_columns)
             all_results.extend(row_results)
         except Exception as exc:  # noqa: BLE001
             logger.error("[lfc_worker] pipeline %s failed: %s", row.get("object_name"), exc, exc_info=True)

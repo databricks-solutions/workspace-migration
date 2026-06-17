@@ -153,7 +153,9 @@ def _sf_row(dest="orders", source_type="SALESFORCE"):
             "metadata_json": json.dumps({"definition": sf_def})}
 
 
-def test_saas_tier1_resolves_cursor_and_sets_row_filter():
+def test_saas_tier1_uses_supplied_cursor_and_sets_row_filter():
+    # The cursor is operator-supplied via saas_cursor_columns (keyed by dest FQN);
+    # the worker validates it exists, then sets the row_filter — NO auto-guessing.
     deps = MagicMock()
     deps.target_view_exists.return_value = False
     deps.get_columns.return_value = ["Id", "Name", "SystemModstamp", "CreatedDate"]
@@ -161,8 +163,9 @@ def test_saas_tier1_resolves_cursor_and_sets_row_filter():
     deps.clone_history.return_value = {"status": "validated"}
     deps.target_table_exists.return_value = True
     deps.create_pipeline.return_value = "pid-1"
-    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf")
-    # cursor resolved + boundary computed against SystemModstamp
+    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf",
+                               saas_cursor_columns={"bronze.sf.orders": "SystemModstamp"})
+    # boundary computed against the SUPPLIED cursor
     deps.compute_boundary.assert_called_once()
     assert deps.compute_boundary.call_args.args[1] == "SystemModstamp"
     # recreate spec carries the SaaS row_filter
@@ -172,17 +175,52 @@ def test_saas_tier1_resolves_cursor_and_sets_row_filter():
     assert any(r["object_type"] == "lfc_view" and r["status"] == "lfc_view_created" for r in results)
 
 
-def test_saas_tier1_no_cursor_clones_and_fullloads_no_filter():
+def test_saas_tier1_cursor_matched_case_insensitively():
+    # Supplied cursor matches a real column case-insensitively; the REAL-cased
+    # column name is used in the row_filter.
     deps = MagicMock()
     deps.target_view_exists.return_value = False
-    deps.get_columns.return_value = ["Id", "Name"]   # no SF cursor column
+    deps.get_columns.return_value = ["Id", "SystemModstamp"]
+    deps.compute_boundary.return_value = "2026-06-10T00:00:00.000Z"
     deps.clone_history.return_value = {"status": "validated"}
+    deps.target_table_exists.return_value = True
     deps.create_pipeline.return_value = "pid-1"
-    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf")
+    migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf",
+                     saas_cursor_columns={"bronze.sf.orders": "systemmodstamp"})
+    assert deps.compute_boundary.call_args.args[1] == "SystemModstamp"
+
+
+def test_saas_tier1_cursor_absent_from_map_fullloads_no_filter():
+    # cursor not supplied for this table → full-load: skipped_no_cursor, no clone/view.
+    deps = MagicMock()
+    deps.target_view_exists.return_value = False
+    deps.create_pipeline.return_value = "pid-1"
+    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf",
+                               saas_cursor_columns={})
+    deps.get_columns.assert_not_called()
     deps.compute_boundary.assert_not_called()
+    deps.clone_history.assert_not_called()
     spec = deps.create_pipeline.call_args.args[0]
     tc = spec["ingestion_definition"]["objects"][0]["table"]["table_configuration"]
     assert "row_filter" not in tc
-    # a no-cursor table full-loads on the recreated pipeline: no unified view, tracked note
     assert any(r["object_type"] == "lfc_view" and r["status"] == "lfc_view_skipped_no_cursor"
                for r in results)
+
+
+def test_saas_tier1_supplied_cursor_not_a_real_column_is_skipped_with_error():
+    # Operator supplied a cursor that doesn't exist on the table → skip clone+view,
+    # record an error status; do NOT set a bad row_filter.
+    deps = MagicMock()
+    deps.target_view_exists.return_value = False
+    deps.get_columns.return_value = ["Id", "Name"]   # no SystemModstamp
+    deps.create_pipeline.return_value = "pid-1"
+    results = migrate_pipeline(_sf_row(), deps=deps, target_connection_name="tgt_sf",
+                               saas_cursor_columns={"bronze.sf.orders": "SystemModstamp"})
+    deps.compute_boundary.assert_not_called()
+    deps.clone_history.assert_not_called()
+    spec = deps.create_pipeline.call_args.args[0]
+    tc = spec["ingestion_definition"]["objects"][0]["table"]["table_configuration"]
+    assert "row_filter" not in tc
+    views = [r for r in results if r["object_type"] == "lfc_view"]
+    assert len(views) == 1 and views[0]["status"] == "lfc_view_skipped_no_cursor"
+    assert "SystemModstamp" in (views[0]["error_message"] or "")
