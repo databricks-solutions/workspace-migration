@@ -88,7 +88,7 @@ flowchart LR
 | `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
 | `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
 | `migrate_online_tables` job | Optional add-on: converts each discovered legacy online table into a **Lakebase synced table** on the target (legacy online tables are deprecated; creation is blocked platform-wide). Re-syncs from the already-migrated source Delta table into a Lakebase database instance the job creates. |
-| `migrate_lfc` job | Optional add-on (Stage 1): migrates **query-based** Lakeflow Connect pipelines (SQL Server, PostgreSQL, MySQL, Redshift, etc.) via a clone-history + recreate-with-row_filter + unified-view pattern. SaaS connectors and CDC/gateway connectors are later stages. |
+| `migrate_lfc` job | Optional add-on: migrates Lakeflow Connect pipelines across all three families — **query-based DB** and **SaaS row_filter** (Salesforce/GA4/ServiceNow) via clone-history + recreate-with-row_filter + unified view (Tier 1), and **CDC / gateway** DB via recreate gateway + ingestion pipeline, create-only (Tier 2). See Section 6, Step 9. |
 | `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
 | Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
 
@@ -159,8 +159,8 @@ by the standalone `migrate_online_tables` job (see Section 6, Step 8).
 | Apps | Spec-only re-create | Read source app spec, POST to target |
 | Model Serving endpoints | Spec-only re-create | Pure config replay |
 | Genie spaces | Spec-only re-create | Configuration replay |
-| Lakeflow Connect pipelines (query-based) | Clone-history + recreate-with-row_filter + unified view | **Available now** via `migrate_lfc` job (see Section 6, Step 9): Stage 1 covers query-based connectors. CDC/gateway + SaaS connectors remain later stages. |
-| Lakeflow Connect pipelines (CDC/gateway + SaaS) | Source-cutover | Cutover watermark via `START_DATE` or `row_filter`; later stages (not yet in this tool) |
+| Lakeflow Connect pipelines (query-based + SaaS row_filter) | Clone-history + recreate-with-row_filter + unified view | **Available now** via `migrate_lfc` job (Section 6, Step 9). Query-based (cursor from spec) + SaaS row_filter (Salesforce/GA4/ServiceNow; operator-supplied cursor). |
+| Lakeflow Connect pipelines (CDC / gateway) | Recreate gateway + ingestion, create-only | **Available now** via `migrate_lfc` job (Section 6, Step 9). Recreates the gateway + ingestion pipeline (not started); customer starts the re-hydrate at cutover. SaaS GA4/ServiceNow + MySQL/Postgres CDC share the code path, pending a live test. |
 | Agent Bricks | AI compound | Wraps Model Serving + VS + KA + prompt config |
 
 Current scope and cutover notes live in
@@ -562,63 +562,99 @@ ORDER BY status, object_name;
   the target, or migrate those as **snapshot** mode. Snapshot-mode online
   tables are unaffected.
 
-### Step 9 — `migrate_lfc` (Stage 1: query-based connectors) (optional)
+### Step 9 — `migrate_lfc` (Lakeflow Connect pipelines) (optional)
 
-Migrates **query-based** Lakeflow Connect pipelines — SQL Server, PostgreSQL,
-MySQL, Redshift, and any other connector that uses a pull-based cursor (as
-opposed to CDC change-data-capture or a SaaS connector). Running this job is
-itself the opt-in — there is no configuration flag to enable or disable it.
+Migrates Lakeflow Connect ingestion pipelines. Cross-workspace LFC migration is
+a **cut-over, not an in-place move** (`ALTER ... SET PIPELINE_ID` is blocked for
+LFC and checkpoints aren't portable — Aha DB-I-18972), so the job **recreates**
+pipelines on the target. Running the job is itself the opt-in — there's no flag
+to enable/disable it. It handles three connector families across two tiers:
 
-**What it does**
+| Tier | Connectors | What the job does |
+|---|---|---|
+| **Tier 1 — settable boundary** | Query-based DB (SQL Server, PostgreSQL, MySQL, Oracle, Teradata, MariaDB) **and** SaaS row_filter (Salesforce, GA4, ServiceNow) | Clone landed history → recreate with a per-table `row_filter` cursor boundary → unified view. No re-pull of history. |
+| **Tier 2 — no boundary** | CDC / gateway DB (SQL Server, MySQL, PostgreSQL in CDC mode) | Recreate the **gateway + ingestion pipeline** (create-only, **not started**) → the customer starts the continuous re-hydrate at cutover. No clone, no view. |
 
-For each query-based LFC pipeline discovered on the source the job:
+#### Tier 1 — query-based + SaaS row_filter
 
-1. **Clones the landed destination table to `<table>_history`** — using the
-   same Delta Sharing staging + `DEEP CLONE` approach as `migrate_uc`, so no
-   intermediate object storage is needed. This preserves every row that had
-   already been ingested up to the moment of cutover.
+For each Tier-1 pipeline the job:
 
-2. **Recreates the pipeline on the target** writing to `<table>_incr`, with a
-   per-table `row_filter = "<cursor_column> >= '<T>'"` where `T` is the
-   `MAX(cursor_column)` from the cloned history. This ensures the new pipeline
-   pulls only post-cutover rows — there is no re-pull of history that would
-   cause duplicates. The pipeline is created with `channel=PREVIEW` to
-   enable the server-side `row_filter` push-down.
+1. **Clones the landed destination table to `<table>_history`** (Delta Sharing
+   staging + `DEEP CLONE`, same as `migrate_uc` — no intermediate object
+   storage). Preserves every row ingested up to cutover.
+2. **Recreates the pipeline** writing to `<table>_incr`, with a per-table
+   `row_filter = "<cursor> >= '<T>'"` where `T = MAX(<cursor>)` from the cloned
+   history — so the new pipeline pulls only post-cutover rows. After creating
+   it the job triggers one run and waits for it to complete, then builds the view.
+3. **Creates a unified view at the canonical name `<table>`** — SCD1: PK-dedup
+   merge (latest cursor wins); SCD2 / append: `UNION ALL` of `_history` + `_incr`.
 
-3. **Creates a unified view at the canonical name `<table>`**:
-   - SCD1 tables: primary-key dedup merge (latest cursor value wins).
-   - SCD2 / append tables: `UNION ALL` across `_history` and `_incr`.
+**The cursor differs by connector family:**
 
-Batch / formula tables (no usable cursor column) are treated differently:
-the recreated pipeline full-loads them from scratch on its first run, which
-is their normal behaviour. No `_history` clone or unified view is created for
-these tables.
+- **Query-based DB** — the cursor column is read **automatically** from the
+  pipeline spec. No operator input needed.
+- **SaaS (Salesforce / GA4 / ServiceNow)** — the connector auto-selects its
+  cursor and does **not** expose it in the spec, so the tool **never guesses**:
+  the cursor is a **mandatory operator input** via `lfc_saas_cursor_columns`
+  (see config below). Discovery surfaces candidate timestamp/numeric columns per
+  SaaS table (printed in the discovery log + stored in `discovery_inventory`) to
+  help you choose. A SaaS table with **no cursor supplied full-loads** (no
+  `_history`, no view — status `lfc_view_skipped_no_cursor`).
 
-**Table layout after migration**
+**Tier-1 table layout after migration**
 
 | Object | What it is |
 |---|---|
 | `<catalog>.<schema>.<table>_history` | Deep-cloned snapshot of all rows landed before cutover. |
-| `<catalog>.<schema>.<table>_incr` | Streaming table written by the new target LFC pipeline (post-cutover rows only). |
+| `<catalog>.<schema>.<table>_incr` | Streaming table written by the new target pipeline (post-cutover rows only). |
 | `<catalog>.<schema>.<table>` | Unified view — canonical name consumers should use after cutover. |
+
+#### Tier 2 — CDC / gateway
+
+A CDC source is two linked objects: an **ingestion gateway** (connects to the
+source DB, stages change data into a UC volume) and an **ingestion pipeline**
+(`ingestion_gateway_id` → the gateway) that loads the destination tables. For
+each CDC pipeline the job:
+
+1. **Recreates the gateway** on the target (mirroring source topology — each
+   unique gateway once; reuses `lfc_target_connection_name`), then **stops it** —
+   a continuous gateway auto-starts on create, so stopping leaves it
+   *created but not running*.
+2. **Recreates the ingestion pipeline**, remapping `ingestion_gateway_id` to the
+   new gateway, full-reload (no `row_filter`).
+3. **Dry-validates** the recreated pipeline (`validate_only` — a config check, no
+   data run).
+
+The job **does not start** the gateway/pipeline or re-pull data — the customer
+starts the continuous run at cutover. The gateway's internal **staging volume is
+excluded** from volume migration (the recreated gateway makes its own).
 
 **Prerequisites**
 
-1. Run `migrate_uc` (Step 4) first — the destination schemas that the LFC
-   pipelines write into must already exist on the target.
-2. Run `migrate_governance` (Step 6) first if any LFC destination tables carry
+1. Run `migrate_uc` (Step 4) first — the destination schemas the pipelines write
+   into must exist on the target.
+2. Run `migrate_governance` (Step 6) first if any Tier-1 destination tables carry
    RLS / column masks — governance is applied before the view is created.
-3. Create the UC connection on the target workspace before running this job.
-   The tool does **not** create connections automatically; set
-   `lfc_target_connection_name` in `config.yaml` to the name of the
-   pre-existing target connection.
+3. Create the UC connection on the **target** workspace before running. The tool
+   does **not** create connections; set `lfc_target_connection_name`. (For SaaS,
+   this is the SaaS connection — OAuth, admin-authorized; for CDC it's the
+   gateway's source connection.)
 
-**`config.yaml` field**
+**`config.yaml` fields**
 
 ```yaml
-# Name of the pre-existing UC connection on the target workspace that
-# the recreated LFC pipelines will use.
-lfc_target_connection_name: "my_sqlserver_connection"
+# Name of the pre-existing UC connection on the target workspace that the
+# recreated pipelines (and CDC gateway) will use.
+lfc_target_connection_name: "my_connection"
+
+# MANDATORY for SaaS (Salesforce/GA4/ServiceNow) tables you want migrated
+# incrementally: the cursor column per destination-table FQN. The tool never
+# guesses a SaaS cursor; a table omitted here full-loads. Run discovery first
+# and check the printed candidate cursor columns. Not needed for query-based or
+# CDC. Accepts a YAML mapping or a JSON string.
+lfc_saas_cursor_columns:
+  my_catalog.sf.account: SystemModstamp
+  my_catalog.snow.incident: sys_updated_on
 ```
 
 ```bash
@@ -630,7 +666,7 @@ Monitor progress in `migration_status`:
 ```sql
 SELECT object_type, object_name, status, error_message
 FROM migration_tracking.cp_migration.migration_status
-WHERE object_type IN ('lfc_table', 'lfc_pipeline', 'lfc_view')
+WHERE object_type IN ('lfc_table', 'lfc_pipeline', 'lfc_gateway', 'lfc_view')
 ORDER BY object_type, status, object_name;
 ```
 
@@ -638,36 +674,33 @@ ORDER BY object_type, status, object_name;
 
 | `object_type` | Status | Meaning |
 |---|---|---|
-| `lfc_table` | `validated` | `_history` clone completed and verified. |
-| `lfc_pipeline` | `lfc_pipeline_created_incremental` | New pipeline created on target with `row_filter` cursor boundary. |
-| `lfc_pipeline` | `skipped_target_pipeline_exists` | A pipeline for this table already exists on the target (idempotent re-run). |
-| `lfc_view` | `lfc_view_created` | Unified view created at the canonical table name. |
+| `lfc_table` | `validated` | `_history` clone completed and verified (Tier 1). |
+| `lfc_pipeline` | `lfc_pipeline_created_incremental` | Tier-1 pipeline recreated with a `row_filter` cursor boundary. |
+| `lfc_pipeline` | `lfc_pipeline_created_fullreload` | CDC ingestion pipeline recreated (full re-hydrate; validate result folded into `error_message`). |
+| `lfc_pipeline` | `skipped_target_pipeline_exists` | A pipeline for this object already exists on target (idempotent re-run). |
+| `lfc_gateway` | `lfc_gateway_created` | CDC ingestion gateway recreated on target (created, then stopped). |
+| `lfc_view` | `lfc_view_created` | Unified view created at the canonical table name (Tier 1). |
+| `lfc_view` | `lfc_view_skipped_no_cursor` | No cursor for this table (SaaS without an `lfc_saas_cursor_columns` entry, or a batch/formula table) → it full-loads; no view. |
 
 **Known limitations / caveats**
 
-- **Post-cutover source deletes are not propagated.** Lakeflow Connect
-  `row_filter` is a push-down filter for new rows — it has no mechanism to
-  propagate `DELETE` operations that occur on the source after the cursor
-  boundary. The SCD1 unified view may therefore show ghost rows for
-  post-cutover source deletes until a manual reconcile is performed.
-
-- **SCD1 dedup by primary key, SCD2/append by UNION ALL.** The unified view
-  for SCD1 tables uses a primary-key dedup merge (latest cursor value wins);
-  this means if the same PK appears in both `_history` and `_incr` the
-  `_incr` row is preferred. SCD2 and append-mode tables use a simple
-  `UNION ALL`, preserving all versions.
-
-- **Batch / formula tables full-load on the recreated pipeline.** Tables that
-  have no usable cursor column (batch-mode or formula-column tables) cannot
-  use the `row_filter` boundary. The recreated target pipeline will perform a
-  full load on its first run. No `_history` clone or unified view is created
-  for these tables.
-
-- **Stage 1 covers query-based connectors only.** CDC / change-data-capture
-  connectors (Salesforce CDC, SQL Server CDC via gateway) and SaaS connectors
-  (GA4, ServiceNow, Workday, etc.) are **not** migrated by this job. They are
-  deferred to later stages. Running `migrate_lfc` against a workspace that
-  contains only CDC or SaaS pipelines will produce no output.
+- **SaaS cursor is mandatory and not guessed.** For Salesforce/GA4/ServiceNow
+  you must supply the cursor in `lfc_saas_cursor_columns` (discovery lists
+  candidates). Omitted tables full-load. **Salesforce is live-validated; GA4 and
+  ServiceNow ride the same code path but are not yet live-tested** — supply their
+  cursor and verify the result.
+- **CDC is create-only — the customer starts the run.** The recreated gateway +
+  ingestion pipeline are created and validated but **not started**; nothing is
+  re-pulled until the operator starts them at cutover. **Pre-cutover SCD2 history
+  is not preserved** — the gateway re-extracts from the source's current change
+  window. (MySQL/PostgreSQL CDC use the same path but aren't yet live-tested.)
+- **Post-cutover source deletes are not propagated** (Tier 1). `row_filter` only
+  filters new rows; `DELETE`s after the cursor boundary aren't reflected, so an
+  SCD1 view may show ghost rows until a manual reconcile.
+- **SCD1 dedup by PK, SCD2/append by UNION ALL** (Tier 1). If the same PK appears
+  in `_history` and `_incr`, the `_incr` row wins; SCD2/append preserve all versions.
+- **Batch / formula tables full-load** (Tier 1). No usable cursor → the recreated
+  pipeline full-loads on first run; no `_history` clone or view.
 
 ### Step 10 — Verify
 
@@ -688,7 +721,10 @@ WHERE status NOT IN ('validated', 'skipped_by_config',
                      'skipped_instance_not_ready',
                      'created_resync_pending',
                      'lfc_pipeline_created_incremental',
+                     'lfc_pipeline_created_fullreload',
+                     'lfc_gateway_created',
                      'lfc_view_created',
+                     'lfc_view_skipped_no_cursor',
                      'dry_run')
 GROUP BY object_type, status, error_message
 ORDER BY n DESC;
