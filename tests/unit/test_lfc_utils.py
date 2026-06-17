@@ -5,6 +5,7 @@ from migrate.lfc_utils import (
     build_query_based_create_spec,
     build_recreate_spec,
     build_unified_view_sql,
+    candidate_cursor_columns,
     classify_pipeline,
     extract_table_configs,
     parse_describe_columns,
@@ -172,6 +173,40 @@ def test_parse_describe_columns_dict_rows_and_empty():
     assert parse_describe_columns([]) == []
     assert parse_describe_columns([{"col_name": "Id"}, {"col_name": "SystemModstamp"}]) \
         == ["Id", "SystemModstamp"]
+
+
+def test_candidate_cursor_columns_keeps_timestamp_date_numeric():
+    rows = [
+        ["Id", "string", None], ["Name", "string", None],
+        ["SystemModstamp", "timestamp", None], ["CreatedDate", "date", None],
+        ["Amount", "decimal(10,2)", None], ["Qty", "bigint", None],
+        ["IsActive", "boolean", None],
+    ]
+    assert candidate_cursor_columns(rows) == [
+        "SystemModstamp", "CreatedDate", "Amount", "Qty",
+    ]
+
+
+def test_candidate_cursor_columns_stops_at_partition_metadata_and_empty():
+    assert candidate_cursor_columns([]) == []
+    rows = [
+        ["ts", "timestamp_ntz", None], ["", "", ""],
+        ["# Partition Information", "", ""], ["pcol", "int", None],
+    ]
+    assert candidate_cursor_columns(rows) == ["ts"]
+
+
+def test_candidate_cursor_columns_int_yes_interval_no():
+    rows = [["n", "int", None], ["span", "interval", None], ["m", "integer", None]]
+    assert candidate_cursor_columns(rows) == ["n", "m"]
+
+
+def test_candidate_cursor_columns_dict_rows():
+    rows = [
+        {"col_name": "Id", "data_type": "string"},
+        {"col_name": "ModstampN", "data_type": "double"},
+    ]
+    assert candidate_cursor_columns(rows) == ["ModstampN"]
 
 
 def _one_table_def(source_type, dest="orders", extra_tc=None):

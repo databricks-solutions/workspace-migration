@@ -44,14 +44,15 @@ _SAAS_CURSOR_PRIORITY = {
 
 
 def resolve_saas_cursor(source_type: str, available_columns: list[str]) -> str | None:
-    """Pick the incremental cursor column for a Tier-1 SaaS table.
+    """DISCOVERY SUGGESTION ONLY — the doc-recommended cursor for a Tier-1 SaaS
+    table. NOT used for selection: the cursor is a MANDATORY operator-supplied
+    input (``config.lfc_saas_cursor_columns``); the tool never auto-guesses it.
 
-    SaaS connectors do not expose the resolved cursor in the pipeline spec, so we
-    match the connector's documented priority order against the columns that
-    actually exist on the (cloned) destination table. Returns the FIRST priority
-    column present (preserving its real-cased name), or None when none are present
-    (that table then full-loads — no row_filter). Column matching is
-    case-insensitive; the returned name is the real column name."""
+    Matches the connector's documented priority order against the columns that
+    actually exist on the destination table and returns the FIRST priority column
+    present (preserving its real-cased name), or None when none are present.
+    Column matching is case-insensitive. Used by discovery to annotate which
+    candidate column an operator would typically pick."""
     priority = _SAAS_CURSOR_PRIORITY.get(str(source_type or "").upper())
     if not priority:
         return None
@@ -83,6 +84,52 @@ def parse_describe_columns(rows: list) -> list[str]:
             break
         cols.append(name)
     return cols
+
+
+# DESCRIBE TABLE data_type prefixes that are plausible incremental cursors
+# (monotonic / orderable): temporal and numeric. Matched case-insensitively on
+# the leading token so parameterised types (decimal(10,2)) and *_ntz/_ltz
+# variants are caught. "int"/"integer" handled explicitly so "interval" (a
+# duration, not a cursor) is NOT matched.
+_CURSOR_TYPE_PREFIXES = (
+    "timestamp", "date", "bigint", "smallint", "tinyint",
+    "long", "short", "byte", "decimal", "numeric", "double", "float",
+)
+_CURSOR_TYPE_EXACT = frozenset({"int", "integer"})
+
+
+def _describe_rows(rows: list):
+    """Yield (col_name, data_type) from a ``DESCRIBE TABLE`` result, STOPPING at
+    the first metadata section (blank or ``#``-prefixed col_name), mirroring
+    :func:`parse_describe_columns`."""
+    for r in rows or []:
+        if isinstance(r, (list, tuple)):
+            name = r[0] if r else None
+            dtype = r[1] if len(r) > 1 else None
+        elif isinstance(r, dict):
+            name = r.get("col_name")
+            dtype = r.get("data_type")
+        else:
+            name = dtype = None
+        if name is None:
+            continue
+        name = str(name).strip()
+        if not name or name.startswith("#"):
+            break
+        yield name, str(dtype or "").strip().lower()
+
+
+def candidate_cursor_columns(rows: list) -> list[str]:
+    """Plausible cursor columns from a ``DESCRIBE TABLE`` result — those whose
+    type is temporal (timestamp/date) or numeric. A pure discovery aid so an
+    operator can see candidates before declaring ``lfc_saas_cursor_columns``;
+    NOT used for selection. Preserves real column casing and DESCRIBE order."""
+    out: list[str] = []
+    for name, dtype in _describe_rows(rows):
+        head = dtype.split("(", 1)[0]
+        if head in _CURSOR_TYPE_EXACT or dtype.startswith(_CURSOR_TYPE_PREFIXES):
+            out.append(name)
+    return out
 
 
 def classify_pipeline(definition: dict) -> tuple[str, str]:
@@ -139,8 +186,8 @@ def build_recreate_spec(
     source_table -> the full row_filter predicate ("<cursor> >= 'T'"). A table in
     the map gets destination ``<table>_incr`` + that row_filter; a table NOT in the
     map keeps its canonical destination and no filter (full-load). The caller
-    supplies the cursor/boundary — query-based reads it from the spec, SaaS resolves
-    it via resolve_saas_cursor()."""
+    supplies the cursor/boundary — query-based reads it from the spec, SaaS reads
+    it from the operator-supplied lfc_saas_cursor_columns map."""
     spec = (definition or {}).get("spec") or {}
     idef = copy.deepcopy(_ingestion_def(definition))
     idef["connection_name"] = target_connection_name
