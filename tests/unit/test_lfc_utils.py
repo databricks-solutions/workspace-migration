@@ -263,3 +263,18 @@ def test_gateway_staging_volume_fqn():
 
 def test_gateway_staging_volume_fqn_none_on_incomplete():
     assert gateway_staging_volume_fqn({"gateway_storage_catalog": "stg"}) is None
+
+
+from migrate.lfc_utils import build_gateway_recreate_spec  # noqa: E402
+
+
+def test_build_gateway_recreate_spec():
+    spec = build_gateway_recreate_spec(
+        extract_gateway_def(_GW_SPEC), target_connection_name="tgt_sql", name="gw_migrated")
+    assert spec["name"] == "gw_migrated"
+    gd = spec["gateway_definition"]
+    assert gd["connection_name"] == "tgt_sql"          # remapped to target connection
+    # storage location mirrored from source
+    assert gd["gateway_storage_catalog"] == "stg"
+    assert gd["gateway_storage_schema"] == "cdc"
+    assert gd["gateway_storage_name"] == "gw_vol"

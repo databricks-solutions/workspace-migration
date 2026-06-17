@@ -220,6 +220,16 @@ def gateway_staging_volume_fqn(gateway_def: dict) -> str | None:
     return f"{cat}.{sch}.{vol}" if (cat and sch and vol) else None
 
 
+def build_gateway_recreate_spec(gateway_def: dict, *, target_connection_name: str, name: str) -> dict:
+    """pipelines.create spec for the recreated ingestion gateway: target connection,
+    staging storage location mirrored from source. The gateway creates its own
+    staging volume at that location on the target."""
+    gd = copy.deepcopy(gateway_def or {})
+    gd["connection_name"] = target_connection_name
+    gd.pop("connection_id", None)  # source id; let the connection_name resolve on target
+    return {"name": name, "gateway_definition": gd}
+
+
 def build_unified_view_sql(
     *, canonical: str, history: str, incr: str,
     scd_type: str, primary_keys: list[str], cursor_column: str,
