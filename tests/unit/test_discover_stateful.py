@@ -52,6 +52,69 @@ def test_discover_stateful_empty_when_all_surfaces_empty():
     assert disc._discover_stateful(MagicMock(), stateful, _now()) == []
 
 
+def _sf_pipeline_def(dest_table="account"):
+    return {"spec": {"catalog": "bronze", "schema": "sf", "ingestion_definition": {
+        "source_type": "SALESFORCE", "connection_name": "sf", "objects": [
+        {"table": {"source_table": dest_table, "destination_catalog": "bronze",
+                   "destination_schema": "sf", "destination_table": dest_table,
+                   "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["Id"]}}}]}}}
+
+
+def test_discover_stateful_records_saas_cursor_candidates(capsys):
+    stateful = MagicMock()
+    for m in ("list_vector_search_indexes", "list_apps", "list_database_instances",
+              "list_synced_tables", "list_model_serving_endpoints"):
+        getattr(stateful, m).return_value = []
+    stateful.list_lfc_pipelines.return_value = [
+        {"pipeline_name": "sf_account", "pipeline_id": "p1", "definition": _sf_pipeline_def()}
+    ]
+
+    def _describe(fqn):
+        assert fqn == "bronze.sf.account"
+        return [["Id", "string", None], ["SystemModstamp", "timestamp", None],
+                ["CreatedDate", "date", None], ["Name", "string", None]]
+
+    rows = disc._discover_stateful(MagicMock(), stateful, _now(), describe_columns=_describe)
+    meta = json.loads([r for r in rows if r["object_type"] == "lfc_pipeline"][0]["metadata_json"])
+    assert meta["candidate_cursor_columns"] == {
+        "bronze.sf.account": ["SystemModstamp", "CreatedDate"]
+    }
+    # operator-facing summary line printed per table
+    out = capsys.readouterr().out
+    assert "bronze.sf.account" in out and "SystemModstamp" in out
+
+
+def test_discover_stateful_saas_cursor_candidates_table_missing(capsys):
+    stateful = MagicMock()
+    for m in ("list_vector_search_indexes", "list_apps", "list_database_instances",
+              "list_synced_tables", "list_model_serving_endpoints"):
+        getattr(stateful, m).return_value = []
+    stateful.list_lfc_pipelines.return_value = [
+        {"pipeline_name": "sf_account", "pipeline_id": "p1", "definition": _sf_pipeline_def()}
+    ]
+
+    def _describe(fqn):
+        raise RuntimeError("TABLE_OR_VIEW_NOT_FOUND")
+
+    rows = disc._discover_stateful(MagicMock(), stateful, _now(), describe_columns=_describe)
+    meta = json.loads([r for r in rows if r["object_type"] == "lfc_pipeline"][0]["metadata_json"])
+    # graceful: empty candidate list, no crash
+    assert meta["candidate_cursor_columns"] == {"bronze.sf.account": []}
+
+
+def test_discover_stateful_no_describe_does_not_enrich():
+    stateful = MagicMock()
+    for m in ("list_vector_search_indexes", "list_apps", "list_database_instances",
+              "list_synced_tables", "list_model_serving_endpoints"):
+        getattr(stateful, m).return_value = []
+    stateful.list_lfc_pipelines.return_value = [
+        {"pipeline_name": "sf_account", "pipeline_id": "p1", "definition": _sf_pipeline_def()}
+    ]
+    rows = disc._discover_stateful(MagicMock(), stateful, _now())
+    meta = json.loads([r for r in rows if r["object_type"] == "lfc_pipeline"][0]["metadata_json"])
+    assert "candidate_cursor_columns" not in meta
+
+
 def test_discover_uc_online_table_reclassified_as_stateful():
     """online_table rows emitted by _discover_uc must be tagged
     source_type='stateful' with capability='online_store' preserved in

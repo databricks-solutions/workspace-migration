@@ -33,6 +33,12 @@ from common.config import MigrationConfig
 from common.sql_utils import find_warehouse, write_discovery_inventory_via_warehouse
 from common.stateful_utils import CAPABILITY, StatefulExplorer
 from common.tracking import TrackingManager, discovery_row, discovery_schema
+from migrate.lfc_utils import (
+    candidate_cursor_columns,
+    classify_pipeline,
+    extract_table_configs,
+    resolve_saas_cursor,
+)
 from migrate.reconciliation import resolve_current_job_run_id
 
 # COMMAND ----------
@@ -507,13 +513,48 @@ def _discover_hive(config, explorer, now) -> list[dict]:
 # COMMAND ----------
 
 
-def _discover_stateful(config, stateful, now) -> list[dict]:
+def _annotate_saas_cursor_candidates(meta: dict, describe_columns) -> None:
+    """For a Tier-1 SaaS lfc_pipeline meta dict, DESCRIBE each landed destination
+    table on the SOURCE and record the plausible cursor columns (timestamp/date/
+    numeric) under ``metadata['candidate_cursor_columns']`` (keyed by dest FQN),
+    plus a doc-recommended suggestion. Prints one operator-facing summary line
+    per table so the operator can populate ``lfc_saas_cursor_columns`` before
+    migration. Tables that don't exist yet describe to an empty list (no crash).
+    No-op for non-Tier-1-SaaS pipelines (no cursor handle to set)."""
+    definition = (meta or {}).get("definition") or {}
+    if classify_pipeline(definition) != ("saas", "tier1"):
+        return
+    source_type = str((((definition.get("spec") or {}).get("ingestion_definition")) or {})
+                       .get("source_type") or "").upper()
+    candidates: dict[str, list[str]] = {}
+    for c in extract_table_configs(definition):
+        dest_fqn = f"{c['destination_catalog']}.{c['destination_schema']}.{c['destination_table']}"
+        try:
+            cols = candidate_cursor_columns(describe_columns(dest_fqn))
+        except Exception as exc:  # noqa: BLE001 — table may not exist yet; skip gracefully
+            print(f"[stateful][lfc] {dest_fqn}: cannot DESCRIBE yet ({type(exc).__name__}); "
+                  "no cursor candidates")
+            cols = []
+        candidates[dest_fqn] = cols
+        suggested = resolve_saas_cursor(source_type, cols)
+        hint = f" (suggested: {suggested})" if suggested else ""
+        print(f"[stateful][lfc] {source_type} {dest_fqn}: candidate cursor columns = "
+              f"{cols or '[]'}{hint} — set in lfc_saas_cursor_columns before migrate_lfc")
+    meta["candidate_cursor_columns"] = candidates
+
+
+def _discover_stateful(config, stateful, now, *, describe_columns=None) -> list[dict]:
     """Discover stateful-service objects (source_type='stateful').
 
     Each surface's list_* returns dicts with a name key + a "definition" raw
     spec. We tag every row source_type='stateful' and stash the capability
     subtype alongside the raw spec in metadata_json. Dependency analysis is a
     later step that reads these rows; discovery only enumerates + persists.
+
+    When ``describe_columns`` (a ``dest_fqn -> list[describe_rows]`` callable) is
+    supplied, Tier-1 SaaS lfc_pipeline rows are additionally annotated with the
+    candidate cursor columns of each landed destination table — a discovery aid
+    so the operator can populate the MANDATORY ``lfc_saas_cursor_columns`` map.
     """
     # `config` is accepted for symmetry with _discover_uc/_discover_hive and
     # reserved for a future stateful catalog/scope filter; unused today.
@@ -531,6 +572,8 @@ def _discover_stateful(config, stateful, now) -> list[dict]:
         for item in list_fn():
             meta = dict(item)
             meta["capability"] = CAPABILITY[obj_type]
+            if obj_type == "lfc_pipeline" and describe_columns is not None:
+                _annotate_saas_cursor_candidates(meta, describe_columns)
             rows.append(
                 discovery_row(
                     source_type="stateful",
@@ -610,7 +653,22 @@ def run(dbutils, spark):  # noqa: D103
 
     print("[stateful] Scanning stateful-service surfaces...")
     stateful_explorer = StatefulExplorer(auth)
-    inventory.extend(_discover_stateful(config, stateful_explorer, now))
+
+    def _describe_columns(fqn: str) -> list:
+        """Raw DESCRIBE TABLE rows of a landed table on the SOURCE warehouse.
+        Used to surface candidate SaaS cursor columns; raises on a missing table
+        so the annotator can skip it gracefully."""
+        from common.sql_utils import execute_and_fetch
+
+        src_wh_id = find_warehouse(auth, use_source=True)
+        bt = ".".join(f"`{p}`" for p in fqn.split("."))
+        res = execute_and_fetch(auth, src_wh_id, f"DESCRIBE TABLE {bt}", use_source=True)
+        if res["state"] != "SUCCEEDED":
+            raise RuntimeError(f"DESCRIBE failed for {fqn}: {res.get('error', res['state'])}")
+        return res.get("rows") or []
+
+    inventory.extend(_discover_stateful(config, stateful_explorer, now,
+                                        describe_columns=_describe_columns))
 
     print(f"\nTotal objects discovered: {len(inventory)}")
 
