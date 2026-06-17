@@ -328,6 +328,13 @@ depending on whether a prior migration created it).
 - A Lakeview dashboard surfaces counts, failures, and durations per
   object type
 
+## Support
+
+Databricks does not offer official support for Databricks Solutions and its
+repository. For any issue with these assets or the demos installed, please open
+an issue using GitHub and the team will have a look on a best-effort basis.
+
 ## License
 
-See [LICENSE.md](LICENSE.md).
+Released under the Databricks License — see [LICENSE.md](LICENSE.md). Third-party
+dependency attributions are in [NOTICE.md](NOTICE.md).
