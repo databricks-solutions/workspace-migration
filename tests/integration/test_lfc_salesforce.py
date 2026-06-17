@@ -42,8 +42,9 @@ _tgt_wh = find_warehouse(_auth, use_source=False)
 
 _CATALOG = "integration_test_lfc_sf"
 _SCHEMA = "sf"
-_ACCOUNT_FQN = f"{_CATALOG}.{_SCHEMA}.account"
+_ACCOUNT_FQN = f"{_CATALOG}.{_SCHEMA}.account"        # cursor supplied → unified view
 _HISTORY_FQN = f"{_CATALOG}.{_SCHEMA}.account_history"
+_CONTACT_FQN = f"{_CATALOG}.{_SCHEMA}.contact"        # NO cursor supplied → full-load table
 _PIPELINE_NAME = "lfc_it_sf_account"
 _MIGRATED_PIPELINE_NAME = "lfc_it_sf_account_migrated"
 
@@ -111,17 +112,15 @@ if not _view_rows:
     summary["lfc_view"] = "FAILED_no_row"
 else:
     _vs = _view_rows[0]["status"]
+    # End-to-end: Salesforce is reachable from the target over the internet, so the
+    # recreated pipeline must run and the unified view must be CREATED. Deferred is
+    # NOT accepted — that would mean forward ingestion didn't complete.
     if _vs == "lfc_view_created":
         summary["lfc_view"] = "asserted_ok"
         print(f"[test-lfc-sf] lfc_view ok: {_ACCOUNT_FQN} lfc_view_created")
-    elif _vs == "lfc_view_pending_forward_ingest":
-        summary["lfc_view"] = "asserted_ok (deferred — no target forward ingestion)"
-        print(f"[test-lfc-sf] lfc_view deferred: {_view_rows[0]['error_message']}")
     else:
-        errors.append(f"lfc_view {_ACCOUNT_FQN!r}: status={_vs!r}, expected created or pending. err={_view_rows[0]['error_message']!r}")
-        summary["lfc_view"] = "FAILED_wrong_status"
-
-_view_deferred = bool(_view_rows) and _view_rows[0]["status"] == "lfc_view_pending_forward_ingest"
+        errors.append(f"lfc_view {_ACCOUNT_FQN!r}: status={_vs!r}, expected 'lfc_view_created' (end-to-end). err={_view_rows[0]['error_message']!r}")
+        summary["lfc_view"] = "FAILED_not_created"
 
 # COMMAND ----------
 # --- TARGET: account_history exists with expected row count ---
@@ -148,20 +147,27 @@ else:
         print(f"[test-lfc-sf] target account_history ok: {_hist_count} rows")
 
 # COMMAND ----------
-# --- TARGET: unified view exists (skipped when deferred) ---
-if _view_deferred:
-    summary["target_view"] = "skipped (view deferred)"
-    print("[test-lfc-sf] target unified view check skipped — view deferred")
+# --- TARGET: unified view exists AND its row count matches source ---
+# SCD1 view = account_history UNION account_incr, deduped by Id → COUNT(*) must
+# equal the seeded source Account row count.
+_view_cnt_res = execute_and_fetch(
+    _auth, _tgt_wh, f"SELECT COUNT(*) AS n FROM `{_CATALOG}`.`{_SCHEMA}`.`account`", use_source=False,
+)
+if _view_cnt_res["state"] != "SUCCEEDED":
+    errors.append(f"target unified view {_ACCOUNT_FQN!r} not queryable: {_view_cnt_res.get('error', _view_cnt_res['state'])}")
+    summary["target_view"] = "FAILED_not_queryable"
 else:
-    _view_res = execute_and_fetch(
-        _auth, _tgt_wh, f"SELECT 1 AS _e FROM `{_CATALOG}`.`{_SCHEMA}`.`account` LIMIT 1", use_source=False,
-    )
-    if _view_res["state"] != "SUCCEEDED":
-        errors.append(f"target unified view {_ACCOUNT_FQN!r} not queryable: {_view_res.get('error', _view_res['state'])}")
-        summary["target_view"] = "FAILED_not_found"
+    _vc_raw = (_view_cnt_res.get("rows") or [[None]])[0]
+    _view_count = int(_vc_raw[0]) if _vc_raw and _vc_raw[0] is not None else 0
+    if _seed_rows > 0 and _view_count != _seed_rows:
+        errors.append(
+            f"target unified view {_ACCOUNT_FQN!r}: row count {_view_count} != source Account {_seed_rows} "
+            "(SCD1 view should dedup to the source cardinality)"
+        )
+        summary["target_view"] = f"FAILED_count_mismatch ({_view_count} vs {_seed_rows})"
     else:
-        summary["target_view"] = "asserted_ok"
-        print(f"[test-lfc-sf] target unified view {_ACCOUNT_FQN!r} exists")
+        summary["target_view"] = f"asserted_ok ({_view_count} rows)"
+        print(f"[test-lfc-sf] target unified view {_ACCOUNT_FQN!r} ok: {_view_count} rows == source {_seed_rows}")
 
 # COMMAND ----------
 # --- TARGET: recreated pipeline object exists ---
@@ -180,6 +186,49 @@ if not _tgt_pipeline_found:
 else:
     summary["target_pipeline_created"] = "asserted_ok"
     print(f"[test-lfc-sf] target pipeline {_MIGRATED_PIPELINE_NAME!r} exists")
+
+# COMMAND ----------
+# --- CONTACT (no cursor supplied) → full-load path, NOT a unified view ---
+# We deliberately did NOT supply a cursor for contact in lfc_saas_cursor_columns,
+# so the worker must: (1) record lfc_view_skipped_no_cursor, (2) NOT clone a
+# contact_history, (3) leave contact as a full-load table the recreated pipeline
+# reloads — so target contact exists with the full source row count.
+_contact_view_rows = [r for r in _by_type["lfc_view"] if _CONTACT_FQN in (r["object_name"] or "")]
+if not _contact_view_rows:
+    errors.append(f"contact: no lfc_view row for {_CONTACT_FQN!r}. rows: {[r['object_name'] for r in _by_type['lfc_view']]}")
+    summary["contact_no_cursor"] = "FAILED_no_row"
+elif _contact_view_rows[0]["status"] != "lfc_view_skipped_no_cursor":
+    errors.append(f"contact {_CONTACT_FQN!r}: status={_contact_view_rows[0]['status']!r}, expected 'lfc_view_skipped_no_cursor'")
+    summary["contact_no_cursor"] = "FAILED_wrong_status"
+else:
+    summary["contact_no_cursor"] = "asserted_ok"
+    print(f"[test-lfc-sf] contact ok: {_CONTACT_FQN} lfc_view_skipped_no_cursor (full-load, no view)")
+
+# No history clone should exist for the no-cursor table.
+if any("contact_history" in (r["object_name"] or "") for r in _by_type["lfc_table"]):
+    errors.append("contact: a contact_history clone exists, but a no-cursor table must NOT be cloned")
+    summary["contact_no_history"] = "FAILED_unexpected_clone"
+else:
+    summary["contact_no_history"] = "asserted_ok"
+
+# Target contact is a full-load table (recreated pipeline reloads it) — count == source.
+_contact_seed_str = dbutils.jobs.taskValues.get(taskKey="seed_lfc_salesforce", key="contact_rows", debugValue="0")  # noqa: F821
+_contact_seed = int(_contact_seed_str) if str(_contact_seed_str).isdigit() else 0
+_contact_res = execute_and_fetch(
+    _auth, _tgt_wh, f"SELECT COUNT(*) AS n FROM `{_CATALOG}`.`{_SCHEMA}`.`contact`", use_source=False,
+)
+if _contact_res["state"] != "SUCCEEDED":
+    errors.append(f"target contact (full-load) not queryable: {_contact_res.get('error', _contact_res['state'])}")
+    summary["target_contact_fullload"] = "FAILED_not_queryable"
+else:
+    _cc_raw = (_contact_res.get("rows") or [[None]])[0]
+    _contact_count = int(_cc_raw[0]) if _cc_raw and _cc_raw[0] is not None else 0
+    if _contact_seed > 0 and _contact_count != _contact_seed:
+        errors.append(f"target contact full-load: row count {_contact_count} != source Contact {_contact_seed}")
+        summary["target_contact_fullload"] = f"FAILED_count_mismatch ({_contact_count} vs {_contact_seed})"
+    else:
+        summary["target_contact_fullload"] = f"asserted_ok ({_contact_count} rows)"
+        print(f"[test-lfc-sf] target contact full-load ok: {_contact_count} rows == source {_contact_seed}")
 
 # COMMAND ----------
 _result = json.dumps({"summary": summary, "errors": errors})

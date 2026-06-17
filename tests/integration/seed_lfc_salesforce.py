@@ -54,10 +54,15 @@ _CONNECTION_NAME = "hs_salesforce"
 _CATALOG = "integration_test_lfc_sf"
 _SCHEMA = "sf"
 _PIPELINE_NAME = "lfc_it_sf_account"
-_SF_SOURCE_OBJECT = "Account"     # Salesforce SObject API name
 _SF_SOURCE_SCHEMA = "objects"     # Salesforce LFC addresses SObjects under schema "objects"
-_DEST_TABLE = "account"
 _PRIMARY_KEY = "Id"
+# Two objects in one pipeline to exercise BOTH SaaS paths in one migration:
+#   account  → a cursor IS supplied in lfc_saas_cursor_columns → Tier-1 (clone +
+#              row_filter + unified view).
+#   contact  → NO cursor supplied → full-load (recreated pipeline reloads it,
+#              no _history, no unified view; status lfc_view_skipped_no_cursor).
+# (SObject API name, destination table)
+_OBJECTS = [("Account", "account"), ("Contact", "contact")]
 _POLL_TIMEOUT_SECONDS = 600
 _POLL_INTERVAL_SECONDS = 15
 
@@ -123,22 +128,24 @@ if _existing_pid:
     _src_client.pipelines.delete(_existing_pid)
     print(f"[seed-lfc-sf] deleted existing source pipeline {_existing_pid!r} ({_PIPELINE_NAME!r})")
 
-# SaaS table spec: NO query_based_connector_config, NO row_filter (the migration
-# adds the row_filter on the resolved cursor). scd_type SCD1, PK Id.
-_table = {
-    "source_table": _SF_SOURCE_OBJECT,
-    "destination_catalog": _CATALOG,
-    "destination_schema": _SCHEMA,
-    "destination_table": _DEST_TABLE,
-    "table_configuration": {"primary_keys": [_PRIMARY_KEY], "scd_type": "SCD_TYPE_1"},
-}
-if _SF_SOURCE_SCHEMA:
-    _table["source_schema"] = _SF_SOURCE_SCHEMA
+# SaaS table specs: NO query_based_connector_config, NO row_filter (the migration
+# adds the row_filter on the operator-supplied cursor, per-table). scd_type SCD1, PK Id.
+def _table_spec(sobject: str, dest: str) -> dict:
+    t = {
+        "source_table": sobject,
+        "source_schema": _SF_SOURCE_SCHEMA,
+        "destination_catalog": _CATALOG,
+        "destination_schema": _SCHEMA,
+        "destination_table": dest,
+        "table_configuration": {"primary_keys": [_PRIMARY_KEY], "scd_type": "SCD_TYPE_1"},
+    }
+    return t
+
 
 _idef = {
     "connection_name": _CONNECTION_NAME,
     "source_type": "SALESFORCE",
-    "objects": [{"table": _table}],
+    "objects": [{"table": _table_spec(_obj, _dest)} for _obj, _dest in _OBJECTS],
 }
 
 _created = _src_client.pipelines.create(
@@ -152,37 +159,42 @@ _pipeline_id = _created.pipeline_id  # type: ignore[union-attr]
 print(f"[seed-lfc-sf] source pipeline created: {_pipeline_id!r} ({_PIPELINE_NAME!r})")
 
 # COMMAND ----------
-# --- Trigger first update and wait for the account table to have rows ---
+# --- Trigger first update and wait for ALL destination tables to have rows ---
 _src_client.pipelines.start_update(_pipeline_id)
 print(f"[seed-lfc-sf] triggered update for {_pipeline_id!r}, polling up to {_POLL_TIMEOUT_SECONDS}s ...")
 
-_dest_fqn = f"`{_CATALOG}`.`{_SCHEMA}`.`{_DEST_TABLE}`"
-_account_rows = 0
+_counts: dict[str, int] = {dest: 0 for _, dest in _OBJECTS}
 _elapsed = 0
 while _elapsed < _POLL_TIMEOUT_SECONDS:
     time.sleep(_POLL_INTERVAL_SECONDS)
     _elapsed += _POLL_INTERVAL_SECONDS
-    try:
-        _cnt_rows = spark.sql(f"SELECT COUNT(*) AS n FROM {_dest_fqn}").collect()  # noqa: F821
-        _account_rows = _cnt_rows[0]["n"]
-        if _account_rows > 0:
-            print(f"[seed-lfc-sf] {_dest_fqn} has {_account_rows} rows after {_elapsed}s — pipeline landed data")
-            break
-    except Exception as _exc:  # noqa: BLE001
-        print(f"[seed-lfc-sf] table not yet queryable after {_elapsed}s: {_exc}")
+    for _, _dest in _OBJECTS:
+        if _counts[_dest] > 0:
+            continue
+        _fqn = f"`{_CATALOG}`.`{_SCHEMA}`.`{_dest}`"
+        try:
+            _counts[_dest] = spark.sql(f"SELECT COUNT(*) AS n FROM {_fqn}").collect()[0]["n"]  # noqa: F821
+        except Exception as _exc:  # noqa: BLE001
+            print(f"[seed-lfc-sf] {_dest} not yet queryable after {_elapsed}s: {_exc}")
+    if all(_counts[d] > 0 for _, d in _OBJECTS):
+        print(f"[seed-lfc-sf] all tables landed after {_elapsed}s: {_counts}")
+        break
 
-if _account_rows == 0:
+_missing = [d for _, d in _OBJECTS if _counts[d] == 0]
+if _missing:
     raise RuntimeError(
-        f"[seed-lfc-sf] {_dest_fqn} has 0 rows after {_POLL_TIMEOUT_SECONDS}s — "
+        f"[seed-lfc-sf] tables {_missing} had 0 rows after {_POLL_TIMEOUT_SECONDS}s — "
         "pipeline did not land data in time; check the Salesforce LFC pipeline logs."
     )
 
 # COMMAND ----------
 # Emit provable exit value (notebook stdout is not retrievable via Jobs API).
+# Per-table row counts so the assertion notebook can match target == source.
 dbutils.jobs.taskValues.set(key="has_saas", value="true")  # noqa: F821
 dbutils.jobs.taskValues.set(key="source_pipeline_id", value=_pipeline_id)  # noqa: F821
-dbutils.jobs.taskValues.set(key="account_rows", value=str(_account_rows))  # noqa: F821
-print(f"[seed-lfc-sf] flags: has_saas=true pipeline_id={_pipeline_id!r} account_rows={_account_rows}")
+dbutils.jobs.taskValues.set(key="account_rows", value=str(_counts["account"]))  # noqa: F821
+dbutils.jobs.taskValues.set(key="contact_rows", value=str(_counts["contact"]))  # noqa: F821
+print(f"[seed-lfc-sf] flags: has_saas=true pipeline_id={_pipeline_id!r} counts={_counts}")
 dbutils.notebook.exit(  # noqa: F821
-    json.dumps({"has_saas": True, "source_pipeline_id": _pipeline_id, "account_rows": _account_rows})
+    json.dumps({"has_saas": True, "source_pipeline_id": _pipeline_id, "counts": _counts})
 )
