@@ -294,22 +294,36 @@ def _cdc_row(name="cdc_orders", gw_id="src-gw-1"):
             "metadata_json": json.dumps({"definition": d})}
 
 
-def test_cdc_recreates_gateway_then_ingestion_and_validates():
+def test_cdc_recreates_gateway_then_ingestion_validates_and_stops_gateway():
     deps = MagicMock()
     deps.target_view_exists.return_value = False
     deps.create_gateway.return_value = "tgt-gw-9"
     deps.create_pipeline.return_value = "tgt-ing-9"
+    deps.validate_pipeline.return_value = "validated"
     gmap = {}
     results = migrate_pipeline(_cdc_row(), deps=deps, target_connection_name="tgt_sql", gateway_id_map=gmap)
     deps.create_gateway.assert_called_once()                       # gateway recreated
     assert gmap["src-gw-1"] == "tgt-gw-9"                           # mapping cached
     spec = deps.create_pipeline.call_args.args[0]
     assert spec["ingestion_definition"]["ingestion_gateway_id"] == "tgt-gw-9"   # remapped
-    deps.validate_pipeline.assert_called()                          # dry-validate run
+    deps.validate_pipeline.assert_called_once_with("tgt-ing-9")    # validate the INGESTION
+    deps.stop_pipeline.assert_called_once_with("tgt-gw-9")          # auto-started gateway STOPPED
     assert any(r["object_type"] == "lfc_gateway" and r["status"] == "lfc_gateway_created" for r in results)
-    assert any(r["status"] == "lfc_pipeline_created_fullreload" for r in results)
-    # NOT started:
-    deps.run_pipeline_and_await.assert_not_called()
+    ing = [r for r in results if r["object_type"] == "lfc_pipeline"][0]
+    assert ing["status"] == "lfc_pipeline_created_fullreload" and ing["error_message"] is None
+    deps.run_pipeline_and_await.assert_not_called()                # NOT started
+
+
+def test_cdc_validate_config_error_fails_the_ingestion():
+    deps = MagicMock()
+    deps.target_view_exists.return_value = False
+    deps.create_gateway.return_value = "tgt-gw-9"
+    deps.create_pipeline.return_value = "tgt-ing-9"
+    deps.validate_pipeline.return_value = "failed"                  # genuine config error
+    results = migrate_pipeline(_cdc_row(), deps=deps, target_connection_name="t", gateway_id_map={})
+    ing = [r for r in results if r["object_type"] == "lfc_pipeline"][0]
+    assert ing["status"] == "failed" and "validate" in (ing["error_message"] or "")
+    deps.stop_pipeline.assert_called_once()                        # gateway still stopped
 
 
 def test_cdc_shared_gateway_recreated_once():
@@ -317,8 +331,10 @@ def test_cdc_shared_gateway_recreated_once():
     deps.target_view_exists.return_value = False
     deps.create_gateway.return_value = "tgt-gw-9"
     deps.create_pipeline.side_effect = ["i1", "i2"]
+    deps.validate_pipeline.return_value = "validated"
     gmap = {}
     migrate_pipeline(_cdc_row("cdc_a"), deps=deps, target_connection_name="t", gateway_id_map=gmap)
     migrate_pipeline(_cdc_row("cdc_b"), deps=deps, target_connection_name="t", gateway_id_map=gmap)
     deps.create_gateway.assert_called_once()    # same source gateway → recreated once
     assert deps.create_pipeline.call_count == 2  # both ingestion pipelines recreated
+    deps.stop_pipeline.assert_called_once()      # gateway stopped once (on creation)

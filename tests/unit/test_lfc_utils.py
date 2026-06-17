@@ -258,11 +258,15 @@ def test_extract_gateway_def_none_when_absent():
 
 
 def test_gateway_staging_volume_fqn():
-    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC)) == "stg.cdc.gw_vol"
+    # live-confirmed: the staging volume is named with the gateway PIPELINE id,
+    # not gateway_storage_name.
+    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC), "gw-pid-1") == \
+        "stg.cdc.__databricks_ingestion_gateway_staging_data-gw-pid-1"
 
 
 def test_gateway_staging_volume_fqn_none_on_incomplete():
-    assert gateway_staging_volume_fqn({"gateway_storage_catalog": "stg"}) is None
+    assert gateway_staging_volume_fqn({"gateway_storage_catalog": "stg"}, "gw-pid-1") is None
+    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC), None) is None
 
 
 from migrate.lfc_utils import build_gateway_recreate_spec  # noqa: E402
@@ -278,6 +282,23 @@ def test_build_gateway_recreate_spec():
     assert gd["gateway_storage_catalog"] == "stg"
     assert gd["gateway_storage_schema"] == "cdc"
     assert gd["gateway_storage_name"] == "gw_vol"
+
+
+def test_recreate_specs_mirror_source_compute():
+    # Compute fields (serverless/clusters/photon/budget_policy_id) carry source→target
+    # so the recreated pipeline runs on the SAME compute. LFC carries none (serverless-only).
+    gw = build_gateway_recreate_spec(
+        extract_gateway_def(_GW_SPEC), target_connection_name="t", name="g",
+        source_spec={"serverless": True, "photon": False, "budget_policy_id": "bp1"})
+    assert gw["serverless"] is True and gw["photon"] is False and gw["budget_policy_id"] == "bp1"
+    # classic clusters mirrored verbatim
+    classic = {"spec": {"ingestion_definition": {"ingestion_gateway_id": "g", "objects": []},
+                        "clusters": [{"label": "default", "num_workers": 2}]}}
+    ing = build_cdc_ingestion_recreate_spec(classic, target_gateway_id="g2", name="i")
+    assert ing["clusters"] == [{"label": "default", "num_workers": 2}]
+    # LFC (no compute fields) → none carried
+    bare = build_gateway_recreate_spec(extract_gateway_def(_GW_SPEC), target_connection_name="t", name="g")
+    assert "serverless" not in bare and "clusters" not in bare
 
 
 from migrate.lfc_utils import build_cdc_ingestion_recreate_spec  # noqa: E402

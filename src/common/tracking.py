@@ -124,10 +124,10 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "lfc_gateway_created",
     # Lakeflow Connect (Tier-2 CDC): the ingestion pipeline was recreated on
     # target pointing at the new gateway, full-reload (no row_filter, not started).
+    # The validate_only result is folded into this row's error_message (None when
+    # validated; "created; validate inconclusive" otherwise). A genuine config
+    # error instead records the ingestion pipeline as "failed".
     "lfc_pipeline_created_fullreload",
-    # Lakeflow Connect (Tier-2 CDC): start_update(validate_only=True) confirmed the
-    # recreated config resolves (record-and-assert; not a real run).
-    "lfc_pipeline_validated",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 

@@ -607,7 +607,10 @@ def _gateway_staging_volume_fqns(inventory: list[dict]) -> set[str]:
         except _json.JSONDecodeError:
             continue
         gw_spec = ((meta.get("definition") or {}).get("gateway_spec")) or {}
-        fqn = gateway_staging_volume_fqn(extract_gateway_def(gw_spec))
+        # The staging volume is named with the gateway's PIPELINE id, not
+        # gateway_storage_name (live-confirmed), so pass the gateway pipeline id.
+        gw_pipeline_id = (gw_spec.get("spec") or {}).get("id") or gw_spec.get("pipeline_id")
+        fqn = gateway_staging_volume_fqn(extract_gateway_def(gw_spec), gw_pipeline_id)
         if fqn:
             fqns.add(fqn)
     return fqns
