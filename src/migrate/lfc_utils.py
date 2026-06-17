@@ -220,6 +220,20 @@ def gateway_staging_volume_fqn(gateway_def: dict) -> str | None:
     return f"{cat}.{sch}.{vol}" if (cat and sch and vol) else None
 
 
+def build_cdc_ingestion_recreate_spec(definition: dict, *, target_gateway_id: str, name: str) -> dict:
+    """pipelines.create spec for the recreated CDC ingestion pipeline: gateway id
+    remapped to the new target gateway, NO row_filter (full re-hydrate)."""
+    spec = (definition or {}).get("spec") or {}
+    idef = copy.deepcopy(_ingestion_def(definition))
+    idef["ingestion_gateway_id"] = target_gateway_id
+    out = {"name": name, "ingestion_definition": idef}
+    if spec.get("catalog"):
+        out["catalog"] = spec["catalog"]
+    if spec.get("schema"):
+        out["schema"] = spec["schema"]
+    return out
+
+
 def build_gateway_recreate_spec(gateway_def: dict, *, target_connection_name: str, name: str) -> dict:
     """pipelines.create spec for the recreated ingestion gateway: target connection,
     staging storage location mirrored from source. The gateway creates its own

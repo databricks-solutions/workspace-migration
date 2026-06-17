@@ -278,3 +278,23 @@ def test_build_gateway_recreate_spec():
     assert gd["gateway_storage_catalog"] == "stg"
     assert gd["gateway_storage_schema"] == "cdc"
     assert gd["gateway_storage_name"] == "gw_vol"
+
+
+from migrate.lfc_utils import build_cdc_ingestion_recreate_spec  # noqa: E402
+
+_CDC_ING = {"spec": {"catalog": "bronze", "schema": "cdc", "ingestion_definition": {
+    "ingestion_gateway_id": "src-gw-1", "objects": [
+    {"table": {"source_schema": "dbo", "source_table": "orders",
+               "destination_catalog": "bronze", "destination_schema": "cdc", "destination_table": "orders",
+               "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["id"]}}}]}}}
+
+
+def test_build_cdc_ingestion_recreate_spec():
+    spec = build_cdc_ingestion_recreate_spec(
+        {"spec": _CDC_ING["spec"]}, target_gateway_id="tgt-gw-9", name="ing_migrated")
+    idef = spec["ingestion_definition"]
+    assert idef["ingestion_gateway_id"] == "tgt-gw-9"     # remapped
+    assert spec["catalog"] == "bronze" and spec["schema"] == "cdc"
+    tc = idef["objects"][0]["table"]["table_configuration"]
+    assert "row_filter" not in tc                          # full reload, no boundary
+    assert spec["name"] == "ing_migrated"
