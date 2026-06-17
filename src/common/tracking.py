@@ -118,6 +118,16 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     # cursor, so the recreated pipeline full-loads it and no unified view is built.
     # Terminal so re-runs don't reprocess it.
     "lfc_view_skipped_no_cursor",
+    # Lakeflow Connect (Tier-2 CDC, gateway-based): the source gateway was
+    # recreated on target (new id, target connection, mirrored staging). Terminal
+    # so re-runs don't recreate a shared gateway twice.
+    "lfc_gateway_created",
+    # Lakeflow Connect (Tier-2 CDC): the ingestion pipeline was recreated on
+    # target pointing at the new gateway, full-reload (no row_filter, not started).
+    "lfc_pipeline_created_fullreload",
+    # Lakeflow Connect (Tier-2 CDC): start_update(validate_only=True) confirmed the
+    # recreated config resolves (record-and-assert; not a real run).
+    "lfc_pipeline_validated",
 )
 _TERMINAL_STATUSES_SQL = ", ".join(f"'{s}'" for s in _TERMINAL_STATUSES)
 
