@@ -165,7 +165,8 @@ class TestTrackingManager:
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
-            "'lfc_view_skipped_no_cursor')"
+            "'lfc_view_skipped_no_cursor', 'lfc_gateway_created', "
+            "'lfc_pipeline_created_fullreload')"
             in sql_arg
         )
         # object_type is passed via args= (parameterized), not interpolated
@@ -313,7 +314,8 @@ class TestTrackingManager:
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
-            "'lfc_view_skipped_no_cursor')"
+            "'lfc_view_skipped_no_cursor', 'lfc_gateway_created', "
+            "'lfc_pipeline_created_fullreload')"
             in sql
         )
         # Guard against regression to the old LIKE filter that swept up
@@ -549,6 +551,12 @@ class TestStagingManifest:
         mock_spark.sql.return_value.collect.return_value = []
         result = tm.get_staging_for_original("`c`.`s`.`missing`")
         assert result is None
+
+
+def test_cdc_statuses_are_terminal():
+    from common.tracking import _TERMINAL_STATUSES
+    for s in ("lfc_gateway_created", "lfc_pipeline_created_fullreload"):
+        assert s in _TERMINAL_STATUSES
 
 
 def test_vector_search_terminal_statuses_present():

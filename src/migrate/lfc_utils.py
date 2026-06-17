@@ -205,6 +205,76 @@ def build_recreate_spec(
         out["catalog"] = spec["catalog"]
     if spec.get("schema"):
         out["schema"] = spec["schema"]
+    _carry_compute_fields(spec, out)
+    return out
+
+
+# Compute-determining top-level pipeline fields. Carried source→target so the
+# recreated pipeline runs on the SAME compute as the source (classic↔classic,
+# serverless↔serverless). LFC managed ingestion/gateways are serverless-only and
+# carry NONE of these — so this is a no-op for LFC today, but it guarantees parity
+# and future-proofs any pipeline that does declare a compute mode. NOTE: a classic
+# ``clusters`` block references workspace-specific node types / instance pools, so
+# cross-workspace it is a verbatim copy that may need target-side adjustment.
+_COMPUTE_FIELDS = ("serverless", "clusters", "photon", "budget_policy_id")
+
+
+def _carry_compute_fields(src_spec: dict, out: dict) -> None:
+    """Copy the source spec's compute fields into the recreate spec (if present)."""
+    for f in _COMPUTE_FIELDS:
+        if (src_spec or {}).get(f) is not None:
+            out[f] = copy.deepcopy(src_spec[f])
+
+
+def extract_gateway_def(gateway_spec: dict) -> dict | None:
+    """The gateway_definition from a gateway pipeline's get()-dict, or None."""
+    return ((gateway_spec or {}).get("spec") or {}).get("gateway_definition") or None
+
+
+# The platform auto-names the gateway's staging volume with the gateway pipeline id
+# (NOT the gateway_storage_name field), in the gateway_storage catalog/schema.
+_GATEWAY_STAGING_VOLUME_PREFIX = "__databricks_ingestion_gateway_staging_data-"
+
+
+def gateway_staging_volume_fqn(gateway_def: dict, gateway_pipeline_id: str) -> str | None:
+    """`cat.schema.volume` of the gateway's auto-created staging volume, or None if
+    incomplete. The volume is named ``__databricks_ingestion_gateway_staging_data-
+    <gateway_pipeline_id>`` (live-confirmed) — NOT ``gateway_storage_name`` — so the
+    exclusion must key off the gateway pipeline id."""
+    gd = gateway_def or {}
+    cat, sch = gd.get("gateway_storage_catalog"), gd.get("gateway_storage_schema")
+    if not (cat and sch and gateway_pipeline_id):
+        return None
+    return f"{cat}.{sch}.{_GATEWAY_STAGING_VOLUME_PREFIX}{gateway_pipeline_id}"
+
+
+def build_cdc_ingestion_recreate_spec(definition: dict, *, target_gateway_id: str, name: str) -> dict:
+    """pipelines.create spec for the recreated CDC ingestion pipeline: gateway id
+    remapped to the new target gateway, NO row_filter (full re-hydrate). Compute
+    fields mirrored from source."""
+    spec = (definition or {}).get("spec") or {}
+    idef = copy.deepcopy(_ingestion_def(definition))
+    idef["ingestion_gateway_id"] = target_gateway_id
+    out = {"name": name, "ingestion_definition": idef}
+    if spec.get("catalog"):
+        out["catalog"] = spec["catalog"]
+    if spec.get("schema"):
+        out["schema"] = spec["schema"]
+    _carry_compute_fields(spec, out)
+    return out
+
+
+def build_gateway_recreate_spec(gateway_def: dict, *, target_connection_name: str, name: str,
+                                source_spec: dict | None = None) -> dict:
+    """pipelines.create spec for the recreated ingestion gateway: target connection,
+    staging storage location mirrored from source. The gateway creates its own
+    staging volume at that location on the target. ``source_spec`` (the source
+    gateway pipeline's top-level spec) is used to mirror compute fields."""
+    gd = copy.deepcopy(gateway_def or {})
+    gd["connection_name"] = target_connection_name
+    gd.pop("connection_id", None)  # source id; let the connection_name resolve on target
+    out = {"name": name, "gateway_definition": gd}
+    _carry_compute_fields(source_spec or {}, out)
     return out
 
 

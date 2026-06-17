@@ -44,9 +44,62 @@ def _bt(fqn: str) -> str:
     return ".".join(f"`{p}`" for p in fqn.split("."))
 
 
+def _migrate_cdc(row, definition, *, deps, target_connection_name, gateway_id_map):
+    """Migrate one Tier-2 CDC (gateway-based) lfc_pipeline row: recreate its
+    gateway (once per unique source gateway, via the shared gateway_id_map), then
+    recreate the ingestion pipeline pointing at the new gateway (full-reload, no
+    row_filter), dry-validating each. Does NOT start a real run."""
+    from migrate.lfc_utils import (
+        build_cdc_ingestion_recreate_spec,
+        build_gateway_recreate_spec,
+        extract_gateway_def,
+    )
+    obj = row["object_name"]
+    results = []
+    src_gw_id = _ingestion_def(definition).get("ingestion_gateway_id")
+    gateway_spec = (definition or {}).get("gateway_spec") or {}
+    gw_def = extract_gateway_def(gateway_spec)
+    if not src_gw_id or not gw_def:
+        return [{"object_name": obj, "object_type": "lfc_pipeline", "status": "failed",
+                 "error_message": "CDC pipeline missing gateway id / nested gateway_spec"}]
+    # Gateway-first: recreate each unique source gateway once (shared map). A
+    # continuous gateway AUTO-STARTS on create, so we stop it after wiring the
+    # ingestion pipeline — honouring "created, not running" (the operator starts
+    # the real continuous run at cutover). Compute fields are mirrored from source.
+    tgt_gw_id = gateway_id_map.get(src_gw_id)
+    new_gateway = tgt_gw_id is None
+    if new_gateway:
+        gw_name = f"{(gw_def.get('gateway_storage_name') or 'gateway')}_migrated"
+        gw_spec = build_gateway_recreate_spec(
+            gw_def, target_connection_name=target_connection_name, name=gw_name,
+            source_spec=gateway_spec.get("spec") or {})
+        tgt_gw_id = deps.create_gateway(gw_spec)
+        gateway_id_map[src_gw_id] = tgt_gw_id
+        results.append({"object_name": gw_name, "object_type": "lfc_gateway",
+                        "status": "lfc_gateway_created", "error_message": None})
+    ing_spec = build_cdc_ingestion_recreate_spec(definition, target_gateway_id=tgt_gw_id, name=f"{obj}_migrated")
+    tgt_ing_id = deps.create_pipeline(ing_spec)
+    # Dry-validate the ingestion pipeline (exercises the gateway link) while the
+    # gateway is still up. validate_pipeline returns "validated" | "failed" |
+    # "inconclusive"; only a genuine config error ("failed") fails the object.
+    vstate = deps.validate_pipeline(tgt_ing_id)
+    if vstate == "failed":
+        results.append({"object_name": obj, "object_type": "lfc_pipeline", "status": "failed",
+                        "error_message": "recreated CDC ingestion pipeline failed validate_only (config error)"})
+    else:
+        results.append({"object_name": obj, "object_type": "lfc_pipeline",
+                        "status": "lfc_pipeline_created_fullreload",
+                        "error_message": None if vstate == "validated" else f"created; validate {vstate}"})
+    # Honour "created, not running": stop the auto-started gateway (once, on creation).
+    if new_gateway:
+        deps.stop_pipeline(tgt_gw_id)
+    return results
+
+
 def migrate_pipeline(row: dict, *, deps, target_connection_name: str,
-                     saas_cursor_columns: dict[str, str] | None = None) -> list[dict]:
-    """Migrate one Tier-1 query-based or SaaS lfc_pipeline row. Returns status dicts.
+                     saas_cursor_columns: dict[str, str] | None = None,
+                     gateway_id_map: dict[str, str] | None = None) -> list[dict]:
+    """Migrate one lfc_pipeline row. Returns status dicts.
 
     ``saas_cursor_columns`` maps a destination-table FQN (``cat.schema.table``)
     -> the operator-supplied incremental cursor column. It is MANDATORY for
@@ -55,13 +108,20 @@ def migrate_pipeline(row: dict, *, deps, target_connection_name: str,
     full-loads (no row_filter, no unified view). Query-based tables ignore this
     map (their cursor is read from the spec's nested cursor_columns).
 
-    Non-Tier-1 / cdc / unknown rows return [] (left for a later stage).
-    Per-pipeline isolation is the caller's job (it wraps this in try/except).
+    ``gateway_id_map`` (source-gateway-id -> new-target-gateway-id) is shared
+    across rows by ``run()`` so a CDC gateway referenced by N ingestion pipelines
+    is recreated exactly once. Tier-1 rows ignore it.
+
+    Unknown rows return [] (left for a later stage). Per-pipeline isolation is the
+    caller's job (it wraps this in try/except).
     """
     saas_cursor_columns = saas_cursor_columns or {}
     obj_name = row["object_name"]
     definition = (json.loads(row.get("metadata_json") or "{}") or {}).get("definition") or {}
     kind, tier = classify_pipeline(definition)
+    if kind == "cdc":
+        return _migrate_cdc(row, definition, deps=deps, target_connection_name=target_connection_name,
+                            gateway_id_map=gateway_id_map if gateway_id_map is not None else {})
     if tier != "tier1" or kind not in ("query_based", "saas"):
         logger.info("[lfc] %s is %s/%s — deferred to a later stage.", obj_name, kind, tier)
         return []
@@ -384,6 +444,20 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         except Exception:  # noqa: BLE001
             return False
 
+    def _compute_kwargs(spec: dict) -> dict:
+        """Forward the source's compute fields to pipelines.create so the target
+        runs on the SAME compute (classic↔classic, serverless↔serverless). LFC
+        carries none of these (serverless-only) → empty kwargs; present only to
+        honour parity + future-proof other compute modes."""
+        kw: dict = {}
+        for f in ("serverless", "photon", "budget_policy_id"):
+            if spec.get(f) is not None:
+                kw[f] = spec[f]
+        if spec.get("clusters"):
+            from databricks.sdk.service.pipelines import PipelineCluster
+            kw["clusters"] = [PipelineCluster.from_dict(c) for c in spec["clusters"]]
+        return kw
+
     def _create_pipeline(spec: dict) -> None:
         """Create the recreated LFC pipeline on the TARGET workspace.
 
@@ -400,6 +474,7 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
             schema=spec.get("schema"),
             channel=spec.get("channel", "PREVIEW"),
             ingestion_definition=IngestionPipelineDefinition.from_dict(spec["ingestion_definition"]),
+            **_compute_kwargs(spec),
         )
         return created.pipeline_id
 
@@ -438,6 +513,73 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         if res["state"] != "SUCCEEDED":
             raise RuntimeError(f"create_view failed: {res.get('error', res['state'])}\nSQL: {sql}")
 
+    def _create_gateway(spec):
+        """Create the recreated ingestion GATEWAY on the TARGET workspace.
+
+        A gateway pipeline is created with the typed gateway_definition only — no
+        top-level catalog/schema (its staging storage lives inside the
+        gateway_definition's gateway_storage_{catalog,schema,name})."""
+        from databricks.sdk.service.pipelines import IngestionGatewayPipelineDefinition
+
+        created = auth.target_client.pipelines.create(
+            name=spec["name"],
+            gateway_definition=IngestionGatewayPipelineDefinition.from_dict(spec["gateway_definition"]),
+            **_compute_kwargs(spec),
+        )                                      # live-confirmed: gateway create, no top-level catalog/schema
+        return created.pipeline_id
+
+    def _validate_pipeline(pipeline_id, *, max_attempts: int = 40, sleep_seconds: float = 10.0) -> str:
+        """Dry-validate: a validate_only update (analysis-only, no data, no continuous
+        run). Returns 'validated' (update COMPLETED), 'failed' (update FAILED — a
+        genuine config-resolution error), or 'inconclusive' (start error / still
+        running past the budget — serverless spin-up can be slow). The caller fails
+        the object only on 'failed'."""
+        try:
+            auth.target_client.pipelines.start_update(pipeline_id, validate_only=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[lfc] validate_only start(%s) failed: %s", pipeline_id, exc)
+            return "inconclusive"
+        for _ in range(max_attempts):
+            time.sleep(sleep_seconds)
+            try:
+                ups = auth.target_client.pipelines.get(pipeline_id).latest_updates or []
+                state = str(ups[0].state).upper() if ups else ""
+            except Exception:  # noqa: BLE001
+                continue
+            if "COMPLETED" in state:
+                return "validated"
+            if "FAILED" in state or "CANCELED" in state or "CANCELLED" in state:
+                return _classify_validate_failure(pipeline_id)
+        return "inconclusive"
+
+    def _classify_validate_failure(pipeline_id) -> str:
+        """A FAILED validate update is 'failed' (genuine config error) UNLESS its
+        cause is the gateway not being fully staged — "waiting for global metadata"
+        / "Ingestion Gateway pipeline is running". That timeout means the config +
+        gateway link RESOLVED but the (intentionally not-run) gateway has no staged
+        metadata yet → 'inconclusive', not a config error."""
+        gateway_not_ready = ("waiting for global metadata", "ingestion gateway pipeline is running")
+        try:
+            from itertools import islice
+            for e in islice(auth.target_client.pipelines.list_pipeline_events(pipeline_id), 50):
+                texts = [(e.message or "").lower()]
+                err = getattr(e, "error", None)
+                texts += [(getattr(ex, "message", "") or "").lower()
+                          for ex in (getattr(err, "exceptions", None) or [])]
+                if any(any(k in t for k in gateway_not_ready) for t in texts):
+                    return "inconclusive"
+        except Exception:  # noqa: BLE001
+            pass
+        return "failed"
+
+    def _stop_pipeline(pipeline_id) -> None:
+        """Stop a (continuous) pipeline — used to halt the auto-started gateway so
+        the migration leaves it created-but-not-running."""
+        try:
+            auth.target_client.pipelines.stop(pipeline_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[lfc] stop(%s) failed: %s", pipeline_id, exc)
+
     deps = types.SimpleNamespace(
         compute_boundary=_compute_boundary,
         get_columns=_get_columns,
@@ -447,6 +589,9 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
         create_pipeline=_create_pipeline,
         run_pipeline_and_await=_run_pipeline_and_await,
         create_view=_create_view,
+        create_gateway=_create_gateway,
+        validate_pipeline=_validate_pipeline,
+        stop_pipeline=_stop_pipeline,
     )
 
     # Read target_connection_name from config
@@ -462,10 +607,14 @@ def run(dbutils, spark) -> None:  # noqa: ARG001 — spark unused; kept for work
     # ---------------------------------------------------------------------------
     all_results: list[dict] = []
     saas_cursor_columns = getattr(config, "lfc_saas_cursor_columns", None) or {}
+    # Shared across rows so a CDC gateway referenced by N ingestion pipelines is
+    # recreated exactly once (source-gateway-id -> new-target-gateway-id).
+    gateway_id_map: dict[str, str] = {}
     for row in rows:
         try:
             row_results = migrate_pipeline(row, deps=deps, target_connection_name=target_connection_name,
-                                           saas_cursor_columns=saas_cursor_columns)
+                                           saas_cursor_columns=saas_cursor_columns,
+                                           gateway_id_map=gateway_id_map)
             all_results.extend(row_results)
         except Exception as exc:  # noqa: BLE001
             logger.error("[lfc_worker] pipeline %s failed: %s", row.get("object_name"), exc, exc_info=True)

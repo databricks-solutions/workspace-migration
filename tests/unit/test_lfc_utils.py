@@ -239,3 +239,83 @@ def test_table_absent_from_map_keeps_canonical_name_no_filter():
     t = spec["ingestion_definition"]["objects"][0]["table"]
     assert t["destination_table"] == "orders"
     assert "row_filter" not in t["table_configuration"]
+
+
+# --- CDC (Tier-2, gateway-based) pure helpers ---
+from migrate.lfc_utils import extract_gateway_def, gateway_staging_volume_fqn  # noqa: E402
+
+_GW_SPEC = {"spec": {"gateway_definition": {
+    "connection_name": "src_sql", "gateway_storage_catalog": "stg",
+    "gateway_storage_schema": "cdc", "gateway_storage_name": "gw_vol"}}}
+
+
+def test_extract_gateway_def():
+    assert extract_gateway_def(_GW_SPEC)["gateway_storage_name"] == "gw_vol"
+
+
+def test_extract_gateway_def_none_when_absent():
+    assert extract_gateway_def({"spec": {"ingestion_definition": {}}}) is None
+
+
+def test_gateway_staging_volume_fqn():
+    # live-confirmed: the staging volume is named with the gateway PIPELINE id,
+    # not gateway_storage_name.
+    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC), "gw-pid-1") == \
+        "stg.cdc.__databricks_ingestion_gateway_staging_data-gw-pid-1"
+
+
+def test_gateway_staging_volume_fqn_none_on_incomplete():
+    assert gateway_staging_volume_fqn({"gateway_storage_catalog": "stg"}, "gw-pid-1") is None
+    assert gateway_staging_volume_fqn(extract_gateway_def(_GW_SPEC), None) is None
+
+
+from migrate.lfc_utils import build_gateway_recreate_spec  # noqa: E402
+
+
+def test_build_gateway_recreate_spec():
+    spec = build_gateway_recreate_spec(
+        extract_gateway_def(_GW_SPEC), target_connection_name="tgt_sql", name="gw_migrated")
+    assert spec["name"] == "gw_migrated"
+    gd = spec["gateway_definition"]
+    assert gd["connection_name"] == "tgt_sql"          # remapped to target connection
+    # storage location mirrored from source
+    assert gd["gateway_storage_catalog"] == "stg"
+    assert gd["gateway_storage_schema"] == "cdc"
+    assert gd["gateway_storage_name"] == "gw_vol"
+
+
+def test_recreate_specs_mirror_source_compute():
+    # Compute fields (serverless/clusters/photon/budget_policy_id) carry source→target
+    # so the recreated pipeline runs on the SAME compute. LFC carries none (serverless-only).
+    gw = build_gateway_recreate_spec(
+        extract_gateway_def(_GW_SPEC), target_connection_name="t", name="g",
+        source_spec={"serverless": True, "photon": False, "budget_policy_id": "bp1"})
+    assert gw["serverless"] is True and gw["photon"] is False and gw["budget_policy_id"] == "bp1"
+    # classic clusters mirrored verbatim
+    classic = {"spec": {"ingestion_definition": {"ingestion_gateway_id": "g", "objects": []},
+                        "clusters": [{"label": "default", "num_workers": 2}]}}
+    ing = build_cdc_ingestion_recreate_spec(classic, target_gateway_id="g2", name="i")
+    assert ing["clusters"] == [{"label": "default", "num_workers": 2}]
+    # LFC (no compute fields) → none carried
+    bare = build_gateway_recreate_spec(extract_gateway_def(_GW_SPEC), target_connection_name="t", name="g")
+    assert "serverless" not in bare and "clusters" not in bare
+
+
+from migrate.lfc_utils import build_cdc_ingestion_recreate_spec  # noqa: E402
+
+_CDC_ING = {"spec": {"catalog": "bronze", "schema": "cdc", "ingestion_definition": {
+    "ingestion_gateway_id": "src-gw-1", "objects": [
+    {"table": {"source_schema": "dbo", "source_table": "orders",
+               "destination_catalog": "bronze", "destination_schema": "cdc", "destination_table": "orders",
+               "table_configuration": {"scd_type": "SCD_TYPE_1", "primary_keys": ["id"]}}}]}}}
+
+
+def test_build_cdc_ingestion_recreate_spec():
+    spec = build_cdc_ingestion_recreate_spec(
+        {"spec": _CDC_ING["spec"]}, target_gateway_id="tgt-gw-9", name="ing_migrated")
+    idef = spec["ingestion_definition"]
+    assert idef["ingestion_gateway_id"] == "tgt-gw-9"     # remapped
+    assert spec["catalog"] == "bronze" and spec["schema"] == "cdc"
+    tc = idef["objects"][0]["table"]["table_configuration"]
+    assert "row_filter" not in tc                          # full reload, no boundary
+    assert spec["name"] == "ing_migrated"
