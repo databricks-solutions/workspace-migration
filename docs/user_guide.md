@@ -1,7 +1,16 @@
 # Workspace Migration — User Guide
 
 A Databricks Asset Bundle (DAB) that migrates Unity Catalog and legacy Hive
-Metastore objects between Databricks workspaces.
+Metastore objects between Databricks workspaces, plus the surrounding
+methodology for a full control-plane migration.
+
+This guide covers both:
+
+- **The tool** — how to set it up and run it, and exactly which objects it
+  migrates (Sections 5–7).
+- **The migration approach** — the phased methodology around the tool, the
+  per-data-type strategy, and the assets the tool does *not* move directly
+  (handled via the Terraform exporter or manual steps) — Sections 2–4, 8–11.
 
 ---
 
@@ -9,772 +18,526 @@ Metastore objects between Databricks workspaces.
 
 ### What it does
 
-`workspace-migration` is a self-contained DAB that replays a source
-workspace's Unity Catalog and Hive Metastore objects into a target
-workspace. It moves data (managed-table bytes), structure (catalogs,
-schemas, tables, views, functions, volumes), and governance (grants,
-tags, row filters, column masks, customer shares) — without requiring
-data egress through external storage.
+`workspace-migration` replays a source workspace's Unity Catalog and Hive
+Metastore objects into a target workspace. It moves data (managed-table
+bytes), structure (catalogs, schemas, tables, views, functions, volumes), and
+governance (grants, tags, row filters, column masks, customer shares) —
+**without requiring data egress through external storage**.
+
+It is one part of a larger migration. A control-plane migration also involves
+infrastructure, identity, workspace assets (notebooks/jobs), and stateful
+services — the tool handles the **UC & data plane**; the rest is covered by
+the phased approach in Section 2 and the Terraform-exporter path in Section 8.
 
 ### When to use it
 
-- **Control-plane migrations** — moving a workspace between regions or
-  cloud account boundaries (e.g. UK West → UK South).
-- **Account consolidations** — merging multiple Databricks accounts into
-  one.
-- **Region moves** — relocating workloads closer to users or data
-  sources.
-- **Workspace re-platforming** — moving onto a fresh workspace with
-  updated networking, identity, or compute defaults.
+- **Control-plane migrations** — moving a workspace between regions or cloud
+  account boundaries (e.g. UK West → UK South).
+- **Account consolidations** — merging multiple Databricks accounts.
+- **Region moves** — relocating workloads closer to users or data sources.
+- **Workspace re-platforming** — onto a fresh workspace with updated
+  networking, identity, or compute defaults.
+
+A control-plane migration is **not** in-place: workspace IDs change, a new UC
+metastore is required, and a new DBFS root is provisioned. Data-plane storage
+(ADLS Gen2) stays put — external-table data is never moved.
 
 ### How data moves
 
 Managed-table bytes move via **Delta Sharing + `DEEP CLONE`** — the tool
-creates an internal share on source, the target consumes it as a foreign
-catalog, and each managed table is cloned into the target's UC. No
-intermediate object storage is required. External tables, views,
-functions, and governance objects are replayed via DDL.
+creates an internal share on source, the target consumes it, and each managed
+table is cloned into the target's UC. No intermediate object storage is
+required. External tables, views, functions, and governance objects are
+replayed via DDL.
 
 ### Design tenets
 
-- **Idempotent** — every worker re-runnable; status is tracked
-  per-object in a Delta table, so re-runs only act on pending objects.
-- **No source mutation** — source workspace is never modified for
-  managed-table migration. Row-filter / column-mask tables use a
-  staging-copy pattern (Path A) that never strips source policies.
-- **Standalone jobs** — UC, Hive, and Governance are independent
-  workflows; operators decide ordering.
+- **Idempotent** — every worker is re-runnable; status is tracked per-object
+  in a Delta table, so re-runs only act on pending objects.
+- **No source mutation** — the source workspace is never modified for
+  managed-table migration. Row-filter / column-mask tables use a staging-copy
+  pattern (Path A) that never strips source policies.
+- **Standalone jobs** — UC, Hive, and Governance are independent workflows;
+  operators decide ordering.
 - **Serverless-only compute** — no cluster management, no init scripts.
-- **Auditable** — every action lands a row in `migration_status` with a
+- **Auditable** — every action lands a row in `migration_status`, with a
   Lakeview dashboard summarising counts, failures, and durations.
 
 ---
 
-## 2. High-level architecture
+## 2. Migration phases
 
-```mermaid
-flowchart LR
-    subgraph SRC["Source workspace"]
-        S_UC[("UC catalogs/schemas/tables<br/>volumes, views, funcs, models")]
-        S_HIVE[("Hive metastore")]
-    end
+A full control-plane migration follows a phased approach. This tool automates
+**Phase 2** (and contributes to Phase 3/4); the other phases are operator- and
+methodology-driven.
 
-    subgraph TGT["Target workspace (tool runs here)"]
-        DISC["discovery job<br/><i>scans source via Delta Sharing</i>"]
-        UC["migrate_uc job<br/><i>data plane</i>"]
-        HIVE["migrate_hive job<br/><i>Hive external + managed</i>"]
-        GOV["migrate_governance job<br/><i>tags, RLS, CM, comments,<br/>monitors, shares, fcat</i>"]
-        TRACK[("migration_tracking.cp_migration<br/>• discovery_inventory<br/>• migration_status<br/>• pre_check_results")]
-    end
-
-    SRC -- "Delta Sharing<br/>(cp_migration_share)" --> DISC
-    DISC --> TRACK
-    DISC -. "upstream of" .-> UC
-    DISC -. "upstream of" .-> HIVE
-    DISC -. "upstream of" .-> GOV
-    UC --> TRACK
-    HIVE --> TRACK
-    GOV --> TRACK
-```
-
-**Core components**
-
-| Component | Role |
-|---|---|
-| `pre_check` job | Validates connectivity, grants, target collisions, RLS/CM admin-bypass invariants. Run before any side-effecting job. |
-| `discovery` job | Inventories source via Delta Sharing + REST. Populates `discovery_inventory`. |
-| `migrate_uc` job | UC data plane: managed tables, external tables, views, functions, volumes, models, grants. |
-| `migrate_hive` job | Hive (legacy): databases, tables, views, functions, grants — migrated into a UC target catalog. |
-| `migrate_governance` job | Fine-grained governance: tags, RLS, column masks, comments, monitors, customer shares, foreign catalogs, connections, policies. |
-| `migrate_vector_search` job | Optional add-on: recreates Delta Sync Vector Search indexes on the target and triggers re-embedding from the already-migrated source Delta table. |
-| `migrate_online_tables` job | Optional add-on: converts each discovered legacy online table into a **Lakebase synced table** on the target (legacy online tables are deprecated; creation is blocked platform-wide). Re-syncs from the already-migrated source Delta table into a Lakebase database instance the job creates. |
-| `migrate_lfc` job | Optional add-on: migrates Lakeflow Connect pipelines across all three families — **query-based DB** and **SaaS row_filter** (Salesforce/GA4/ServiceNow) via clone-history + recreate-with-row_filter + unified view (Tier 1), and **CDC / gateway** DB via recreate gateway + ingestion pipeline, create-only (Tier 2). See Section 6, Step 9. |
-| `migration_tracking.cp_migration` | Three Delta tables holding discovery inventory, per-object status, pre-check results. |
-| Lakeview dashboard | Visual progress + failure surface. Deployed by the bundle. |
-
-A more detailed view (per-job task graph, code layout) lives in
-[docs/peer-review-diagrams.md](peer-review-diagrams.md) and as an
-openable HTML viewer at [docs/peer-review-diagrams.html](peer-review-diagrams.html).
-
----
-
-## 3. Features
-
-### Supported today
-
-**Unity Catalog**
-
-| Category | Coverage |
-|---|---|
-| Containers | Catalogs, schemas |
-| Data | Managed tables (Delta), managed Iceberg (via DDL replay opt-in), external tables |
-| Code | Views, SQL functions, Python UDFs |
-| Files | Volumes (managed with file-level copy, external via metadata) |
-| Access | Grants (catalog/schema/table/volume/function) |
-| Governance | Tags, row filters, column masks, ABAC policies, comments |
-| Sharing | Customer-defined shares, recipients, providers (tables, views, volumes, schemas, catalogs) |
-| Other | Lakehouse monitors, registered models (metadata + aliases), connections, foreign catalogs |
-
-**Legacy Hive Metastore**
-
-- Databases, managed + external tables, views, functions, grants
-- Migrated by the standalone `migrate_hive` job, written into a UC
-  target catalog (`hive_target_catalog`, default `hive_upgraded`)
-
-**Operational features**
-
-- Dry-run mode (`dry_run: true`) — produces a full plan without DDL
-- Catalog / schema filters — scope a run to specific namespaces
-- Idempotent re-runs — `migration_status` filters out completed objects
-- Collision handling (`on_target_collision: fail | skip`)
-- RLS / column-mask migration via staging-copy (Path A)
-- Iceberg DDL-replay strategy (opt-in via `iceberg_strategy: ddl_replay`)
-- Byte-sized for-each batching to stay under the Databricks Jobs
-  3000-byte payload limit
-- Lakeview dashboard with per-object-type counts, failures, durations
-
-### Deliberately out of scope today
-
-Hard-skipped with a `skipped_by_stateful_service_migration` status — these
-require dedicated cutover semantics and are planned for Phase 3 (see
-next section):
-
-- Streaming Tables (Kafka / Auto Loader checkpoints don't transfer)
-- Materialized Views (rebuild semantics)
-
-Online Tables were previously hard-skipped here; they are now migrated
-by the standalone `migrate_online_tables` job (see Section 6, Step 8).
-
-### Coming in Phase 3 — stateful services
-
-| Service | Pattern | Notes |
+| Phase | Key actions | Tool involvement |
 |---|---|---|
-| DLT pipelines | Spec + rebuild from UC (if UC-sourced) | Customer-owned definitions; checkpoints don't transfer |
-| Streaming Tables | Source-cutover | Re-create + cutover watermark; previously hard-skipped |
-| Materialized Views | Spec + rebuild | Re-create + REFRESH; previously hard-skipped |
-| Online Tables | Convert to Lakebase synced table | Legacy online tables are deprecated (creation blocked platform-wide). **Available now** via `migrate_online_tables` job (see Section 6, Step 8): converts each online table to a Lakebase **synced table** re-syncing from the migrated source Delta table. Consumer repoint is operator-owned. |
-| Vector Search indexes | Spec + rebuild | Delta Sync indexes: **available now** via `migrate_vector_search` job (see Section 6, Step 7). Direct Access indexes remain deferred. |
-| Lakebase | Dump / restore | `pg_dump` / `pg_restore` out-of-band |
-| Online Feature Store | Dump / restore | Out-of-band state move |
-| Apps | Spec-only re-create | Read source app spec, POST to target |
-| Model Serving endpoints | Spec-only re-create | Pure config replay |
-| Genie spaces | Spec-only re-create | Configuration replay |
-| Lakeflow Connect pipelines (query-based + SaaS row_filter) | Clone-history + recreate-with-row_filter + unified view | **Available now** via `migrate_lfc` job (Section 6, Step 9). Query-based (cursor from spec) + SaaS row_filter (Salesforce/GA4/ServiceNow; operator-supplied cursor). |
-| Lakeflow Connect pipelines (CDC / gateway) | Recreate gateway + ingestion, create-only | **Available now** via `migrate_lfc` job (Section 6, Step 9). Recreates the gateway + ingestion pipeline (not started); customer starts the re-hydrate at cutover. SaaS GA4/ServiceNow + MySQL/Postgres CDC share the code path, pending a live test. |
-| Agent Bricks | AI compound | Wraps Model Serving + VS + KA + prompt config |
-
-Current scope and cutover notes live in
-[docs/stateful_services_phase.md](stateful_services_phase.md); a full
-Phase 3 design spec is forthcoming.
+| **0. Discovery** | Inventory assets per workspace; classify complexity; identify integrations; size managed-table data volume. | `discovery` job inventories UC + Hive objects. |
+| **1a. Infrastructure / 1b. Identity** | Create the target workspace + UC metastore in the Account Console. Networking, Private Link, identity (SSO/SCIM), CMK. | Out of scope — operator/IaC. |
+| **2. UC & data migration** | External tables (fast), managed tables via DEEP CLONE (slow), views, functions, grants, governance. Validate integrity. | **Core of this tool** — `migrate_uc`, `migrate_hive`, `migrate_governance`. |
+| **3. Workspace assets** | Notebooks, jobs, policies, warehouses, dashboards, secrets. | **Terraform exporter** (Section 8). |
+| **4. Stateful services** | Vector Search, Online Tables, Lakeflow Connect, DLT, Model Serving, Apps, MLflow. | Optional tool jobs (VS/OT/LFC) + Terraform exporter (DLT/Model Serving/Apps) — Sections 7–8. |
+| **5. Validation & cutover** | Verify counts/rows/grants; update DNS/SSO/SCIM/integrations; enable new, disable old. | Section 9. |
+| **6. Decommission** | Dual-run grace period; archive audit logs; delete old workspace + Private Link. | Section 10. |
 
 ---
 
-## 4. Pre-requisites
+## 3. What it covers — approach by data type
 
-### Tooling (on the operator's local machine)
+For each object class: the **complexity**, the **migration approach**, and
+**how this tool handles it**. Objects are sequenced by the priority in
+Section 3.7.
 
-- **Databricks CLI** ≥ 0.220 — install via `brew install databricks` or
-  the official installer.
-- **Terraform 1.5.7+** locally — the bundled Terraform in the
-  Databricks CLI has an expired GPG signing key; you'll point the CLI
-  at your local Terraform via env vars (see Step 5 below).
-- **uv** (or `pip`) — only needed if you plan to run the unit tests.
+### 3.1 Hive managed tables — DBFS-root storage
+- **Complexity:** HIGH. Data lives in the workspace-scoped DBFS root; the new
+  workspace has its own DBFS storage it can't reach, so bytes must be copied.
+- **Approach:** Delta → `DEEP CLONE`; non-Delta → CTAS.
+- **This tool:** `migrate_hive` with `migrate_hive_dbfs_root: true` copies the
+  DBFS-root bytes to `hive_dbfs_target_path` and registers the target table as
+  **external** in the Hive→UC target catalog (`hive_target_catalog`, default
+  `hive_upgraded`).
+
+### 3.2 Hive managed tables — non-DBFS storage
+- **Complexity:** MEDIUM–HIGH. Data is on customer-owned storage but registered
+  as *managed* in Hive.
+- **Approach:** re-register against the same location (Delta reads schema from
+  the log; non-Delta needs `MSCK REPAIR`).
+- **This tool:** `migrate_hive` (`hive_managed_nondbfs_worker`) re-registers the
+  table on target pointing at the same storage.
+
+### 3.3 Hive external tables — external storage (ADLS)
+- **Complexity:** LOW. Data stays in ADLS; only metadata (DDL) is recreated.
+- **Approach:** recreate the table pointing at the same location; recommended
+  path is **Hive external → UC external** (same storage path).
+- **This tool:** `migrate_hive` (`hive_external_worker`) replays the DDL into the
+  UC target catalog against the same ADLS path.
+
+### 3.4 External Hive metastore
+- **Complexity:** LOW. The metastore lives in customer-configured storage
+  (MySQL / Azure SQL); connect the new workspace to the same metastore and all
+  metadata is retained.
+- **Approach:** set up credentials + init scripts on target, verify
+  connectivity.
+- **This tool:** out of scope — operator reconnects the external metastore. See
+  [external_hive_metastore.md](reference/external_hive_metastore.md).
+
+### 3.5 UC managed tables
+- **Complexity:** MEDIUM–HIGH. Data is in UC-managed storage; the new metastore
+  has different managed storage, so bytes must be copied.
+- **Approach:** Delta Sharing between metastores → `DEEP CLONE` (Delta) / CTAS
+  (non-Delta) into the new metastore.
+- **This tool:** `migrate_uc` (`managed_table_worker`) does exactly this via the
+  internal `cp_migration_share`. Managed **Iceberg** tables are skipped by
+  default; opt into DDL-replay + re-ingest with `iceberg_strategy: ddl_replay`
+  (loses snapshot history / time-travel).
+
+### 3.6 UC external tables
+- **Complexity:** LOW. Data stays in ADLS; only metadata migrates.
+- **Approach:** create storage credentials + external locations on the new
+  metastore pointing at the same ADLS paths; recreate `CREATE TABLE … LOCATION`.
+- **This tool:** `migrate_uc` (`external_table_worker`) replays the DDL against
+  the same location. (Storage credentials + external locations are an operator
+  prerequisite — see Setup.)
+
+### 3.7 UC volumes
+- **Complexity:** LOW (external) / MEDIUM (managed).
+- **Approach:** external → recreate the external location + volume definition;
+  managed → copy files to the new managed storage, then recreate.
+- **This tool:** `migrate_uc` (`volume_worker`) — external via metadata replay,
+  managed with file-level copy.
+
+### 3.8 Views, functions
+- **Complexity:** LOW.
+- **Approach:** export definitions; recreate in dependency order (functions
+  before the views / filters / masks that reference them).
+- **This tool:** `migrate_uc` (`views_worker`, `functions_worker`) for UC;
+  `migrate_hive` (`hive_views_worker`, `hive_functions_worker`) for Hive.
+
+### 3.9 Governance, sharing, and other UC objects
+Migrated by `migrate_governance` (fine-grained) and `migrate_uc` (grants,
+models):
+
+| Object | How this tool handles it |
+|---|---|
+| Grants (all levels) | `grants_worker` / `hive_grants_worker` — applied after objects exist |
+| Tags, ABAC policies | `tags_worker`, `policies_worker` |
+| Row filters, column masks | `row_filters_worker`, `column_masks_worker` (DDL replay; see RLS/CM note in README) |
+| Comments, table properties | preserved by `DEEP CLONE` for Delta; DDL replay otherwise |
+| Registered models | `models_worker` — metadata + versions + **artifact-byte copy** + aliases |
+| Connections, foreign catalogs | `connections_worker`, `foreign_catalogs_worker` (connection secrets are **not** exported — re-enter) |
+| Customer shares, recipients, providers | `sharing_worker` (SPN must own or hold `USE SHARE`/`USE RECIPIENT` — see README) |
+| Lakehouse monitors | `monitors_worker` (metric history does not transfer) |
+
+### 3.10 Data-migration priority & sequencing
+Recommended order (fast/unblocking first, heavy/dependent last):
+
+| # | Category | Reason |
+|---|---|---|
+| 1 | UC external tables | No data copy; unblocks dependent views/jobs |
+| 2 | Hive external tables | No data copy; upgrade to UC |
+| 3 | UC views, functions | Depend on tables |
+| 4 | Hive views | Depend on tables + namespace rewrite |
+| 5 | UC managed tables | Data copy; start largest early |
+| 6 | Hive managed (non-DBFS) | Re-registration |
+| 7 | Hive managed (DBFS-root) | Most complex; bytes copied out first |
+| 8 | Volumes | After tables |
+| 9 | Streaming tables / MVs | Last — see §4 (out of scope for this tool) |
+
+---
+
+## 4. What is out of scope (and where it's handled)
+
+### Hard-skipped by this tool
+`migrate_uc` runs the `mv_st_worker`, which **skips all Materialized Views and
+Streaming Tables** with status `skipped_by_stateful_service_migration` — their
+stream/rebuild state cannot be replayed by DDL. Their schema and grants still
+migrate, but the objects are not rebuilt by this tool. Rebuild them on target
+via a pipeline refresh at cutover.
+
+### Handled via the Terraform exporter (Section 8)
+These are **not** migrated by this tool; use the exporter + the guidance in
+Section 8:
+- **DLT / Lakeflow Declarative Pipelines** — exporter recreates pipeline config
+  + notebooks; full refresh on target.
+- **Model Serving endpoints** — exporter recreates endpoint config; this tool's
+  `models_worker` supplies the served model; blue-green cutover.
+- **Apps** — exporter emits the app definition only; source + redeploy are
+  separate.
+
+### Available now via optional tool jobs (Section 7)
+- **Vector Search** (`migrate_vector_search`), **Online Tables**
+  (`migrate_online_tables` → Lakebase synced table), **Lakeflow Connect**
+  (`migrate_lfc`).
+
+### Not covered (out-of-band)
+- **Lakebase** (`pg_dump`/`pg_restore`), **Online Feature Store**, **Genie
+  spaces**, **Agent Bricks**, **MLflow experiments / workspace-registry models**
+  (`mlflow-export-import`).
+
+---
+
+## 5. Prerequisites
+
+### Tooling (operator's machine)
+- **Databricks CLI** ≥ 0.220.
+- **Terraform 1.5.7+** locally — the CLI's bundled Terraform has an expired GPG
+  signing key; point the CLI at your local Terraform (Setup Step 6).
+- **uv** / `pip` — only for running the unit tests.
 
 ### Access
-
-- **Both workspaces** on the same cloud and (currently) the same
-  metastore region for Delta Sharing performance. Cross-region works
-  but volume propagation may lag.
-- **Service Principal (SPN)** — OAuth M2M, will run all migration
-  jobs. Must be a workspace admin on **both** source and target. See
-  Set Up step 2.
-- **Network connectivity** — serverless compute must be reachable from
-  the target workspace. If source uses Private Link, the SPN's source-side
-  REST calls also need to traverse the customer's network controls.
+- **Both workspaces** on the same cloud; same metastore region recommended for
+  Delta Sharing performance (cross-region works but volume propagation may lag).
+- **Service Principal (SPN)** — OAuth M2M, workspace **admin on both** source
+  and target; runs all migration jobs.
+- **Network connectivity** — serverless compute reachable from the target; if
+  source uses Private Link, the SPN's source-side REST calls must traverse it.
 
 ### Workspaces
+- **Target must be empty or non-overlapping** — `pre_check` surfaces collisions.
+- **Delta Sharing enabled** on both metastores.
+- **Target storage credentials + external locations** created for any external
+  table / DBFS-root path the migration touches.
 
-- **Target workspace must be empty or non-overlapping** with the
-  source. Discovery surfaces target collisions during `pre_check`;
-  resolve them (rename / drop / set `on_target_collision: skip`) before
-  running migrate jobs.
-- **Delta Sharing must be enabled** on both metastores (account
-  console → Settings).
-
-### Recommended state on source
-
-- For RLS / column-mask tables you want to migrate **with data**: every
-  active filter / mask function body must contain an admin-bypass call
-  (`is_account_group_member(`, `is_member(`, or `is_user_in_group(`).
+### Source state for RLS/CM
+- To migrate RLS / column-mask tables **with data**, every active filter/mask
+  function body must contain an admin-bypass call
+  (`is_account_group_member(`, `is_member(`, or `is_user_in_group(`);
   `pre_check` enforces this.
-- For customer-defined shares to be migrated: the migration SPN must
-  own them or hold `USE SHARE` / `USE RECIPIENT` — see the Delta
-  Sharing prerequisites section in the README.
 
 ---
 
-## 5. Set up
+## 6. Setup
 
 ### Step 1 — Clone the repo
-
 ```bash
 git clone git@github.com:databricks-solutions/workspace-migration.git
 cd workspace-migration
 ```
 
-### Step 2 — Create or identify the migration SPN
-
-Create an OAuth service principal in the **account console** (Identity
-and access → Service principals → Add service principal), then either
-**generate an OAuth client secret** in the account console UI, or via
-the CLI:
-
+### Step 2 — Create the migration SPN
+Create an OAuth service principal in the account console, add it as **admin on
+both workspaces**, and generate a client secret:
 ```bash
-# Add SPN to source workspace as an admin
 databricks account workspace-assignments update <source-workspace-id> \
   --principal-id <spn-id> --permissions ADMIN
-
-# Add SPN to target workspace as an admin
 databricks account workspace-assignments update <target-workspace-id> \
   --principal-id <spn-id> --permissions ADMIN
-
-# Generate OAuth client secret (note: shown once)
-databricks account service-principal-secrets create <spn-id>
+databricks account service-principal-secrets create <spn-id>   # shown once
 ```
 
-### Step 3 — Store the SPN secret in a Databricks secret scope (target workspace)
-
+### Step 3 — Store the SPN secret (target workspace)
 ```bash
-# Create a secret scope on the target workspace
 databricks secrets create-scope migration --profile target-workspace
-
-# Add the SPN OAuth secret under a known key
 databricks secrets put-secret migration spn-secret --profile target-workspace
-# Paste the secret value when prompted (or pass --string-value)
 ```
-
-You will reference `migration` (scope) and `spn-secret` (key) in
-`config.yaml`.
 
 ### Step 4 — Grant SPN privileges
-
-The SPN needs UC privileges to read source and write target. The
-following grants cover the standard path; tighten as needed.
-
 ```sql
--- On the source workspace (run as a metastore admin)
+-- Source (run as metastore admin)
 GRANT USE CATALOG ON ALL CATALOGS TO `<spn-application-id>`;
 GRANT USE SCHEMA  ON ALL SCHEMAS  TO `<spn-application-id>`;
 GRANT SELECT      ON ALL TABLES   TO `<spn-application-id>`;
 GRANT READ VOLUME ON ALL VOLUMES  TO `<spn-application-id>`;
-
--- For customer-defined shares the SPN should migrate:
+-- Customer shares to migrate:
 ALTER SHARE     `<share_name>`     OWNER TO `<spn-application-id>`;
 ALTER RECIPIENT `<recipient_name>` OWNER TO `<spn-application-id>`;
-
--- On the target workspace
+-- Target
 GRANT CREATE CATALOG ON METASTORE TO `<spn-application-id>`;
 GRANT USE PROVIDER   ON METASTORE TO `<spn-application-id>`;
 ```
 
-For the **`staging_copy` RLS/CM strategy**, also ensure every active
-row-filter / column-mask function body contains an admin-bypass call
-(see Pre-requisites). `pre_check` will fail loudly if not.
-
 ### Step 5 — Configure `config.yaml`
-
-Open `config.yaml` (committed with **placeholder values only**) and
-fill in real values locally:
-
+`config.yaml` is git-ignored; copy the example and fill in real values locally:
+```bash
+cp config.example.yaml config.yaml
+```
+Key fields (full reference in the [README](../README.md#config-reference-configyaml)):
 ```yaml
 source_workspace_url: "https://adb-<source-id>.<n>.azuredatabricks.net"
 target_workspace_url: "https://adb-<target-id>.<n>.azuredatabricks.net"
 spn_client_id:        "<spn-application-id>"
 spn_secret_scope:     "migration"
 spn_secret_key:       "spn-secret"
-
-# Optional — scope the run
-catalog_filter: ["sales", "marketing"]
-schema_filter:  []
-
-# Recommended for RLS/CM
-rls_cm_strategy: "staging_copy"
-
-# Recommended for Iceberg if present in source
-iceberg_strategy: "ddl_replay"
-
-# Hive (only if migrating from Hive Metastore)
-migrate_hive_dbfs_root: false
-# hive_dbfs_target_path: "abfss://<container>@<account>.dfs.core.windows.net/hive-data/"
+catalog_filter:  []                 # scope the run
+rls_cm_strategy: "staging_copy"     # migrate RLS/CM tables with data
+iceberg_strategy: "ddl_replay"      # if managed Iceberg present
+migrate_hive_dbfs_root: false       # true + hive_dbfs_target_path for DBFS-root Hive
 ```
+> Don't edit the workspace-side copy — `bundle deploy` overwrites it from your
+> local copy.
 
-> **Don't edit the workspace-side copy of `config.yaml`.** The
-> bundle treats your local copy as source of truth and overwrites
-> the workspace copy on every deploy.
-
-Full field reference: see the README's [Config reference table](../README.md#config-reference-configyaml).
-
-### Step 6 — Deploy the bundle to the target workspace
-
-The Databricks CLI's bundled Terraform has an expired signing key —
-point at your locally-installed Terraform:
-
+### Step 6 — Deploy the bundle (target workspace)
 ```bash
 export DATABRICKS_TF_VERSION=1.5.7
 export DATABRICKS_TF_EXEC_PATH=$(which terraform)
-
 databricks bundle deploy -t dev \
   --var migration_spn_id=<spn-application-id> \
   --profile target-workspace
 ```
-
-This creates:
-
-- The eight workflows: `pre_check`, `discovery`, `migrate_uc`,
-  `migrate_hive`, `migrate_governance`, `migrate_vector_search`,
-  `migrate_online_tables`, `migrate_lfc` (plus integration-test workflows).
-- The Lakeview dashboard at `/Shared/cp_migration/dev`.
-- The `config.yaml` file at `/Workspace/Shared/cp_migration/config.yaml`.
+This creates eight workflows — `pre_check`, `discovery`, `migrate_uc`,
+`migrate_hive`, `migrate_governance`, `migrate_vector_search`,
+`migrate_online_tables`, `migrate_lfc` (plus integration tests) — the Lakeview
+dashboard, and the workspace `config.yaml`.
 
 ---
 
-## 6. Execution
+## 7. Running the tool
 
-The recommended order: `pre_check` → `discovery` → `pre_check` (again,
-for collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
-`migrate_governance` → `migrate_vector_search` (optional) →
-`migrate_online_tables` (optional) → `migrate_lfc` (optional).
+Recommended order: `pre_check` → `discovery` → `pre_check` (again, for
+collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
+`migrate_governance` → then the optional stateful jobs
+`migrate_vector_search` / `migrate_online_tables` / `migrate_lfc`.
 
 ### Step 1 — `pre_check`
-
-Validates connectivity, SPN grants, and (after discovery has run)
-target collisions and RLS/CM admin-bypass.
-
-```bash
-databricks jobs run-now --job-id <pre_check_job_id> --profile target-workspace
-```
-
-Read results:
-
+Validates connectivity, SPN grants, and (after discovery) target collisions +
+RLS/CM admin-bypass.
 ```sql
 SELECT check_name, status, severity, error_message
 FROM migration_tracking.cp_migration.pre_check_results
-WHERE run_id = <latest_run_id>
-ORDER BY severity DESC, check_name;
+WHERE run_id = <latest_run_id> ORDER BY severity DESC;
 ```
-
-Resolve any FAILs before continuing.
 
 ### Step 2 — `discovery`
+Scans source via Delta Sharing + REST; writes `discovery_inventory` (one row
+per source object). Also prints DLT-managed-table and RLS/CM warnings.
 
-Scans source via Delta Sharing + REST and populates
-`discovery_inventory` with one row per source object.
-
-```bash
-databricks jobs run-now --job-id <discovery_job_id> --profile target-workspace
-```
-
-Read results:
-
-```sql
-SELECT source_type, object_type, COUNT(*) AS n
-FROM migration_tracking.cp_migration.discovery_inventory
-GROUP BY source_type, object_type
-ORDER BY source_type, object_type;
-```
-
-### Step 3 — `pre_check` again (target-collision pass)
-
-Now that `discovery_inventory` is populated, `pre_check` checks for
-target objects with the same FQN that the tool didn't create.
-
-With `on_target_collision: fail` (default) any unexpected target object
-will block `migrate_uc`. Either rename / drop the colliding target
-object, or switch to `on_target_collision: skip` and redeploy.
+### Step 3 — `pre_check` again (collision pass)
+With `on_target_collision: fail` (default) an unexpected target object blocks
+`migrate_uc`; rename/drop it, or set `on_target_collision: skip`.
 
 ### Step 4 — `migrate_uc`
-
-UC data plane: managed/external tables, views, functions, volumes,
-models, plus UC grants. Workers run in parallel where dependencies
-allow.
-
-```bash
-databricks jobs run-now --job-id <migrate_uc_job_id> --profile target-workspace
-```
-
-Monitor progress:
-
-- **Lakeview dashboard** at `/Shared/cp_migration/<target>` — counts,
-  failures, durations per object type.
-- **`migration_status`** for per-object detail:
-
+UC data plane: managed/external tables, views, functions, volumes, models, plus
+UC grants (`setup_sharing` → `orchestrator` → workers → `cleanup_staging` →
+`summary_uc`). MV/ST rows are skipped here (§4). Re-runs are safe.
 ```sql
-SELECT object_type, status, COUNT(*) AS n
+SELECT object_type, status, COUNT(*) n
 FROM migration_tracking.cp_migration.migration_status
-WHERE source_type = 'uc'
-GROUP BY object_type, status
-ORDER BY object_type, status;
+WHERE source_type='uc' GROUP BY object_type, status;
 ```
 
-Re-runs are safe — `migration_status` filters out completed objects.
+### Step 5 — `migrate_hive` (only if migrating from Hive)
+Same shape, scoped to Hive sources; writes into `hive_target_catalog`
+(default `hive_upgraded`). See [external_hive_metastore.md](reference/external_hive_metastore.md)
+for the classic-compute cluster/init-script requirements for ADLS-backed Hive
+tables.
 
-### Step 5 — `migrate_hive` (only if migrating from Hive Metastore)
-
-Same shape as `migrate_uc`, scoped to Hive sources. Writes into the
-target UC catalog set by `hive_target_catalog` (default
-`hive_upgraded`).
-
-```bash
-databricks jobs run-now --job-id <migrate_hive_job_id> --profile target-workspace
-```
-
-### Step 6 — `migrate_governance`
-
-**Run last.** This job assumes target tables / views / volumes already
-exist (from `migrate_uc` and / or `migrate_hive`). It replays the
-governance layer: tags, RLS, column masks, comments, monitors, customer
-shares, foreign catalogs, connections, policies.
-
-```bash
-databricks jobs run-now --job-id <migrate_governance_job_id> --profile target-workspace
-```
+### Step 6 — `migrate_governance` (run last of the core three)
+Assumes target tables/views/volumes already exist. Replays tags, RLS, column
+masks, comments, monitors, customer shares, foreign catalogs, connections,
+policies. **Do not run against an empty target.**
 
 ### Step 7 — `migrate_vector_search` (optional)
-
-Recreates **Delta Sync** Vector Search indexes on the target workspace.
-Running this job is itself the opt-in — there is no configuration flag
-to enable or disable it. Bear in mind that re-embedding every index
-against the target source tables incurs compute cost proportional to
-the size of those tables.
-
-**Precondition:** run `migrate_uc` first (Step 4). The job performs an
-up-front pre-check that verifies every index's source Delta table
-exists on the target — if any are missing, the pre-check fails loudly
-before creating anything.
-
-```bash
-databricks jobs run-now --job-id <migrate_vector_search_job_id> --profile target-workspace
-```
-
-The job also ensures the target Vector Search endpoint exists before
-attempting to create indexes. If the named endpoint does not exist it
-is created automatically; if it exists but is still provisioning the
-affected indexes are skipped and retried on the next run.
-
-Monitor progress in `migration_status`:
-
-```sql
-SELECT object_name, status, error_message
-FROM migration_tracking.cp_migration.migration_status
-WHERE object_type = 'vector_search_index'
-ORDER BY status, object_name;
-```
-
-**Status values**
-
-| Status | Meaning |
-|---|---|
-| `created_resync_pending` | Index created on target; re-embedding is in progress. The index is not queryable until the re-sync completes. |
-| `skipped_endpoint_not_ready` | The target endpoint was still provisioning when this index was processed. Re-run the job — idempotency will retry the index. |
-| `skipped_target_exists` | The index already exists on the target (set by a previous run or pre-existing). No action taken. |
-| `failed` | Index creation failed. Inspect `error_message` and the workflow run logs, then re-run. |
-
-**Known limitations**
-
-- **Direct Vector Access indexes are not migrated** — they are recorded
-  `skipped_direct_access_unsupported`. Their vectors are written
-  directly by your application (external state) and cannot be recreated
-  by this tool.
-- **Custom embedding-model serving endpoints are not checked or
-  migrated.** If a Delta Sync index uses a custom model serving endpoint
-  for embeddings, ensure that endpoint exists on the target before
-  running. Databricks-hosted embedding models (e.g.
-  `databricks-gte-large-en`) are available by default and are
-  unaffected.
+Recreates **Delta Sync** Vector Search indexes and triggers re-embedding from
+the already-migrated source Delta table (run `migrate_uc` first). Re-embedding
+incurs compute cost proportional to table size. **Direct Access indexes are not
+migrated** (`skipped_direct_access_unsupported`). Custom embedding-model
+endpoints must exist on target first.
 
 ### Step 8 — `migrate_online_tables` (optional)
+Converts each legacy online table into a **Lakebase synced table** (legacy
+online tables are deprecated — creation is blocked platform-wide). Provisions a
+**paid** Lakebase instance that persists after migration. Requires the source
+Delta table on target with its primary key; incremental sync needs the
+`auto_cdf` preview. Consumer repoint is operator-owned.
 
-Converts each discovered legacy online table into a **Lakebase synced
-table** on the target workspace. Legacy UC online tables are deprecated
-and can no longer be created platform-wide; this job re-syncs the same
-data from the already-migrated source Delta table into a Lakebase
-database instance. Running this job is itself the opt-in — there is no
-configuration flag to enable or disable it.
-
-**Paid resource — Lakebase database instance.** The job provisions a
-Lakebase database instance (configured via `lakebase_instance_name`,
-`lakebase_logical_database`, and `lakebase_capacity` in `config.yaml`),
-creating it if it does not exist. This is a **paid resource** that
-persists after the migration completes. Factor this into your cost
-planning; decommission the instance manually if it is no longer needed.
-
-**Precondition:** run `migrate_uc` first (Step 4). The job performs an
-up-front pre-check that verifies every online table's source Delta
-table **exists on the target** — it fails loudly if the source table is
-missing. The primary-key requirement is enforced at runtime: if the
-migrated source table lacks a primary key, synced-table creation fails
-and the object is recorded `failed`. Ensure the source Delta table was
-migrated with its primary key intact.
-
-**Consumer repoint is operator-owned.** Once a synced table is
-created, consumer applications must be updated to connect to the new
-Lakebase Postgres endpoint. This cut-over is outside the scope of the
-tool.
-
-```bash
-databricks jobs run-now --job-id <migrate_online_tables_job_id> --profile target-workspace
-```
-
-Monitor progress in `migration_status`:
-
-```sql
-SELECT object_name, status, error_message
-FROM migration_tracking.cp_migration.migration_status
-WHERE object_type = 'online_table'
-ORDER BY status, object_name;
-```
-
-**Status values**
-
-| Status | Meaning |
-|---|---|
-| `created_resync_pending` | Synced table created on target; re-sync from the source Delta table is in progress. The table is not queryable until the sync completes. |
-| `skipped_target_exists` | A synced table with this name already exists on the target (set by a previous run or pre-existing). No action taken. |
-| `skipped_instance_not_ready` | The Lakebase database instance was still provisioning when this table was processed. Re-run the job — idempotency will retry the table once the instance is ready. |
-| `failed` | Synced table creation failed (e.g. missing primary key on the source Delta table). Inspect `error_message` and the workflow run logs, then re-run. |
-
-**Known limitations**
-
-- **Consumer repoint required.** Downstream applications that read
-  from the old online table endpoint must be reconfigured to use the
-  new Lakebase Postgres endpoint — this is an operator action outside
-  the tool's scope.
-- **Primary key mandatory.** If the source Delta table was migrated
-  without a primary key, synced-table creation will fail. Verify the
-  target table schema before running.
-- **Auto CDF preview for incremental sync.** Online tables in
-  **triggered** or **continuous** sync mode map to synced tables that
-  need incremental sync, which requires the **auto_cdf preview** enabled
-  on the target workspace. If it is not enabled, the synced-table
-  creation fails with a clear `failed` status (message: *"Incremental
-  sync ... requires Auto CDF ... Enable the auto_cdf preview for this
-  workspace or use snapshot scheduling policy"*). Enable the preview on
-  the target, or migrate those as **snapshot** mode. Snapshot-mode online
-  tables are unaffected.
-
-### Step 9 — `migrate_lfc` (Lakeflow Connect pipelines) (optional)
-
-Migrates Lakeflow Connect ingestion pipelines. Cross-workspace LFC migration is
-a **cut-over, not an in-place move** (`ALTER ... SET PIPELINE_ID` is blocked for
-LFC and checkpoints aren't portable — Aha DB-I-18972), so the job **recreates**
-pipelines on the target. Running the job is itself the opt-in — there's no flag
-to enable/disable it. It handles three connector families across two tiers:
-
-| Tier | Connectors | What the job does |
-|---|---|---|
-| **Tier 1 — settable boundary** | Query-based DB (SQL Server, PostgreSQL, MySQL, Oracle, Teradata, MariaDB) **and** SaaS row_filter (Salesforce, GA4, ServiceNow) | Clone landed history → recreate with a per-table `row_filter` cursor boundary → unified view. No re-pull of history. |
-| **Tier 2 — no boundary** | CDC / gateway DB (SQL Server, MySQL, PostgreSQL in CDC mode) | Recreate the **gateway + ingestion pipeline** (create-only, **not started**) → the customer starts the continuous re-hydrate at cutover. No clone, no view. |
-
-#### Tier 1 — query-based + SaaS row_filter
-
-For each Tier-1 pipeline the job:
-
-1. **Clones the landed destination table to `<table>_history`** (Delta Sharing
-   staging + `DEEP CLONE`, same as `migrate_uc` — no intermediate object
-   storage). Preserves every row ingested up to cutover.
-2. **Recreates the pipeline** writing to `<table>_incr`, with a per-table
-   `row_filter = "<cursor> >= '<T>'"` where `T = MAX(<cursor>)` from the cloned
-   history — so the new pipeline pulls only post-cutover rows. After creating
-   it the job triggers one run and waits for it to complete, then builds the view.
-3. **Creates a unified view at the canonical name `<table>`** — SCD1: PK-dedup
-   merge (latest cursor wins); SCD2 / append: `UNION ALL` of `_history` + `_incr`.
-
-**The cursor differs by connector family:**
-
-- **Query-based DB** — the cursor column is read **automatically** from the
-  pipeline spec. No operator input needed.
-- **SaaS (Salesforce / GA4 / ServiceNow)** — the connector auto-selects its
-  cursor and does **not** expose it in the spec, so the tool **never guesses**:
-  the cursor is a **mandatory operator input** via `lfc_saas_cursor_columns`
-  (see config below). Discovery surfaces candidate timestamp/numeric columns per
-  SaaS table (printed in the discovery log + stored in `discovery_inventory`) to
-  help you choose. A SaaS table with **no cursor supplied full-loads** (no
-  `_history`, no view — status `lfc_view_skipped_no_cursor`).
-
-**Tier-1 table layout after migration**
-
-| Object | What it is |
-|---|---|
-| `<catalog>.<schema>.<table>_history` | Deep-cloned snapshot of all rows landed before cutover. |
-| `<catalog>.<schema>.<table>_incr` | Streaming table written by the new target pipeline (post-cutover rows only). |
-| `<catalog>.<schema>.<table>` | Unified view — canonical name consumers should use after cutover. |
-
-#### Tier 2 — CDC / gateway
-
-A CDC source is two linked objects: an **ingestion gateway** (connects to the
-source DB, stages change data into a UC volume) and an **ingestion pipeline**
-(`ingestion_gateway_id` → the gateway) that loads the destination tables. For
-each CDC pipeline the job:
-
-1. **Recreates the gateway** on the target (mirroring source topology — each
-   unique gateway once; reuses `lfc_target_connection_name`), then **stops it** —
-   a continuous gateway auto-starts on create, so stopping leaves it
-   *created but not running*.
-2. **Recreates the ingestion pipeline**, remapping `ingestion_gateway_id` to the
-   new gateway, full-reload (no `row_filter`).
-3. **Dry-validates** the recreated pipeline (`validate_only` — a config check, no
-   data run).
-
-The job **does not start** the gateway/pipeline or re-pull data — the customer
-starts the continuous run at cutover. The gateway's internal **staging volume is
-excluded** from volume migration (the recreated gateway makes its own).
-
-**Prerequisites**
-
-1. Run `migrate_uc` (Step 4) first — the destination schemas the pipelines write
-   into must exist on the target.
-2. Run `migrate_governance` (Step 6) first if any Tier-1 destination tables carry
-   RLS / column masks — governance is applied before the view is created.
-3. Create the UC connection on the **target** workspace before running. The tool
-   does **not** create connections; set `lfc_target_connection_name`. (For SaaS,
-   this is the SaaS connection — OAuth, admin-authorized; for CDC it's the
-   gateway's source connection.)
-
-**`config.yaml` fields**
-
-```yaml
-# Name of the pre-existing UC connection on the target workspace that the
-# recreated pipelines (and CDC gateway) will use.
-lfc_target_connection_name: "my_connection"
-
-# MANDATORY for SaaS (Salesforce/GA4/ServiceNow) tables you want migrated
-# incrementally: the cursor column per destination-table FQN. The tool never
-# guesses a SaaS cursor; a table omitted here full-loads. Run discovery first
-# and check the printed candidate cursor columns. Not needed for query-based or
-# CDC. Accepts a YAML mapping or a JSON string.
-lfc_saas_cursor_columns:
-  my_catalog.sf.account: SystemModstamp
-  my_catalog.snow.incident: sys_updated_on
-```
-
-```bash
-databricks jobs run-now --job-id <migrate_lfc_job_id> --profile target-workspace
-```
-
-Monitor progress in `migration_status`:
-
-```sql
-SELECT object_type, object_name, status, error_message
-FROM migration_tracking.cp_migration.migration_status
-WHERE object_type IN ('lfc_table', 'lfc_pipeline', 'lfc_gateway', 'lfc_view')
-ORDER BY object_type, status, object_name;
-```
-
-**Status values**
-
-| `object_type` | Status | Meaning |
-|---|---|---|
-| `lfc_table` | `validated` | `_history` clone completed and verified (Tier 1). |
-| `lfc_pipeline` | `lfc_pipeline_created_incremental` | Tier-1 pipeline recreated with a `row_filter` cursor boundary. |
-| `lfc_pipeline` | `lfc_pipeline_created_fullreload` | CDC ingestion pipeline recreated (full re-hydrate; validate result folded into `error_message`). |
-| `lfc_pipeline` | `skipped_target_pipeline_exists` | A pipeline for this object already exists on target (idempotent re-run). |
-| `lfc_gateway` | `lfc_gateway_created` | CDC ingestion gateway recreated on target (created, then stopped). |
-| `lfc_view` | `lfc_view_created` | Unified view created at the canonical table name (Tier 1). |
-| `lfc_view` | `lfc_view_skipped_no_cursor` | No cursor for this table (SaaS without an `lfc_saas_cursor_columns` entry, or a batch/formula table) → it full-loads; no view. |
-
-**Known limitations / caveats**
-
-- **SaaS cursor is mandatory and not guessed.** For Salesforce/GA4/ServiceNow
-  you must supply the cursor in `lfc_saas_cursor_columns` (discovery lists
-  candidates). Omitted tables full-load. **Salesforce is live-validated; GA4 and
-  ServiceNow ride the same code path but are not yet live-tested** — supply their
-  cursor and verify the result.
-- **CDC is create-only — the customer starts the run.** The recreated gateway +
-  ingestion pipeline are created and validated but **not started**; nothing is
-  re-pulled until the operator starts them at cutover. **Pre-cutover SCD2 history
-  is not preserved** — the gateway re-extracts from the source's current change
-  window. (MySQL/PostgreSQL CDC use the same path but aren't yet live-tested.)
-- **Post-cutover source deletes are not propagated** (Tier 1). `row_filter` only
-  filters new rows; `DELETE`s after the cursor boundary aren't reflected, so an
-  SCD1 view may show ghost rows until a manual reconcile.
-- **SCD1 dedup by PK, SCD2/append by UNION ALL** (Tier 1). If the same PK appears
-  in `_history` and `_incr`, the `_incr` row wins; SCD2/append preserve all versions.
-- **Batch / formula tables full-load** (Tier 1). No usable cursor → the recreated
-  pipeline full-loads on first run; no `_history` clone or view.
+### Step 9 — `migrate_lfc` (optional)
+Migrates Lakeflow Connect ingestion pipelines (cross-workspace = cut-over, not
+in-place). **Tier 1** (query-based DB + SaaS row_filter): clone history →
+recreate with a `row_filter` cursor boundary → unified view. **Tier 2** (CDC /
+gateway): recreate gateway + ingestion pipeline, create-only; customer starts
+the re-hydrate at cutover. SaaS cursor is a mandatory operator input
+(`lfc_saas_cursor_columns`); the target UC connection must be pre-created
+(`lfc_target_connection_name`). Full detail: `migration_status` rows
+`lfc_table` / `lfc_pipeline` / `lfc_gateway` / `lfc_view`.
 
 ### Step 10 — Verify
-
-Confirm via the dashboard and these checks:
-
 ```sql
--- Anything that failed?
-SELECT object_type, status, error_message, COUNT(*) AS n
+SELECT object_type, status, COUNT(*) n
 FROM migration_tracking.cp_migration.migration_status
-WHERE status NOT IN ('validated', 'skipped_by_config',
-                     'skipped_by_rls_cm_policy',
-                     'skipped_by_pipeline_migration',
-                     'skipped_by_stateful_service_migration',
-                     'skipped_target_exists',
-                     'skipped_target_pipeline_exists',
-                     'skipped_direct_access_unsupported',
-                     'skipped_endpoint_not_ready',
-                     'skipped_instance_not_ready',
-                     'created_resync_pending',
-                     'lfc_pipeline_created_incremental',
-                     'lfc_pipeline_created_fullreload',
-                     'lfc_gateway_created',
-                     'lfc_view_created',
-                     'lfc_view_skipped_no_cursor',
-                     'dry_run')
-GROUP BY object_type, status, error_message
-ORDER BY n DESC;
-
--- Anything pending (worker never picked it up)?
-SELECT object_type, COUNT(*) AS pending
+GROUP BY object_type, status ORDER BY object_type;
+-- Pending (discovered but no status row):
+SELECT d.object_type, COUNT(*) pending
 FROM migration_tracking.cp_migration.discovery_inventory d
 LEFT JOIN migration_tracking.cp_migration.migration_status m
-  ON m.object_name = d.object_name AND m.object_type = d.object_type
-WHERE m.object_name IS NULL
-GROUP BY object_type;
+  ON m.object_name=d.object_name AND m.object_type=d.object_type
+WHERE m.object_name IS NULL GROUP BY d.object_type;
 ```
 
 ---
 
-## 7. Troubleshooting & FAQ
+## 8. Migrating non-UC assets via the Terraform exporter
 
-**`bundle deploy` fails with "key expired"** — Use a local Terraform
-(Step 6 setup).
+Workspace assets and several stateful services are migrated with the
+**Databricks Terraform exporter** (`terraform-provider-databricks exporter`),
+not this tool. Run one export with the asset listings, review the HCL, point
+the provider at the target, and `terraform apply`.
 
-**`pre_check` reports target collisions you didn't create** — Either
-rename / drop them, or set `on_target_collision: skip` and redeploy.
-The tool will leave those target objects untouched and mark the
-corresponding source rows `skipped_target_exists`.
+```bash
+export DATABRICKS_CONFIG_PROFILE=<source-profile>
+terraform-provider-databricks exporter -skip-interactive \
+  -directory=./export -listing=notebooks,wsfiles,repos,jobs,compute,dlt,model-serving,apps,dashboards,queries,secrets,policies,pools,sql-endpoints
+```
 
-**Customer-defined share not appearing in discovery** — The migration
-SPN must own the share or hold `USE SHARE`. See the
-[Delta Sharing prerequisites](../README.md#delta-sharing-prerequisites)
-section.
+### 8.1 Workspace assets (Phase 3)
+Notebooks/files, Git repos, jobs (excl. DABs jobs), cluster policies, instance
+pools, SQL warehouses, queries/alerts, dashboards, secret scopes (values
+redacted — use `-export-secrets` or re-provision), IP access lists, global init
+scripts, identities. IDs (warehouse/policy/pool) change; references are
+auto-updated in the exported HCL.
 
-**RLS / column-mask table arrives empty on target** — Default
-`rls_cm_strategy` is `""` (skip). Set `rls_cm_strategy: staging_copy`
-and ensure every filter / mask function has an admin-bypass call.
+### 8.2 DLT / Lakeflow Declarative Pipelines
+The exporter migrates DLT pipelines well (validated end-to-end). See
+[dlt_pipeline_migration.md](reference/dlt_pipeline_migration.md) for the full guide.
+- **Exports** the full pipeline config + wires in its notebooks; the migrated
+  pipeline **runs correctly** on target.
+- **Use the full asset listing** (`dlt,notebooks,wsfiles,repos`), not `dlt`
+  alone — `-listing=dlt` misses transitive Python imports / non-library files.
+- **Pre-create the UC catalog/schema** (this tool) — the exporter doesn't.
+- **No state migrates** → full refresh at cutover, in dependency order (the
+  exporter does not capture inter-pipeline ordering — derive it from UC lineage
+  or supply it manually).
 
-**Volume contents missing on target** — Cross-region Delta Sharing
-volume propagation can lag. The tool now retries volume `ls` calls; if
-issues persist, re-run `migrate_uc` — idempotency handles it.
+### 8.3 Model Serving endpoints
+See [model_serving_and_apps_migration.md](reference/model_serving_and_apps_migration.md).
+- The exporter captures the **full endpoint config** (served entities, traffic,
+  scale-to-zero) — **only when the endpoint is `READY`** (a provisioning
+  endpoint exports as a name-only stub) — and wires it to the model.
+- The served model itself comes from this tool's **`models_worker`** (metadata +
+  version artifacts). Align the endpoint's `entity_version` with the migrated
+  version. **Foundation-model endpoints are auto-skipped** (they exist on every
+  workspace). Blue-green cutover; endpoint URLs change.
 
-**A worker keeps failing** — Check `migration_status.error_message`
-and the workflow run logs. Re-run the job; only failed objects are
-retried.
+### 8.4 Apps
+- The exporter emits **only the app definition** (name, and `resources`/
+  `description` if set) — **no source code, no deployment**. Applying it yields a
+  non-functional shell.
+- Full app migration = recreate the definition (**remap `resources` to target
+  IDs**) + migrate the source (workspace files) + `databricks apps deploy
+  --source-code-path /Workspace/<path>`.
+
+### 8.5 Exporter gotchas
+- **Export serving endpoints only when `READY`** (else name-only stub).
+- **Registering a UC model needs a UC-enabled cluster** (`data_security_mode =
+  SINGLE_USER`); a No-Isolation cluster fails with `PERMISSION_DENIED … clusters
+  that don't have Unity Catalog enabled`.
+- Serverless job base env lacks `mlflow` → `%pip install mlflow` (or use an ML
+  runtime on classic compute).
+- App `--source-code-path` must be a `/Workspace/...` path.
 
 ---
 
-## 8. Going deeper
+## 9. Validation & cutover
 
-- Detailed architecture + per-job task graph:
-  [docs/peer-review-diagrams.md](peer-review-diagrams.md)
-- Workflow split rationale: [docs/workflow_split_design.md](workflow_split_design.md)
-- Idempotency model: [docs/idempotency_audit.md](idempotency_audit.md)
-- Retry / resumability: [docs/retry_resumability.md](retry_resumability.md)
-- Stateful services (Phase 3) scope: [docs/stateful_services_phase.md](stateful_services_phase.md)
-- External Hive Metastore notes: [docs/external_hive_metastore.md](external_hive_metastore.md)
+### Data validation checklist
+After each category, verify on target:
+- Table counts and row counts match (sample very large tables).
+- Schema (names, types, nullability) and partition structure preserved.
+- Table properties and comments preserved.
+- Grants/permissions replayed and validated with test users.
+- Views return expected results; functions execute; downstream jobs/queries run.
+
+### External integrations cutover
+Update every system referencing the old workspace: CI/CD (URLs, tokens),
+Terraform (provider host, workspace ID), orchestrators (Airflow/ADF), BI tools
+(JDBC/ODBC, warehouse IDs), SCIM/Entra (endpoints, SSO), API clients,
+monitoring, and Kafka/Event Hubs endpoints.
+
+### Non-recoverable assets (plan around these)
+Job/query run history, notebook revision history, PATs/OAuth tokens, Git
+credentials, DBFS-root data (AzCopy separately), UC connection passwords, and
+storage-credential keys are **not** transferable — re-provision on target.
+
+---
+
+## 10. Decommission
+
+- **Dual-run grace period** (2–4 weeks recommended).
+- Archive audit logs from the old workspace (`system.access.audit` is tied to
+  the old metastore).
+- Confirm all integrations point to the new workspace.
+- Delete the old workspace + Private Link endpoints; clean up the old managed
+  resource group.
+
+---
+
+## 11. Risk matrix
+
+| Risk | Impact | Mitigation |
+|---|---|---|
+| Managed-table `DEEP CLONE` too slow | Extends window | Start largest tables first; parallel clones; incremental sync for huge tables |
+| Secret values not re-provisioned | Jobs/pipelines fail | Document scopes; prepare values before cutover |
+| Streaming gap during cutover | Data loss/dup | Precise timing; idempotent writes; dual-write period |
+| External integrations missed | Production failures | Comprehensive discovery; customer checklist (§9) |
+| Old workspace ID hardcoded | Runtime failures | Search repos for the old ID; find-and-replace |
+| Serving endpoint URL change | Inference downtime | Blue-green; update clients before decommission |
+| Permission/grant gaps | Access denied | Comprehensive GRANT replay; validate with test users |
+
+---
+
+## 12. Troubleshooting & FAQ
+
+- **`bundle deploy` fails "key expired"** — use a local Terraform (Setup Step 6).
+- **`pre_check` reports collisions you didn't create** — rename/drop them, or set
+  `on_target_collision: skip`.
+- **Customer share not appearing in discovery** — the SPN must own it or hold
+  `USE SHARE` (see README, Delta Sharing prerequisites).
+- **RLS/CM table arrives empty** — set `rls_cm_strategy: staging_copy` and ensure
+  each filter/mask has an admin-bypass call.
+- **Volume contents missing** — cross-region Delta Sharing propagation lags;
+  re-run `migrate_uc` (idempotent).
+- **A worker keeps failing** — check `migration_status.error_message` + run logs;
+  re-run (only failed objects retry).
+
+---
+
+## 13. Going deeper
+
+- Architecture + per-job task graph: [peer-review-diagrams.md](reference/peer-review-diagrams.md)
+- Workflow split rationale: [workflow_split_design.md](reference/workflow_split_design.md)
+- Idempotency model: [idempotency_audit.md](reference/idempotency_audit.md)
+- Retry / resumability: [retry_resumability.md](reference/retry_resumability.md)
+- Stateful services scope: [stateful_services_phase.md](reference/stateful_services_phase.md)
+- DLT migration (Terraform exporter): [dlt_pipeline_migration.md](reference/dlt_pipeline_migration.md)
+- Model Serving & Apps migration: [model_serving_and_apps_migration.md](reference/model_serving_and_apps_migration.md)
+- External Hive Metastore: [external_hive_metastore.md](reference/external_hive_metastore.md)
