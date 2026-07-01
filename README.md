@@ -6,30 +6,43 @@ migrations, account consolidations, or moving between Azure regions.
 
 ## Coverage
 
-**Unity Catalog**
+> **See [docs/user_guide.md](docs/user_guide.md) for the full guide** — the
+> phased migration approach, per-data-type strategy, setup, execution, and the
+> Terraform-exporter path for assets the tool doesn't move directly. The
+> summary below is the quick reference.
+
+**Unity Catalog** (core jobs `migrate_uc` + `migrate_governance`)
 - Catalogs, schemas, grants
-- Managed tables (Delta, Iceberg), external tables
+- Managed tables (Delta; Iceberg via opt-in DDL replay), external tables
 - Views, SQL and Python functions
 - Volumes (managed with file-level copy, external via metadata replay)
-- Materialized views and streaming tables (SQL-created; DLT-owned
-  variants are out of scope — migrate those via pipeline migration)
 - Tags, row filters, column masks, ABAC policies
-- Lakehouse monitors, registered models (metadata + aliases)
-- Connections, foreign catalogs, online tables
+- Lakehouse monitors, registered models (metadata + version artifacts + aliases)
+- Connections, foreign catalogs
 - Delta Sharing (shares, recipients, providers; objects include tables,
   views, volumes, schemas, catalogs)
 
-**Legacy Hive Metastore**
+**Legacy Hive Metastore** (standalone `migrate_hive` job, run only when needed)
 - Databases, managed + external tables, views, functions, grants
-- Migrated by the standalone `migrate_hive` job (run only when needed)
+- Managed tables migrated into a UC target catalog (`hive_target_catalog`)
 
-**Lakeflow Connect ingestion pipelines** (optional `migrate_lfc` job)
-- Query-based DB + SaaS row_filter (Salesforce/GA4/ServiceNow): clone history,
-  recreate with a `row_filter` cursor boundary, unified view
-- CDC / gateway DB: recreate the gateway + ingestion pipeline (create-only;
-  customer starts the re-hydrate at cutover)
-- Cross-workspace LFC is a cut-over, not an in-place move (`SET PIPELINE_ID` is
-  blocked); see the user guide, Step 9
+**Stateful services** (optional standalone jobs — run as needed)
+- **Vector Search** (`migrate_vector_search`) — Delta Sync indexes recreated +
+  re-embedded; Direct Access indexes skipped
+- **Online Tables** (`migrate_online_tables`) — converted to a Lakebase synced
+  table (legacy online tables are deprecated); provisions a paid Lakebase instance
+- **Lakeflow Connect** (`migrate_lfc`) — query-based + SaaS row_filter (clone
+  history + row_filter boundary + unified view) and CDC/gateway (recreate,
+  create-only); cross-workspace LFC is a cut-over, not in-place
+
+**Not migrated by this tool** (see the user guide for the path)
+- **Materialized views & streaming tables** — hard-skipped
+  (`skipped_by_stateful_service_migration`); schema + grants still migrate,
+  rebuild the object via a pipeline refresh at cutover
+- **DLT pipelines, Model Serving endpoints, Apps** — migrated via the
+  **Terraform exporter** (+ this tool's model migration for serving); see
+  [docs/reference/dlt_pipeline_migration.md](docs/reference/dlt_pipeline_migration.md) and
+  [docs/reference/model_serving_and_apps_migration.md](docs/reference/model_serving_and_apps_migration.md)
 
 ## Layout
 
@@ -112,10 +125,12 @@ databricks bundle deploy -t dev
 | `batch_size` | no | `50` | Max objects per batched for-each task (keeps payload under the 3000-byte Databricks Jobs limit) |
 | `iceberg_strategy` | no | `""` | `""` skips Iceberg managed tables (marking `skipped_by_config`). `"ddl_replay"` opts into the Option A path — rebuild schema + re-ingest via `cp_migration_share`. Loses snapshot history / time travel / branches + tags. |
 | `rls_cm_strategy` | no | `""` | Managed tables carrying legacy row filter / column mask. `""` skips them (marking `skipped_by_rls_cm_policy`). `"staging_copy"` CTAS-copies each affected table into `<tracking_catalog>.cp_migration_staging`, shares the staging copy, DEEP CLONEs on target, then drops the staging copy. Source RLS/CM is never mutated. Requires the migration SPN to be a workspace admin and every active filter/mask to contain an admin-bypass call (`pre_check` enforces both). |
-| `on_target_collision` | no | `"fail"` | What to do when a discovered source object has the same FQN as an object already on target AND no `migration_status` row says the tool created it. `"fail"` (default) — pre_check emits a FAIL `check_target_collisions` row and the migrate workflow refuses to start; operator must rename / drop the colliding object and rerun pre_check. `"skip"` — pre_check emits a WARN row and seeds `skipped_target_exists` migration_status rows; workers skip those objects on the next migrate run (target copy left untouched). See [docs/idempotency_audit.md](docs/idempotency_audit.md#collision-handling-x4). |
+| `on_target_collision` | no | `"fail"` | What to do when a discovered source object has the same FQN as an object already on target AND no `migration_status` row says the tool created it. `"fail"` (default) — pre_check emits a FAIL `check_target_collisions` row and the migrate workflow refuses to start; operator must rename / drop the colliding object and rerun pre_check. `"skip"` — pre_check emits a WARN row and seeds `skipped_target_exists` migration_status rows; workers skip those objects on the next migrate run (target copy left untouched). See [docs/reference/idempotency_audit.md](docs/reference/idempotency_audit.md#collision-handling-x4). |
 | `migrate_hive_dbfs_root` | no | `false` | Enables `hive_managed_dbfs_worker` — copies DBFS-root bytes to `hive_dbfs_target_path` and registers the target table as EXTERNAL |
 | `hive_dbfs_target_path` | conditional | `""` | ADLS/S3/GCS path where DBFS-root bytes land on target. Required when `migrate_hive_dbfs_root=true`. The SPN needs `READ_FILES`/`WRITE_FILES`/`CREATE_EXTERNAL_TABLE` on the external location that owns this path. |
 | `hive_target_catalog` | no | `hive_upgraded` | Target catalog name for Hive-to-UC migration. Created during migrate if missing. |
+| `overwrite_existing` | no | `false` | When `true`, workers replace an existing target object instead of skipping it. Leave `false` for the safe idempotent default (paired with `on_target_collision`). |
+| `transfer_ownership` | no | `true` | When `true`, grants workers transfer object ownership to match source. Set `false` to leave target ownership as-created. |
 
 ### Deploy + configure flow
 
@@ -149,21 +164,27 @@ To change values later, edit your local `config.yaml` and redeploy —
 
 ### Operator flow
 
-The migration tool ships four production jobs. Run them in this order:
+The tool ships **three core jobs** (plus `discovery` and `pre_check`) and
+**three optional stateful-service jobs**. Run the core sequence first:
 
 1. **`discovery`** — scans the source workspace and writes
    `discovery_inventory`. The `migrate_*` jobs depend on it
    operationally; run discovery first.
 2. **`migrate_uc`** — UC data plane migration: managed/external tables,
-   views, volumes, models, online tables, plus UC grants. Runs
+   views, functions, volumes, models, plus UC grants. Runs
    `setup_sharing` → `orchestrator` → workers → `cleanup_staging` →
-   `summary_uc`.
+   `summary_uc`. (Materialized views / streaming tables are hard-skipped
+   here — see Coverage.)
 3. **`migrate_hive`** — Hive (legacy) data plane migration:
    external/managed tables, functions, views, plus Hive ACLs replayed
    as UC grants on the target catalog.
 4. **`migrate_governance`** — fine-grained governance: tags, comments,
    row filters, column masks, customer-defined shares, policies,
    monitors, foreign catalogs, connections.
+
+Then, as needed, the **optional stateful-service jobs**:
+`migrate_vector_search`, `migrate_online_tables`, `migrate_lfc` (see
+Coverage and the [user guide](docs/user_guide.md), Steps 7–9).
 
 Each `migrate_*` job is independent and standalone-runnable. They
 assume `discovery_inventory` has been populated by an earlier
@@ -172,7 +193,7 @@ assume `discovery_inventory` has been populated by an earlier
 #### Standalone-runnable contract
 
 `migrate_governance` runs standalone (per design Q1 in
-[docs/workflow_split_design.md](docs/workflow_split_design.md)). It
+[docs/reference/workflow_split_design.md](docs/reference/workflow_split_design.md)). It
 assumes target catalog/schema/table/view/volume objects already exist
 on target. **Do NOT** run `migrate_governance` against an empty
 target — it will write governance state for objects that don't exist.
@@ -217,7 +238,7 @@ environment-specific fields **once** after deploy.
 The per-workflow settings live in each workflow's YAML task parameters;
 edit them there if you need to change test behavior.
 
-See [docs/external_hive_metastore.md](docs/external_hive_metastore.md) for
+See [docs/reference/external_hive_metastore.md](docs/reference/external_hive_metastore.md) for
 the Hive-specific cluster/init-script reconfiguration checklist.
 
 ## Delta Sharing prerequisites
