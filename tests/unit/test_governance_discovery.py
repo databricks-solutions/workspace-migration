@@ -76,11 +76,21 @@ class TestListTags:
         explorer = _explorer(mock_spark, MagicMock())
         tags = explorer.list_tags("c", "s")
 
+        # Finding #7: catalog tags are handled by list_catalog_tags (once per
+        # catalog), NOT list_tags (per schema). list_tags returns the
+        # schema/table/column/volume scopes only.
         types = {t["securable_type"] for t in tags}
-        assert types == {"CATALOG", "SCHEMA", "TABLE", "COLUMN", "VOLUME"}
+        assert types == {"SCHEMA", "TABLE", "COLUMN", "VOLUME"}
+        assert "CATALOG" not in types
         col_tag = next(t for t in tags if t["securable_type"] == "COLUMN")
         assert col_tag["column_name"] == "email"
         assert col_tag["tag_name"] == "pii"
+
+        # Catalog tags come from the dedicated once-per-catalog method.
+        cat_tags = explorer.list_catalog_tags("c")
+        assert [t["securable_type"] for t in cat_tags] == ["CATALOG"]
+        assert cat_tags[0]["securable_fqn"] == "`c`"
+        assert cat_tags[0]["tag_name"] == "env"
 
     def test_tolerates_missing_tag_tables(self, mock_spark):
         """If system.information_schema.* isn't readable, return [] not raise."""

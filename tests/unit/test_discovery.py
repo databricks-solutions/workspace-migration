@@ -60,6 +60,42 @@ class TestDiscovery:
     @patch("discovery.discovery.AuthManager")
     @patch("discovery.discovery.TrackingManager")
     @patch("discovery.discovery.CatalogExplorer")
+    def test_catalog_tag_emitted_once_for_multi_schema_catalog(
+        self, mock_explorer_cls, mock_tracker_cls, mock_auth_cls, mock_from_file
+    ):
+        # Finding #7: a catalog-level tag must be emitted exactly ONCE, not
+        # once per schema. Catalog here has TWO schemas; the pre-fix code
+        # (catalog_tags queried inside per-schema list_tags) produced two
+        # identical rows that then collided in the discovery MERGE (#8).
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config()
+
+        explorer = mock_explorer_cls.return_value
+        explorer.list_catalogs.return_value = ["cat"]
+        explorer.list_schemas.return_value = ["s1", "s2"]  # two schemas
+        explorer.classify_tables.return_value = []
+        explorer.list_functions.return_value = []
+        explorer.list_volumes.return_value = []
+        explorer.list_tags.return_value = []            # per-schema tags: none
+        explorer.list_catalog_tags.return_value = [     # one catalog-level tag
+            {"securable_type": "CATALOG", "securable_fqn": "`cat`",
+             "tag_name": "tier", "tag_value": "gold"},
+        ]
+
+        inventory = run(dbutils, spark)
+
+        tag_rows = [o for o in inventory if o["object_type"] == "tag"]
+        assert len(tag_rows) == 1, f"expected 1 catalog tag row, got {len(tag_rows)}"
+        assert tag_rows[0]["object_name"] == "`cat`::tier"
+        assert tag_rows[0]["schema_name"] is None
+        # list_catalog_tags is called once per catalog, not per schema
+        assert explorer.list_catalog_tags.call_count == 1
+
+    @patch("discovery.discovery.MigrationConfig.from_workspace_file")
+    @patch("discovery.discovery.AuthManager")
+    @patch("discovery.discovery.TrackingManager")
+    @patch("discovery.discovery.CatalogExplorer")
     def test_empty_catalog(self, mock_explorer_cls, mock_tracker_cls, mock_auth_cls, mock_from_file):
         dbutils = MagicMock()
         spark = MagicMock()

@@ -31,14 +31,20 @@ class TestPreCheck:
 
         mock_auth = mock_auth_cls.return_value
         mock_auth.test_connectivity.return_value = {"source": True, "target": True}
-        mock_auth.source_client.shares.list.return_value = []
-        mock_auth.target_client.shares.list.return_value = []
+        # New SDK exposes list_shares() (not list()); the pre_check shim (#5)
+        # must use it so the sharing preflight PASSes instead of WARNing.
+        mock_auth.source_client.shares = MagicMock(spec=["list_shares"])
+        mock_auth.source_client.shares.list_shares.return_value = []
+        mock_auth.target_client.shares = MagicMock(spec=["list_shares"])
+        mock_auth.target_client.shares.list_shares.return_value = []
         mock_auth.target_client.metastores.summary.return_value = MagicMock(name="test-metastore")
         mock_auth.target_client.storage_credentials.list.return_value = [MagicMock()]
         mock_auth.target_client.external_locations.list.return_value = [MagicMock()]
 
         mock_explorer_cls.return_value.list_catalogs.return_value = ["cat_a"]
         spark.sql.return_value.first.return_value = MagicMock(ms="test-metastore-id")
+        # check_deploy_is_source: deploy workspace == configured source URL
+        spark.conf.get.return_value = "https://source.test"
 
         # Phase 2 additions need a source_client that supports cluster/warehouse listing
         mock_auth.source_client.clusters.list.return_value = []
@@ -54,10 +60,50 @@ class TestPreCheck:
         results = run(dbutils, spark)
 
         # 10 core UC checks + 3 Hive/external-metastore checks +
-        # 1 target-collision check (X.4) = 14
-        assert len(results) == 14
+        # 1 target-collision check (X.4) + 1 deploy-is-source guard (#3) = 15
+        assert len(results) == 15
         assert all(r["status"] in ("PASS", "WARN") for r in results)
         assert sum(1 for r in results if r["status"] == "FAIL") == 0
+        _deploy = [r for r in results if r["check_name"] == "check_deploy_is_source"]
+        assert _deploy and _deploy[0]["status"] == "PASS"
+        # #5: sharing preflight must PASS via the list_shares shim (not WARN)
+        _sharing = {r["check_name"]: r["status"] for r in results
+                    if r["check_name"] in ("check_source_sharing", "check_target_sharing")}
+        assert _sharing == {"check_source_sharing": "PASS", "check_target_sharing": "PASS"}
+
+    @patch("pre_check.pre_check.MigrationConfig.from_workspace_file")
+    @patch("pre_check.pre_check.AuthManager")
+    @patch("pre_check.pre_check.TrackingManager")
+    @patch("pre_check.pre_check.CatalogExplorer")
+    def test_deploy_to_target_fails(self, mock_explorer_cls, mock_tracker_cls, mock_auth_cls, mock_from_file):
+        # Regression guard for finding #3: if the bundle is deployed to the
+        # TARGET workspace, check_deploy_is_source must FAIL (not silently
+        # let discovery scan the empty target as the source).
+        dbutils = MagicMock()
+        spark = MagicMock()
+        mock_from_file.return_value = _make_config()
+        mock_auth = mock_auth_cls.return_value
+        mock_auth.test_connectivity.return_value = {"source": True, "target": True}
+        mock_auth.source_client.shares = MagicMock(spec=["list_shares"])
+        mock_auth.source_client.shares.list_shares.return_value = []
+        mock_auth.target_client.shares = MagicMock(spec=["list_shares"])
+        mock_auth.target_client.shares.list_shares.return_value = []
+        mock_auth.target_client.metastores.summary.return_value = MagicMock(name="test-metastore")
+        mock_auth.target_client.storage_credentials.list.return_value = [MagicMock()]
+        mock_auth.target_client.external_locations.list.return_value = [MagicMock()]
+        mock_explorer_cls.return_value.list_catalogs.return_value = ["cat_a"]
+        spark.sql.return_value.first.return_value = MagicMock(ms="test-metastore-id")
+        mock_auth.source_client.clusters.list.return_value = []
+        mock_auth.source_client.warehouses.list.return_value = []
+        mock_explorer_cls.return_value.list_hive_databases.return_value = []
+        mock_explorer_cls.return_value.classify_hive_tables.return_value = []
+        # Deploy workspace URL == configured TARGET (the misconfiguration)
+        spark.conf.get.return_value = "https://target.test"
+
+        # Every other check passes in this setup, so a raise here proves the
+        # deploy-is-source guard is the sole FAIL ("1 check(s) returned FAIL").
+        with pytest.raises(Exception, match=r"1 check\(s\) returned FAIL"):
+            run(dbutils, spark)
 
     @patch("pre_check.pre_check.MigrationConfig.from_workspace_file")
     @patch("pre_check.pre_check.AuthManager")
