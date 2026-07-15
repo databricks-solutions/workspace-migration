@@ -10,10 +10,110 @@ succeeded clean".
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
-from tests.integration._assertion_helpers import expect_validated
+from tests.integration._assertion_helpers import (
+    assert_migrate_idempotent,
+    assert_target_matches_ground_truth,
+    expect_validated,
+)
+
+
+def _spark_count(n):
+    """Mock spark whose COUNT(*) query returns a row with .n == n."""
+    spark = MagicMock()
+    spark.sql.return_value.first.return_value = {"n": n}
+    return spark
+
+
+def _spark_rows(rows):
+    """Mock spark whose SELECT returns the given dict rows via .collect()."""
+    spark = MagicMock()
+    spark.sql.return_value.collect.return_value = rows
+    return spark
+
+
+def _run(result_state, message=""):
+    return SimpleNamespace(
+        state=SimpleNamespace(
+            result_state=SimpleNamespace(value=result_state),
+            state_message=message,
+        )
+    )
+
+
+class TestGroundTruth:
+    """assert_target_matches_ground_truth reads the TARGET, not migration_status."""
+
+    def test_count_match_passes(self):
+        errs: list[str] = []
+        assert assert_target_matches_ground_truth(
+            _spark_count(4), "cat.sch.orders", errs, expected_count=4
+        ) is True
+        assert errs == []
+
+    def test_count_mismatch_fails_with_data_loss_hint(self):
+        errs: list[str] = []
+        # target has 2 of the 4 seeded rows — the #21 row-filter data loss
+        assert assert_target_matches_ground_truth(
+            _spark_count(2), "cat.sch.orders", errs, expected_count=4
+        ) is False
+        assert errs and "2 != expected 4" in errs[0]
+
+    def test_masked_values_caught_by_value_set(self):
+        errs: list[str] = []
+        # target emails came across masked -> value set differs from ground truth
+        spark = _spark_rows([{"customer_id": 1, "email": "***@***"}])
+        ok = assert_target_matches_ground_truth(
+            spark, "cat.sch.customers", errs,
+            expected_rows=[(1, "alice@example.com")],
+            select_cols=["customer_id", "email"],
+        )
+        assert ok is False
+        assert errs and "target values != ground truth" in errs[0]
+
+    def test_value_set_match_passes(self):
+        errs: list[str] = []
+        spark = _spark_rows([{"customer_id": 1, "email": "alice@example.com"}])
+        assert assert_target_matches_ground_truth(
+            spark, "cat.sch.customers", errs,
+            expected_rows=[(1, "alice@example.com")],
+            select_cols=["customer_id", "email"],
+        ) is True
+        assert errs == []
+
+
+class TestIdempotent:
+    """assert_migrate_idempotent runs the job again and demands a clean result."""
+
+    def test_clean_rerun_passes(self):
+        errs: list[str] = []
+        wc = MagicMock()
+        wc.jobs.run_now_and_wait.return_value = _run("SUCCESS", "")
+        assert assert_migrate_idempotent(wc, 123, errs) is True
+        assert errs == []
+        wc.jobs.run_now_and_wait.assert_called_once_with(job_id=123)
+
+    def test_failed_rerun_fails(self):
+        errs: list[str] = []
+        wc = MagicMock()
+        wc.jobs.run_now_and_wait.return_value = _run(
+            "FAILED", "LOCATION_OVERLAP: input path overlaps ..."
+        )
+        assert assert_migrate_idempotent(wc, 1, errs) is False
+        assert errs and "not idempotent" in errs[0]
+
+    def test_success_but_bad_signature_fails(self):
+        # e.g. SUCCESS_WITH_FAILURES-style message carrying a known signature
+        errs: list[str] = []
+        wc = MagicMock()
+        wc.jobs.run_now_and_wait.return_value = _run(
+            "SUCCESS", "ResourceAlreadyExists: Shared Table already exists"
+        )
+        assert assert_migrate_idempotent(wc, 1, errs) is False
+        assert errs and "non-idempotent signature" in errs[0]
 
 
 class TestExpectValidatedDict:
