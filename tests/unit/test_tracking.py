@@ -55,6 +55,21 @@ class TestTrackingManager:
         # Must NOT call the old overwrite write path.
         mock_df.write.mode.assert_not_called()
 
+    def test_write_discovery_inventory_dedups_source(self, mock_spark, mock_config):
+        """Finding #8: the MERGE key omits schema_name, so duplicate source
+        rows (e.g. #7's catalog-tag dups) collided on re-run with
+        DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW. The USING source must
+        be de-duplicated on the merge key (ROW_NUMBER, keep latest) so a
+        re-run can never crash the discovery task."""
+        mgr = TrackingManager(mock_spark, mock_config)
+        mgr.write_discovery_inventory(MagicMock())
+
+        sql_calls = [c.args[0] for c in mock_spark.sql.call_args_list]
+        merge_sql = next((s for s in sql_calls if "MERGE INTO" in s), "")
+        assert "ROW_NUMBER() OVER" in merge_sql, "MERGE source must be de-duplicated"
+        assert "PARTITION BY object_name, object_type, source_type" in merge_sql
+        assert "_dedup_rn = 1" in merge_sql
+
     def test_append_migration_status(self, mock_spark, mock_config):
         mgr = TrackingManager(mock_spark, mock_config)
 

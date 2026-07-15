@@ -38,6 +38,15 @@ ADMIN_BYPASS_PATTERNS = (
 )
 
 
+def _list_shares(client):
+    """SDK-compat shim: SharesAPI.list() was renamed to list_shares() in
+    databricks-sdk 0.6x. Prefer the new name, fall back to the old (finding
+    #5). Mirrors catalog_utils.list_shares so the sharing preflight actually
+    exercises the API instead of always WARNing on AttributeError."""
+    lister = getattr(client.shares, "list_shares", None) or client.shares.list
+    return list(lister())
+
+
 def _check_staging_copy_preconditions(config, auth) -> list[str]:
     """Return a list of error messages. Empty list = all checks passed.
 
@@ -228,9 +237,45 @@ def run(dbutils, spark):  # noqa: D103
             "Ensure target workspace has a UC metastore assigned.",
         )
 
+    # 4b. check_deploy_is_source (guards user_guide #3: the bundle must be
+    # deployed to the SOURCE workspace. The jobs run local Spark against the
+    # deploy workspace and treat it as the source; deploying to the target
+    # makes discovery scan the empty target -> silent no-op. Compare the
+    # current (deploy) workspace URL to the configured source/target URLs.
+    # Only FAILs on the clear misconfiguration (deploy == target); passes or
+    # skips otherwise so same-metastore migrations aren't false-flagged.
+    def _host(url: str) -> str:
+        return (url or "").strip().rstrip("/").split("://")[-1].lower()
+
+    try:
+        current_host = _host(spark.conf.get("spark.databricks.workspaceUrl"))  # noqa: F821
+        src_host = _host(config.source_workspace_url)
+        tgt_host = _host(config.target_workspace_url)
+        if current_host and current_host == tgt_host and tgt_host != src_host:
+            _add(
+                "check_deploy_is_source",
+                "FAIL",
+                f"Bundle appears deployed to the TARGET workspace ({current_host}). "
+                f"It must be deployed to the SOURCE ({src_host}) — the jobs inventory "
+                f"the deploy workspace as the source.",
+                "Redeploy the bundle to the source workspace (user_guide Step 6) "
+                "and store the SPN secret there (Step 3).",
+            )
+        elif current_host and current_host == src_host:
+            _add("check_deploy_is_source", "PASS", f"Deploy workspace is the source ({src_host}).")
+        else:
+            _add(
+                "check_deploy_is_source",
+                "WARN",
+                f"Could not confirm deploy workspace matches source "
+                f"(current={current_host!r}, source={src_host!r}).",
+            )
+    except Exception as e:  # noqa: BLE001
+        _add("check_deploy_is_source", "WARN", f"Could not resolve deploy workspace URL: {e}")
+
     # 5. check_source_sharing
     try:
-        list(auth.source_client.shares.list())
+        _list_shares(auth.source_client)
         _add("check_source_sharing", "PASS", "Source Delta Sharing provider is accessible.")
     except Exception as e:
         _add(
@@ -242,7 +287,7 @@ def run(dbutils, spark):  # noqa: D103
 
     # 6. check_target_sharing
     try:
-        list(auth.target_client.shares.list())
+        _list_shares(auth.target_client)
         _add("check_target_sharing", "PASS", "Target Delta Sharing provider is accessible.")
     except Exception as e:
         _add(

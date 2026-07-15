@@ -29,6 +29,37 @@ class TestCatalogUtils:
         result = explorer.list_catalogs(filter_list=["catalog_a", "catalog_c"])
         assert result == ["catalog_a", "catalog_c"]
 
+    # ------------------------------------------------------------------
+    # list_connections (finding #6 — must NOT swallow errors)
+    # ------------------------------------------------------------------
+
+    def test_list_connections_returns_connections(self, mock_spark):
+        auth = MagicMock()
+        conn = MagicMock()
+        conn.name = "sqlserver_conn"
+        conn.connection_type = MagicMock(value="SQLSERVER")
+        conn.options = {"host": "h"}
+        conn.comment = "c"
+        auth.source_client.connections.list.return_value = [conn]
+        explorer = CatalogExplorer(mock_spark, auth)
+
+        result = explorer.list_connections()
+        assert result == [
+            {"connection_name": "sqlserver_conn", "connection_type": "SQLSERVER",
+             "options": {"host": "h"}, "comment": "c"}
+        ]
+
+    def test_list_connections_propagates_errors(self, mock_spark):
+        # Regression for #6: a permission/SDK error must PROPAGATE, not be
+        # swallowed into an empty list (which silently skipped connections).
+        auth = MagicMock()
+        auth.source_client.connections.list.side_effect = RuntimeError("PermissionDenied")
+        explorer = CatalogExplorer(mock_spark, auth)
+
+        import pytest
+        with pytest.raises(RuntimeError, match="PermissionDenied"):
+            explorer.list_connections()
+
     def test_list_catalogs_excludes_system(self, mock_spark):
         mock_spark.sql.return_value.collect.return_value = [
             _row(catalog="my_catalog"),

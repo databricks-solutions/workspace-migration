@@ -108,6 +108,25 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
 
     for catalog in catalogs:
         all_securables.append(("CATALOG", catalog))
+
+        # Catalog-level tags: enumerate ONCE per catalog (finding #7). Emitting
+        # inside the per-schema loop duplicated each catalog tag N times for a
+        # catalog with N schemas, which then collided in the discovery MERGE.
+        for tag in explorer.list_catalog_tags(catalog):
+            rows.append(
+                discovery_row(
+                    source_type="uc",
+                    object_type="tag",
+                    object_name=(f"{tag['securable_fqn']}:{tag.get('column_name', '')}:{tag['tag_name']}").rstrip(
+                        ":"
+                    ),
+                    catalog_name=catalog,
+                    schema_name=None,
+                    discovered_at=now,
+                    metadata=tag,
+                )
+            )
+
         schemas = explorer.list_schemas(catalog)
         if config.schema_filter:
             schemas = [s for s in schemas if s in config.schema_filter]

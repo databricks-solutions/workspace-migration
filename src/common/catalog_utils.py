@@ -402,15 +402,15 @@ class CatalogExplorer:
     # preview feature is not enabled.
     # ------------------------------------------------------------------
 
-    def list_tags(self, catalog: str, schema: str) -> list[dict]:
-        """List tags on all securables in a schema via system.information_schema.
-
-        Aggregates catalog/schema/table/column/volume tags into a single
-        normalized shape so tags_worker can replay them with one dispatch.
-        """
+    def list_catalog_tags(self, catalog: str) -> list[dict]:
+        """Catalog-level tags for one catalog. Called ONCE per catalog by
+        discovery — separate from ``list_tags`` (which is per-schema) so a
+        catalog tag isn't emitted once per schema. Finding #7: the old code
+        queried ``catalog_tags`` inside ``list_tags(catalog, schema)`` (whose
+        WHERE filters only on ``catalog_name``), so a catalog with N schemas
+        produced N duplicate catalog-tag rows that then collided in the
+        discovery MERGE (#8)."""
         results: list[dict] = []
-
-        # Catalog tags: only returned once per catalog (de-dup'd by caller)
         with _suppress():
             rows = self.spark.sql(  # type: ignore[attr-defined]
                 f"SELECT catalog_name, tag_name, tag_value "
@@ -426,6 +426,17 @@ class CatalogExplorer:
                         "tag_value": r.tag_value,
                     }
                 )
+        return results
+
+    def list_tags(self, catalog: str, schema: str) -> list[dict]:
+        """List SCHEMA/TABLE/COLUMN/VOLUME tags in one schema via
+        system.information_schema. Catalog-level tags are handled separately
+        by ``list_catalog_tags`` (once per catalog) — see finding #7.
+
+        Aggregates schema/table/column/volume tags into a single normalized
+        shape so tags_worker can replay them with one dispatch.
+        """
+        results: list[dict] = []
 
         with _suppress():
             rows = self.spark.sql(  # type: ignore[attr-defined]
@@ -678,25 +689,32 @@ class CatalogExplorer:
         Passwords in ``options`` are not returned by the GET API — worker
         will record a partial status and surface the list of credentials
         the customer must re-enter.
+
+        Raises: underlying SDK exceptions (``PermissionDenied``, SDK method
+        renames, etc.) **propagate** so a misconfigured run fails loudly
+        rather than silently producing an empty connection inventory
+        (finding #6 — the old blanket ``except: return []`` masked both the
+        SDK ``.list`` rename and permission errors, so connections were
+        silently skipped with no trace). Mirrors ``list_foreign_catalogs``.
+        Note: a principal that simply lacks ``USE CONNECTION`` sees an empty
+        list (no error) — that visibility gap is closed by the SPN grant
+        recipe (user_guide Step 4), not here.
         """
         results: list[dict] = []
-        try:
-            client = self.auth_manager.source_client  # type: ignore[attr-defined]
-            for c in client.connections.list():
-                _ct = getattr(c, "connection_type", "")
-                # Store the clean value ("SQLSERVER"), not the enum repr
-                # ("ConnectionType.SQLSERVER") — the latter breaks the worker's
-                # ConnectionType coercion. ``.value`` for an enum, else str.
-                results.append(
-                    {
-                        "connection_name": c.name,
-                        "connection_type": getattr(_ct, "value", str(_ct)),
-                        "options": dict(getattr(c, "options", {}) or {}),
-                        "comment": getattr(c, "comment", None),
-                    }
-                )
-        except Exception:  # noqa: BLE001
-            return []
+        client = self.auth_manager.source_client  # type: ignore[attr-defined]
+        for c in client.connections.list():
+            _ct = getattr(c, "connection_type", "")
+            # Store the clean value ("SQLSERVER"), not the enum repr
+            # ("ConnectionType.SQLSERVER") — the latter breaks the worker's
+            # ConnectionType coercion. ``.value`` for an enum, else str.
+            results.append(
+                {
+                    "connection_name": c.name,
+                    "connection_type": getattr(_ct, "value", str(_ct)),
+                    "options": dict(getattr(c, "options", {}) or {}),
+                    "comment": getattr(c, "comment", None),
+                }
+            )
         return results
 
     def list_foreign_catalogs(self) -> list[dict]:

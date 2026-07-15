@@ -272,9 +272,26 @@ class TrackingManager:
         update_set = ", ".join(f"t.{c} = s.{c}" for c in merge_cols if c not in key_cols)
         insert_cols = ", ".join(merge_cols)
         insert_vals = ", ".join(f"s.{c}" for c in merge_cols)
+        select_cols = ", ".join(merge_cols)
+        # Finding #8: the MERGE key omits schema_name, so any two source rows
+        # sharing (object_name, object_type, source_type) — e.g. the #7
+        # duplicate catalog-tag rows — matched the same target row on a re-run
+        # and failed with DELTA_MULTIPLE_SOURCE_ROW_MATCHING_TARGET_ROW,
+        # aborting discovery (which the guide advertises as re-run-safe).
+        # De-duplicate the source on the merge key (keep the latest by
+        # discovered_at) so the MERGE is crash-proof regardless of upstream
+        # duplicates. Belt-and-braces alongside the #7 emission fix.
         self.spark.sql(f"""
             MERGE INTO {self._fqn}.discovery_inventory t
-            USING {staging_view} s
+            USING (
+                SELECT {select_cols} FROM (
+                    SELECT *, ROW_NUMBER() OVER (
+                        PARTITION BY object_name, object_type, source_type
+                        ORDER BY discovered_at DESC
+                    ) AS _dedup_rn
+                    FROM {staging_view}
+                ) WHERE _dedup_rn = 1
+            ) s
             ON  t.object_name  = s.object_name
             AND t.object_type  = s.object_type
             AND t.source_type  = s.source_type

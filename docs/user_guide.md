@@ -266,26 +266,58 @@ databricks account workspace-assignments update <target-workspace-id> \
 databricks account service-principal-secrets create <spn-id>   # shown once
 ```
 
-### Step 3 — Store the SPN secret (target workspace)
+### Step 3 — Store the SPN secret (source workspace)
+The bundle's notebooks execute on the workspace they are deployed to (Step 6),
+which is the **migration source**. They read the SPN secret with
+`dbutils.secrets.get(...)` against that *local* workspace, so the scope and
+secret must live on the **source** workspace — not the target.
 ```bash
-databricks secrets create-scope migration --profile target-workspace
-databricks secrets put-secret migration spn-secret --profile target-workspace
+databricks secrets create-scope migration --profile source-workspace
+databricks secrets put-secret migration spn-secret --profile source-workspace
 ```
 
 ### Step 4 — Grant SPN privileges
+The SPN must be able to **see and read every source object** (discovery runs
+as the SPN) and **create objects on the target**. Two options:
+
+**Option A — least privilege (recommended).** UC has no `ON ALL CATALOGS`
+securable, and privileges granted **on a catalog inherit** to all current and
+future schemas/tables/volumes/functions/models. So grant per-catalog (loop
+over `SHOW CATALOGS`, skipping `system`/`samples`/tool-owned) — this also
+covers **foreign catalogs** (a foreign catalog is a catalog):
 ```sql
--- Source (run as metastore admin)
-GRANT USE CATALOG ON ALL CATALOGS TO `<spn-application-id>`;
-GRANT USE SCHEMA  ON ALL SCHEMAS  TO `<spn-application-id>`;
-GRANT SELECT      ON ALL TABLES   TO `<spn-application-id>`;
-GRANT READ VOLUME ON ALL VOLUMES  TO `<spn-application-id>`;
--- Customer shares to migrate:
+-- SOURCE (run as metastore admin), once per catalog <cat>:
+GRANT USE CATALOG    ON CATALOG `<cat>` TO `<spn-application-id>`;
+GRANT USE SCHEMA     ON CATALOG `<cat>` TO `<spn-application-id>`;
+GRANT SELECT         ON CATALOG `<cat>` TO `<spn-application-id>`;
+GRANT READ VOLUME    ON CATALOG `<cat>` TO `<spn-application-id>`;
+GRANT EXECUTE        ON CATALOG `<cat>` TO `<spn-application-id>`;
+-- SOURCE, once per CONNECTION <conn> (no bulk/metastore-level grant exists;
+-- without this the SPN cannot see the connection and discovery silently
+-- skips it and its foreign catalog):
+GRANT USE CONNECTION ON CONNECTION `<conn>` TO `<spn-application-id>`;
+-- SOURCE, Delta Sharing family (metastore-wide grants ARE valid here):
+GRANT USE PROVIDER ON METASTORE   TO `<spn-application-id>`;
 ALTER SHARE     `<share_name>`     OWNER TO `<spn-application-id>`;
 ALTER RECIPIENT `<recipient_name>` OWNER TO `<spn-application-id>`;
--- Target
-GRANT CREATE CATALOG ON METASTORE TO `<spn-application-id>`;
-GRANT USE PROVIDER   ON METASTORE TO `<spn-application-id>`;
 ```
+```sql
+-- TARGET
+GRANT CREATE CATALOG         ON METASTORE TO `<spn-application-id>`;
+GRANT CREATE CONNECTION      ON METASTORE TO `<spn-application-id>`;  -- recreate connections
+GRANT USE PROVIDER           ON METASTORE TO `<spn-application-id>`;
+GRANT CREATE EXTERNAL VOLUME ON EXTERNAL LOCATION `<ext-loc>` TO `<spn-application-id>`;  -- external volumes
+```
+
+**Option B — metastore admin (easy setup).** Add the SPN to the group set as
+the metastore admin. It then sees/creates every object type with no
+per-catalog/per-connection grants. Broader privilege (may be unacceptable to
+security-sensitive customers); data reads (`SELECT`/`READ VOLUME`) still apply,
+so pair it with the data grants above if the SPN isn't already granted them.
+
+> Do **not** use `GRANT … ON ALL CATALOGS` — it is not valid UC syntax
+> (`PARSE_SYNTAX_ERROR`). Use the per-catalog grants above (they inherit
+> downward), or Option B.
 
 ### Step 5 — Configure `config.yaml`
 `config.yaml` is git-ignored; copy the example and fill in real values locally:
@@ -307,13 +339,17 @@ migrate_hive_dbfs_root: false       # true + hive_dbfs_target_path for DBFS-root
 > Don't edit the workspace-side copy — `bundle deploy` overwrites it from your
 > local copy.
 
-### Step 6 — Deploy the bundle (target workspace)
+### Step 6 — Deploy the bundle (source workspace)
+Deploy to the **source** workspace. The jobs run there and use local Spark to
+inventory the source (discovery) and the SPN secret (Step 3) to reach the
+target for writes. Deploying to the target instead makes discovery scan the
+empty target *as if it were the source* — a silent no-op migration.
 ```bash
 export DATABRICKS_TF_VERSION=1.5.7
 export DATABRICKS_TF_EXEC_PATH=$(which terraform)
 databricks bundle deploy -t dev \
   --var migration_spn_id=<spn-application-id> \
-  --profile target-workspace
+  --profile source-workspace
 ```
 This creates eight workflows — `pre_check`, `discovery`, `migrate_uc`,
 `migrate_hive`, `migrate_governance`, `migrate_vector_search`,
