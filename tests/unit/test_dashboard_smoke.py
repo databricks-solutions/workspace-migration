@@ -502,3 +502,27 @@ def _explicit_select_aliases(sql: str) -> set[str]:
         if re.fullmatch(r"[a-zA-Z_][a-zA-Z0-9_]*", bare):
             aliases.add(bare.lower())
     return aliases
+
+
+class TestHiveLikeForLikePanels:
+    """The like-for-like Hive migration adds dashboard visibility for mount
+    prerequisites, DBFS-root copies, and skipped/failed Hive objects."""
+
+    def test_new_datasets_present(self):
+        d = _load_dashboard()
+        names = {ds["name"] for ds in d["datasets"]}
+        assert {"mount_prerequisites", "dbfs_root_copies", "hive_skipped_failed"} <= names
+
+    def test_new_datasets_have_queries_and_widgets(self):
+        d = _load_dashboard()
+        for ds in d["datasets"]:
+            if ds["name"] in ("mount_prerequisites", "dbfs_root_copies", "hive_skipped_failed"):
+                assert ds.get("queryLines"), f"{ds['name']} has no query"
+        widget_datasets = set()
+        for page in d["pages"]:
+            for le in page.get("layout", []):
+                for q in le.get("widget", {}).get("queries", []) or []:
+                    ref = q.get("query", {}).get("datasetName")
+                    if ref:
+                        widget_datasets.add(ref)
+        assert {"mount_prerequisites", "dbfs_root_copies", "hive_skipped_failed"} <= widget_datasets

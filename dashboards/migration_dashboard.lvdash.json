@@ -109,6 +109,39 @@
         "  FROM migration_tracking.cp_migration.migration_status\n",
         ") WHERE rn = 1 AND status = 'skipped_policy_protected'\n"
       ]
+    },
+    {
+      "name": "mount_prerequisites",
+      "displayName": "Mount Prerequisites (/mnt)",
+      "queryLines": [
+        "SELECT object_name, storage_location, metadata_json\n",
+        "FROM migration_tracking.cp_migration.discovery_inventory\n",
+        "WHERE object_type = 'mount_prerequisite'"
+      ]
+    },
+    {
+      "name": "dbfs_root_copies",
+      "displayName": "DBFS-root Tables Copied",
+      "queryLines": [
+        "SELECT object_name, status, source_row_count, target_row_count, migrated_at\n",
+        "FROM (\n",
+        "  SELECT *, ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn\n",
+        "  FROM migration_tracking.cp_migration.migration_status\n",
+        "  WHERE object_type = 'hive_managed_dbfs_root'\n",
+        ") WHERE rn = 1"
+      ]
+    },
+    {
+      "name": "hive_skipped_failed",
+      "displayName": "Hive Skipped / Failed",
+      "queryLines": [
+        "SELECT object_name, object_type, status, error_message, migrated_at\n",
+        "FROM (\n",
+        "  SELECT *, ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn\n",
+        "  FROM migration_tracking.cp_migration.migration_status\n",
+        "  WHERE object_type LIKE 'hive_%'\n",
+        ") WHERE rn = 1 AND status IN ('failed', 'validation_failed', 'skipped', 'skipped_by_config')"
+      ]
     }
   ],
   "pages": [
@@ -423,6 +456,148 @@
           "position": {
             "x": 0,
             "y": 14,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "mount_prerequisites_widget",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "mount_prerequisites",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "storage_location",
+                      "expression": "`storage_location`"
+                    },
+                    {
+                      "name": "metadata_json",
+                      "expression": "`metadata_json`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "frame": {
+                "title": "Mount prerequisites (/mnt) \u2014 recreate on target first",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 22,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "dbfs_root_copies_widget",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "dbfs_root_copies",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "source_row_count",
+                      "expression": "`source_row_count`"
+                    },
+                    {
+                      "name": "target_row_count",
+                      "expression": "`target_row_count`"
+                    },
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "frame": {
+                "title": "DBFS-root tables copied (two-hop)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 30,
+            "width": 6,
+            "height": 8
+          }
+        },
+        {
+          "widget": {
+            "name": "hive_skipped_failed_widget",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "hive_skipped_failed",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "error_message",
+                      "expression": "`error_message`"
+                    },
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "frame": {
+                "title": "Hive skipped / failed objects",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 38,
             "width": 6,
             "height": 8
           }
