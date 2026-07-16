@@ -1130,7 +1130,7 @@ class TestHiveGrantsWorker:
         src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_grants_worker.py").read_text()
         # No hive_target_catalog anywhere; catalog branch does not transfer OWN.
         assert "hive_target_catalog" not in src
-        assert "transfer_own=False" in src or "skip_own" in src
+        assert "hive_metastore catalog ownership not transferred" in src
 ```
 - [ ] Step 2: Run test to verify it fails  (Run: `uv run pytest tests/unit/test_hive_workers.py::TestHiveGrantsWorker -v`  Expected: FAIL — `_should_skip_owner_transfer` / `_current_owner` / `spn_client_id` param / catalog-skip do not exist yet; `hive_target_catalog` still referenced.)
 - [ ] Step 3: Write minimal implementation — in `src/migrate/hive_grants_worker.py`:
