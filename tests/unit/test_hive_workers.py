@@ -446,6 +446,38 @@ class TestHiveManagedNondbfsWorker:
         assert result["status"] == "failed"
         assert "boom" in result["error_message"]
 
+    @patch("migrate.hive_managed_nondbfs_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_managed_nondbfs_worker.warehouse_table_count")
+    @patch("migrate.hive_managed_nondbfs_worker.time")
+    @patch("migrate.hive_managed_nondbfs_worker.execute_and_poll")
+    def test_replays_into_hive_metastore_and_keeps_location(
+        self, mock_exec, mock_time, mock_wh_count, mock_append
+    ):
+        from migrate.hive_managed_nondbfs_worker import migrate_hive_managed_nondbfs
+
+        mock_time.time.side_effect = [100.0, 105.0]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_wh_count.return_value = 3
+
+        rec = self._orchestrator_record()
+        explorer = MagicMock()
+        # SHOW CREATE with no LOCATION -> worker must inject storage_location.
+        explorer.get_create_statement.return_value = (
+            "CREATE TABLE hive_metastore.integration_test_hive.nondbfs_sales (id INT) USING delta"
+        )
+        explorer.get_table_row_count.return_value = 3
+
+        res = migrate_hive_managed_nondbfs(
+            rec, config=_config_mock(), auth=MagicMock(), explorer=explorer,
+            wh_id="wh", tracking_fqn="migration_tracking.cp_migration",
+            job_run_id="jr-1", status_wh_id="wh-src",
+        )
+        replayed = mock_exec.call_args[0][2]
+        assert "hive_metastore.integration_test_hive.nondbfs_sales" in replayed
+        assert "hive_upgraded" not in replayed
+        assert "LOCATION 'abfss://ext@acct.dfs.core.windows.net/nondbfs_sales'" in replayed
+        assert res["status"] == "validated"
+
 
 # ----------------------------------------------------------------------
 # hive_orchestrator batching — covered by test_hive_orchestrator.py

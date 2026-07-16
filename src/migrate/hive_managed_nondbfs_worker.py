@@ -37,7 +37,7 @@ from common.sql_utils import (
     rewrite_ddl,
     warehouse_table_count,
 )
-from migrate.hive_common import configure_adls_account_key, rewrite_hive_fqn, rewrite_hive_namespace
+from migrate.hive_common import configure_adls_account_key
 from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
@@ -105,7 +105,7 @@ def migrate_hive_managed_nondbfs(
     source_fqn = record["object_name"]
     storage_location = record.get("storage_location", "")
     provider = (record.get("provider") or "").lower()
-    target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
+    target_fqn = source_fqn  # like-for-like: same FQN in hive_metastore
 
     append_migration_status_via_warehouse(
         auth,
@@ -136,11 +136,9 @@ def migrate_hive_managed_nondbfs(
             "duration_seconds": duration,
         }
 
-    # Rewrite hive_metastore.* references -> <hive_target_catalog>.*
-    ddl = rewrite_hive_namespace(ddl, config.hive_target_catalog)
-    # CREATE TABLE -> CREATE TABLE IF NOT EXISTS
+    # Like-for-like: replay as-is into hive_metastore (no namespace rewrite).
     ddl = rewrite_ddl(ddl, r"CREATE\s+TABLE\b", "CREATE TABLE IF NOT EXISTS")
-    # Force the target to be EXTERNAL by making sure LOCATION is present.
+    # Force a LOCATION so the managed source lands as a located table on target.
     ddl = _ensure_location_clause(ddl, storage_location)
 
     if not _LOCATION_RE.search(ddl):
