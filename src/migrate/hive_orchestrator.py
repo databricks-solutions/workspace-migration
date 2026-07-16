@@ -54,19 +54,30 @@ if _is_notebook():
     completed_fqn = f"{config.tracking_catalog}.{config.tracking_schema}.migration_status"
 
     # Subtract already-validated objects from the pending list (idempotent re-runs).
+    #
+    # Finding #12: discovery records hive tables as object_type='hive_table',
+    # but the workers record their migration status under the CLASSIFIED type
+    # ('hive_external' / 'hive_managed_nondbfs' / 'hive_managed_dbfs_root').
+    # Matching the anti-join on object_type therefore NEVER subtracts an
+    # already-migrated hive table, so every re-run re-creates it → the target
+    # external table's ADLS path collides (LOCATION_OVERLAP). Both sides share
+    # the same object_name (the source hive FQN), and hive object_names are
+    # namespace-unique (`hive_metastore`.<db>.<name>), so match on object_name
+    # ALONE. (hive_view / hive_function already share the type on both sides;
+    # object-name matching is still correct for them.)
     _pending_sql = f"""
         SELECT i.object_name, i.object_type, i.catalog_name, i.schema_name,
                i.data_category, i.table_type, i.provider, i.storage_location
         FROM {inv_fqn} i
         LEFT ANTI JOIN (
-          SELECT object_name, object_type
+          SELECT object_name
           FROM (
-            SELECT object_name, object_type, status,
-              ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn
+            SELECT object_name, status,
+              ROW_NUMBER() OVER (PARTITION BY object_name ORDER BY migrated_at DESC) AS rn
             FROM {completed_fqn}
           ) WHERE rn = 1 AND status = 'validated'
         ) c
-          ON i.object_name = c.object_name AND i.object_type = c.object_type
+          ON i.object_name = c.object_name
         WHERE i.source_type = 'hive'
     """
     inventory_rows = spark.sql(_pending_sql).collect()  # noqa: F821
