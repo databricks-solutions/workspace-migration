@@ -103,8 +103,8 @@ spark.sql(  # noqa: F821
 _ND_DB = "integration_test_hive_nd"  # dedicated db with a non-DBFS LOCATION
 _hive_external_location: str | None = None
 _hive_nondbfs_db_location: str | None = None
-if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path:
-    _base = config.hive_dbfs_target_path.rstrip("/")
+if config.migrate_hive_dbfs_root and config.hive_dbfs_staging_path:
+    _base = config.hive_dbfs_staging_path.rstrip("/")
     _hive_external_location = f"{_base}/hive_external_invoices"
     _hive_nondbfs_db_location = f"{_base}/hive_nondbfs_db"
 
@@ -209,15 +209,15 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 # COMMAND ----------
 
 # Grant the SPN CREATE EXTERNAL TABLE on the target's external location that
-# hosts hive_dbfs_target_path. Without this, the DBFS-root worker's
-# CREATE TABLE ... LOCATION '<hive_dbfs_target_path>/...' fails with
+# hosts hive_dbfs_staging_path. Without this, the DBFS-root worker's
+# CREATE TABLE ... LOCATION '<hive_dbfs_staging_path>/...' fails with
 # PERMISSION_DENIED on the target side.
-if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path and config.spn_client_id:
+if config.migrate_hive_dbfs_root and config.hive_dbfs_staging_path and config.spn_client_id:
     auth = AuthManager(config, dbutils)  # noqa: F821
     wh_id = find_warehouse(auth)
-    # Find the external location covering hive_dbfs_target_path on target.
+    # Find the external location covering hive_dbfs_staging_path on target.
     locs = list(auth.target_client.external_locations.list())
-    matching = [loc for loc in locs if config.hive_dbfs_target_path.startswith(loc.url)]
+    matching = [loc for loc in locs if config.hive_dbfs_staging_path.startswith(loc.url)]
     if matching:
         loc_name = matching[0].name
         grant_sql = (
@@ -231,7 +231,7 @@ if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path and config.spn
             print(f"WARNING: grant on external location '{loc_name}' failed: {res.get('error')}")
     else:
         print(
-            f"WARNING: No external location on target covers {config.hive_dbfs_target_path!r}. "
+            f"WARNING: No external location on target covers {config.hive_dbfs_staging_path!r}. "
             f"DBFS-root migration will likely fail with PERMISSION_DENIED."
         )
 
@@ -327,8 +327,8 @@ dbutils.jobs.taskValues.set(  # type: ignore[name-defined]  # noqa: F821
 
 _has_partitioned_external = False
 _hive_external_partitioned_location: str | None = None
-if config.migrate_hive_dbfs_root and config.hive_dbfs_target_path:
-    _base = config.hive_dbfs_target_path.rstrip("/")
+if config.migrate_hive_dbfs_root and config.hive_dbfs_staging_path:
+    _base = config.hive_dbfs_staging_path.rstrip("/")
     _hive_external_partitioned_location = f"{_base}/hive_external_partitioned_sales"
 
 if _hive_external_partitioned_location:

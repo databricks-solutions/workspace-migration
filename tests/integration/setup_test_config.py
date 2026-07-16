@@ -24,6 +24,10 @@
 #                              false. Typically provided by an operator-
 #                              set BUNDLE_VAR or left at the workspace
 #                              config.yaml's value for subsequent reads.
+#                              Written into config.yaml under the current
+#                              ``hive_dbfs_staging_path`` key (the task
+#                              parameter name itself is unchanged so the
+#                              existing workflow YAML wiring keeps working).
 #   batch_size               — integer ≥ 1 overriding batch_size in
 #                              config.yaml. Empty → leave existing value.
 #                              Hive integration passes "10" so its 12-
@@ -160,7 +164,7 @@ cfg = apply_integration_overrides(
     iceberg_strategy=iceberg_strategy,
     rls_cm_strategy=rls_cm_strategy,
     migrate_hive_dbfs_root=migrate_hive_dbfs_root,
-    hive_dbfs_target_path=hive_dbfs_target_path,
+    hive_dbfs_staging_path=hive_dbfs_target_path,
     batch_size_raw=batch_size_raw,
     catalog_filter_raw=catalog_filter_raw,
     lfc_target_connection_name_raw=lfc_target_connection_name_raw,
@@ -181,7 +185,7 @@ print(
     f"  iceberg_strategy              = {iceberg_strategy!r}\n"
     f"  rls_cm_strategy               = {rls_cm_strategy!r}\n"
     f"  migrate_hive_dbfs_root        = {migrate_hive_dbfs_root}\n"
-    f"  hive_dbfs_target_path         = {cfg.get('hive_dbfs_target_path', '')!r}\n"
+    f"  hive_dbfs_staging_path        = {cfg.get('hive_dbfs_staging_path', '')!r}\n"
     f"  batch_size                    = {cfg.get('batch_size', '(unchanged)')}\n"
     f"  catalog_filter                = {cfg.get('catalog_filter', '(unchanged)')}\n"
     f"  lfc_target_connection_name    = {cfg.get('lfc_target_connection_name', '(unchanged)')!r}\n"
