@@ -131,10 +131,12 @@ class TestFromInventory:
                   "column_name": "sku", "tag_name": "access_class", "tag_value": "bu_column"}),
         ]
         out = affected_tables_from_inventory(rows)
+        # Keys are the ORIGINAL (backticked) managed_table FQNs so they match
+        # the managed_table rows downstream (setup_sharing / orchestrator).
         assert set(out) == {
-            "retail_prod.sales.orders",       # legacy row filter
-            "retail_prod.sales.customers",    # legacy column mask
-            "retail_prod.ops.inventory",      # ABAC (tagged column in scope)
+            "`retail_prod`.`sales`.`orders`",       # legacy row filter
+            "`retail_prod`.`sales`.`customers`",    # legacy column mask
+            "`retail_prod`.`ops`.`inventory`",      # ABAC (tagged column in scope)
         }
 
     def test_no_policies_no_affected(self):

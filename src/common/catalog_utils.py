@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import logging
 import re
 from collections import defaultdict, deque
 
+from databricks.sdk.errors import PermissionDenied
+
 from common.auth import AuthManager
+
+logger = logging.getLogger("catalog_utils")
 
 
 def _sql_in_literal(values: set[str]) -> str:
@@ -578,9 +583,14 @@ class CatalogExplorer:
         Each entry carries the full policy JSON under ``definition`` so
         the policies worker can POST it back on target verbatim.
 
-        Returns empty list on any failure (preview not enabled, API
-        absent on the runtime) so discovery keeps going — ABAC is a
-        preview feature and a missing endpoint shouldn't fail the run.
+        A missing endpoint (preview not enabled) is a benign skip. But a
+        PERMISSION_DENIED is surfaced as a WARNING (not silently swallowed):
+        the migration principal running discovery must be able to READ ABAC
+        policies (own the securable or be a metastore admin), otherwise
+        policy-protected tables go undetected and could be migrated with
+        silent data loss (same class as the #6 connections swallow). A
+        WARNING lets the operator see detection may be incomplete without
+        failing the whole run over one unreadable securable.
         """
         if not securables:
             return []
@@ -590,6 +600,7 @@ class CatalogExplorer:
         except Exception:  # noqa: BLE001
             return []
         seen: set[str] = set()
+        perm_denied: list[str] = []
         for sec_type, full_name in securables:
             try:
                 # ABAC policies are addressed by PATH params, not query params:
@@ -601,7 +612,10 @@ class CatalogExplorer:
                     "GET",
                     f"/api/2.1/unity-catalog/policies/{sec_type}/{full_name}",
                 )
-            except Exception:  # noqa: BLE001 — preview absent, perms, etc.
+            except PermissionDenied:
+                perm_denied.append(f"{sec_type} {full_name}")
+                continue
+            except Exception:  # noqa: BLE001 — preview absent / no API, benign skip
                 continue
             if not isinstance(resp, dict):
                 continue
@@ -620,6 +634,15 @@ class CatalogExplorer:
                         "definition": p,
                     }
                 )
+        if perm_denied:
+            logger.warning(
+                "ABAC policy read denied on %d securable(s): %s. Policy-protected "
+                "table detection may be INCOMPLETE — the migration principal must be "
+                "able to read ABAC policies (own the securable or be a metastore "
+                "admin). Affected tables could otherwise be migrated with silent data loss.",
+                len(perm_denied),
+                sorted(perm_denied),
+            )
         return results
 
     def list_monitors(self, table_fqns: list[str]) -> list[dict]:

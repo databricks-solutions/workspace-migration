@@ -121,7 +121,13 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
     rls_cm: list[str] = []
     abac: list[dict] = []
     column_tags: dict[str, set[tuple[str, str]]] = {}
-    managed: set[str] = set()
+    # Map canonical (unbackticked) FQN -> the ORIGINAL managed_table object_name
+    # (backticked). The returned keys MUST be the original form so they match
+    # the managed_table discovery rows downstream — setup_sharing's share
+    # exclusion and the orchestrator's terminal skip both key off the exact
+    # managed_table object_name (backticked). Emitting the normalized form let
+    # ABAC-only tables slip past the share exclusion (found in live validation).
+    managed_orig: dict[str, str] = {}
     for r in rows:
         ot = r.get("object_type")
         md: dict = {}
@@ -135,11 +141,12 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
         # tables migrate via DDL replay (no data copy) with their policies
         # re-applied on target, so they are NOT excluded.
         if ot == "managed_table":
-            managed.add(_norm(r.get("object_name", "")))
+            orig = r.get("object_name", "")
+            managed_orig[_norm(orig)] = orig
         elif ot == "row_filter":
-            rls_cm.append(r.get("object_name", ""))  # object_name is the table FQN
+            rls_cm.append(_norm(r.get("object_name", "")))  # object_name is the table FQN
         elif ot == "column_mask":
-            rls_cm.append(md.get("table_fqn") or r.get("object_name", ""))
+            rls_cm.append(_norm(md.get("table_fqn") or r.get("object_name", "")))
         elif ot == "policy":
             definition = md.get("definition") or {}
             if definition:
@@ -152,7 +159,8 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
         rls_cm_table_fqns=rls_cm,
         abac_policies=abac,
         column_tags=column_tags,
-        all_tables=sorted(managed),
+        all_tables=sorted(managed_orig),  # canonical keys
     )
-    # Scope to managed tables only (external/other are migrated normally).
-    return {t: reasons for t, reasons in resolved.items() if _norm(t) in managed}
+    # Scope to managed tables only + return the ORIGINAL (backticked) FQN so it
+    # matches the managed_table rows everywhere downstream.
+    return {managed_orig[t]: reasons for t, reasons in resolved.items() if t in managed_orig}
