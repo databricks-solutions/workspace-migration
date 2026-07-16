@@ -35,7 +35,9 @@ class TestHiveViewsWorker:
 
     @patch("migrate.hive_views_worker.time")
     @patch("migrate.hive_views_worker.execute_and_poll")
-    def test_rewrites_hive_metastore_references_to_target_catalog(self, mock_execute, mock_time):
+    def test_replays_hive_metastore_references_unchanged(self, mock_execute, mock_time):
+        """Like-for-like migration: rewrite_hive_namespace is identity,
+        so hive_metastore references pass through unchanged."""
         from migrate.hive_views_worker import migrate_hive_view
 
         mock_time.time.side_effect = [100.0, 105.0]
@@ -56,9 +58,8 @@ class TestHiveViewsWorker:
         )
 
         replayed = mock_execute.call_args[0][2]
-        # hive_metastore rewritten
-        assert "hive_metastore" not in replayed
-        assert "hive_upgraded.integration_test_hive.managed_orders" in replayed
+        # hive_metastore references unchanged (like-for-like)
+        assert "hive_metastore.integration_test_hive.managed_orders" in replayed
         # CREATE VIEW replaced
         assert replayed.startswith("CREATE OR REPLACE VIEW")
 

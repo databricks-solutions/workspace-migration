@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import re
 
 HIVE_CATALOG = "hive_metastore"
 
@@ -64,36 +63,22 @@ def configure_adls_account_key(
         return False
 
 
-def rewrite_hive_namespace(sql: str, target_catalog: str) -> str:
-    """Replace every ``hive_metastore.`` reference in a SQL string with
-    ``<target_catalog>.``. Handles both backticked and un-backticked forms.
+def rewrite_hive_namespace(sql: str, target_catalog: str = HIVE_CATALOG) -> str:
+    """Like-for-like migration replays DDL into hive_metastore unchanged, so
+    this is now an identity function. Kept as a call-site seam (and for the
+    ``target_catalog`` signature) while callers are migrated off the rewrite.
     """
-    # `hive_metastore`. -> `target_catalog`.
-    sql = re.sub(r"`hive_metastore`\.", f"`{target_catalog}`.", sql)
-    # hive_metastore. (no backticks)
-    sql = re.sub(r"\bhive_metastore\.", f"{target_catalog}.", sql)
     return sql
 
 
-def rewrite_hive_fqn(fqn: str, target_catalog: str) -> str:
-    """Rewrite a fully-qualified table name from hive_metastore.x.y to
-    ``<target_catalog>.x.y``.  Accepts backticked or plain form.
-    """
-    stripped = fqn.strip("`").split("`.`")
-    if len(stripped) == 3 and stripped[0] == HIVE_CATALOG:
-        _, schema, name = stripped
-        return f"`{target_catalog}`.`{schema}`.`{name}`"
-    # Fallback — treat as dotted
-    parts = fqn.split(".")
-    if len(parts) == 3 and parts[0] == HIVE_CATALOG:
-        return f"`{target_catalog}`.`{parts[1]}`.`{parts[2]}`"
+def rewrite_hive_fqn(fqn: str, target_catalog: str = HIVE_CATALOG) -> str:
+    """Identity: the target FQN equals the source FQN (both in hive_metastore)."""
     return fqn
 
 
-def ensure_target_catalog_and_schema(spark, target_catalog: str, schema: str) -> None:
-    """Idempotently create the UC target catalog and schema."""
-    spark.sql(f"CREATE CATALOG IF NOT EXISTS `{target_catalog}`")
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{target_catalog}`.`{schema}`")
+def ensure_target_database(spark, schema: str) -> None:
+    """Idempotently create the target database in hive_metastore (like-for-like)."""
+    spark.sql(f"CREATE DATABASE IF NOT EXISTS `{HIVE_CATALOG}`.`{schema}`")
 
 
 # Hive → UC privilege mapping for hive_grants_worker.

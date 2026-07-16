@@ -931,7 +931,9 @@ class TestHiveExternalIdempotency:
     @patch("migrate.hive_external_worker.warehouse_table_count")
     @patch("migrate.hive_external_worker.time")
     @patch("migrate.hive_external_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
+    def test_uses_if_not_exists_and_keeps_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
+        """Like-for-like migration: rewrite_hive_namespace is identity,
+        so hive_metastore references pass through unchanged."""
         from migrate.hive_external_worker import migrate_hive_external_table
 
         mock_time.time.side_effect = [100.0, 101.0]
@@ -958,9 +960,8 @@ class TestHiveExternalIdempotency:
         # target count are routed through the patched warehouse helpers).
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql
-        # Namespace rewrite: hive_metastore -> uc_hive
-        assert "`uc_hive`" in sql
-        assert "`hive_metastore`" not in sql
+        # Like-for-like: hive_metastore references unchanged
+        assert "`hive_metastore`.`db`.`t`" in sql
         assert res["status"] == "validated"
 
 
