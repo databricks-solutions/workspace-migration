@@ -25,7 +25,6 @@ except ImportError:
     _TABLE_TYPE = "TABLE"
 
 from common.auth import AuthManager
-from common.config import MigrationConfig
 
 logger = logging.getLogger("sharing_lib")
 
@@ -292,29 +291,6 @@ def _add_rls_cm_from_tables_api(auth_mgr: AuthManager, pending_tables: list[dict
             if getattr(col, "mask", None) is not None:
                 rls_cm_fqns.add(fqn)
                 break
-
-
-def _validate_rls_cm_strategy(config: MigrationConfig) -> str:
-    """Validate ``config.rls_cm_strategy`` and return the normalized value.
-
-    Runs BEFORE any side-effecting setup (share creation, API calls) so
-    misconfiguration fails loud without leaving orphan state on source.
-
-    Supported: ``""`` (skip affected tables) or ``"staging_copy"``. The
-    ``staging_copy`` path CTAS-clones each affected table into the
-    migration tracking schema while the migration SPN bypasses the
-    source-side filter (as a workspace admin), shares the unprotected
-    staging copy, and re-applies RLS/CM on the target after migrate.
-    Source RLS/CM is never altered.
-    """
-    strategy = (config.rls_cm_strategy or "").strip().lower()
-    if strategy not in ("", "staging_copy"):
-        msg = (
-            f"Unknown rls_cm_strategy {config.rls_cm_strategy!r}. "
-            f"Supported values: '' (skip) or 'staging_copy'."
-        )
-        raise ValueError(msg)
-    return strategy
 
 
 def ensure_share_consumer_catalog(auth_mgr: AuthManager, share_name: str, dry_run: bool) -> None:

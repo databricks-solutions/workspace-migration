@@ -408,8 +408,6 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
             )
         )
 
-    _warn_rls_cm_tables(rows, config)
-
     # --- Policy-protected tables (findings #21/#16) ---
     # Tables protected by a row filter, column mask, or ABAC policy are NOT
     # migrated (copying reads through the policy → silent data loss). Compute
@@ -429,70 +427,33 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
             )
         )
 
+    _warn_rls_cm_tables(rows, config)
+
     return rows, dlt_count
 
 
-def _warn_rls_cm_tables(rows: list[dict], config) -> None:
-    """Surface a prominent warning listing tables with row filter / column
-    mask — Delta Sharing refuses to share these, and the tool skips them by
-    default. Operators can opt into the staging_copy path via
-    ``config.rls_cm_strategy``.
-    """
-    import json as _json
-
-    rls_cm_tables: set[str] = set()
-    for r in rows:
-        ot = r.get("object_type")
-        if ot == "row_filter" and r.get("object_name"):
-            rls_cm_tables.add(r["object_name"])
-        elif ot == "column_mask" and r.get("metadata_json"):
-            try:
-                meta = _json.loads(r["metadata_json"])
-            except _json.JSONDecodeError:
-                continue
-            tbl = meta.get("table_fqn")
-            if tbl:
-                rls_cm_tables.add(tbl)
-
-    if not rls_cm_tables:
+def _warn_rls_cm_tables(rows: list[dict], config) -> None:  # noqa: ARG001
+    """Surface a prominent notice listing tables EXCLUDED from migration because
+    they're protected by a row filter, column mask, or ABAC policy (recorded as
+    ``policy_protected_table``). Copying them would read through the policy and
+    silently drop/mask data, so they are not migrated — they're listed in the
+    dashboard for manual handling (findings #21/#16)."""
+    protected = [r["object_name"] for r in rows if r.get("object_type") == "policy_protected_table"]
+    if not protected:
         return
 
-    strategy = (getattr(config, "rls_cm_strategy", "") or "").strip().lower()
     print()
     print("=" * 78)
-    print("!! TABLES WITH ROW FILTER / COLUMN MASK DETECTED")
+    print("!! POLICY-PROTECTED TABLES — EXCLUDED FROM MIGRATION")
     print("=" * 78)
-    print(f"Discovery found {len(rls_cm_tables)} managed table(s) protected by a row filter or column mask:")
-    for fqn in sorted(rls_cm_tables):
+    print(f"{len(protected)} managed table(s) are protected by a row filter, column mask, or")
+    print("ABAC policy and will NOT be migrated (copying reads through the policy):")
+    for fqn in sorted(protected):
         print(f"  - {fqn}")
     print()
-    print("Delta Sharing providers cannot share tables with legacy RLS/CM (ALTER TABLE ... SET ROW FILTER / SET MASK).")
-    print()
-    if strategy == "staging_copy":
-        print(
-            "config.rls_cm_strategy = 'staging_copy' — setup_sharing will CTAS "
-            "each affected table into the migration tracking catalog's "
-            "cp_migration_staging schema, share the staging copy, and the "
-            "migrate workers will DEEP CLONE that copy. Source RLS/CM "
-            "untouched."
-        )
-    else:
-        print(
-            "Default behavior: these tables WILL BE SKIPPED during migration. "
-            "Their data will NOT move to target. migration_status will record "
-            "status 'skipped_by_rls_cm_policy'."
-        )
-        print()
-        print("Options to migrate their data (see README.md for details):")
-        print(
-            "  1. Rewrite their governance as ABAC policies before migrating — "
-            "Delta Sharing supports sharing tables protected by ABAC."
-        )
-        print(
-            "  2. Set rls_cm_strategy='staging_copy' — clones each affected "
-            "table into a staging schema and shares the copy. Source RLS/CM "
-            "untouched. Requires the migration SPN to be a workspace admin."
-        )
+    print("Recorded as 'skipped_policy_protected' and listed in the migration dashboard")
+    print("(Policy-Protected Tables panel). Migrate manually: remove the policy on")
+    print("source, migrate, then re-apply it on target.")
     print("=" * 78)
     print()
 

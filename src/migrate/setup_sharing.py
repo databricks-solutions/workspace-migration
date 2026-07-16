@@ -32,7 +32,6 @@ from migrate.reconciliation import resolve_current_job_run_id
 from migrate.sharing_lib import (  # noqa: F401,F403  (re-export; runtime can't import this notebook)
     SHARE_NAME,
     _add_rls_cm_from_tables_api,
-    _validate_rls_cm_strategy,  # noqa: F401 — re-export for tests; setup_sharing no longer calls it (flag deprecated)
     add_tables_to_share,
     ensure_share_consumer_catalog,
     ensure_target_catalogs_and_schemas,
