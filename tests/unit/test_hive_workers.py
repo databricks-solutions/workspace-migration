@@ -28,39 +28,31 @@ def _config_mock(**overrides):
 
 
 class TestHiveViewsWorker:
-    """hive_views_worker rewrites hive_metastore.* references to the
-    target catalog and swaps CREATE VIEW → CREATE OR REPLACE VIEW. We
-    hit a real TABLE_OR_VIEW_NOT_FOUND bug here earlier; these tests
-    guard the rewrite contract."""
+    """hive_views_worker replays Hive view DDL into hive_metastore
+    unchanged (like-for-like) and swaps CREATE VIEW → CREATE OR REPLACE
+    VIEW. We hit a real TABLE_OR_VIEW_NOT_FOUND bug here earlier; these
+    tests guard the replay contract."""
 
     @patch("migrate.hive_views_worker.time")
     @patch("migrate.hive_views_worker.execute_and_poll")
-    def test_replays_hive_metastore_references_unchanged(self, mock_execute, mock_time):
-        """Like-for-like migration: rewrite_hive_namespace is identity,
-        so hive_metastore references pass through unchanged."""
+    def test_replays_view_ddl_into_hive_metastore_unchanged(self, mock_execute, mock_time):
         from migrate.hive_views_worker import migrate_hive_view
 
         mock_time.time.side_effect = [100.0, 105.0]
         mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
 
         ddl = (
-            "CREATE VIEW hive_metastore.integration_test_hive.big_orders AS "
-            "SELECT * FROM hive_metastore.integration_test_hive.managed_orders "
-            "WHERE amount > 15"
+            "CREATE OR REPLACE VIEW `hive_metastore`.`integration_test_hive`.`big_orders` AS "
+            "SELECT * FROM hive_metastore.integration_test_hive.managed_orders WHERE amount > 15"
         )
         cfg = _config_mock()
         migrate_hive_view(
             {"object_name": "`hive_metastore`.`integration_test_hive`.`big_orders`"},
-            ddl,
-            config=cfg,
-            auth=MagicMock(),
-            wh_id="wh-hv",
+            ddl, config=cfg, auth=MagicMock(), wh_id="wh-hv",
         )
-
         replayed = mock_execute.call_args[0][2]
-        # hive_metastore references unchanged (like-for-like)
+        assert "hive_upgraded" not in replayed
         assert "hive_metastore.integration_test_hive.managed_orders" in replayed
-        # CREATE VIEW replaced
         assert replayed.startswith("CREATE OR REPLACE VIEW")
 
     @patch("migrate.hive_views_worker.time")
