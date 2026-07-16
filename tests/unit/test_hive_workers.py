@@ -277,27 +277,32 @@ class TestHiveManagedDbfsWorker:
     table on target pointing there. Full behavior drives spark.read /
     write so we test source-level contracts only."""
 
-    def test_module_uses_hive_dbfs_target_path_config(self):
+    def test_module_uses_staging_path_config(self):
         import pathlib
 
         src = (
             pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_managed_dbfs_worker.py"
         ).read_text()
-        assert "hive_dbfs_target_path" in src
+        assert "hive_dbfs_staging_path" in src
+        assert "hive_dbfs_target_path" not in src
 
-    def test_creates_external_table_on_target(self):
-        """Migrated DBFS-root tables land as EXTERNAL on target —
-        their bytes live in ADLS, not in the managed storage allocated
-        by CREATE TABLE. Source-level check that the CREATE statement
-        uses ``CREATE EXTERNAL TABLE`` (or equivalent)."""
-        import pathlib
+    def test_target_table_is_managed_no_location(self):
+        """STAGE 2 lands a MANAGED table in the target DBFS root — the target
+        CREATE TABLE must NOT carry a LOCATION clause (that would make it
+        external and defeat the DBFS-root rehome)."""
+        from migrate.hive_managed_dbfs_worker import _staging_ctas_sql
 
-        src = (
-            pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_managed_dbfs_worker.py"
-        ).read_text()
-        # Either explicit EXTERNAL keyword or LOCATION clause
-        # (LOCATION on CREATE TABLE makes it external in UC).
-        assert "LOCATION" in src
+        sql = _staging_ctas_sql("db", "t", "abfss://stage@a.dfs.core.windows.net/hive", [])
+        assert "LOCATION" not in sql.upper()
+        assert sql.startswith("CREATE OR REPLACE TABLE `hive_metastore`.`db`.`t`")
+        assert "USING DELTA" in sql.upper()
+        assert "delta.`abfss://stage@a.dfs.core.windows.net/hive/db/t/`" in sql
+
+    def test_ctas_sql_preserves_partitions(self):
+        from migrate.hive_managed_dbfs_worker import _staging_ctas_sql
+
+        sql = _staging_ctas_sql("db", "t", "abfss://s@a.dfs.core.windows.net/h", ["country", "yr"])
+        assert "PARTITIONED BY (`country`, `yr`)" in sql
 
     @staticmethod
     def _describe_rows(*pairs, partition_cols=()):
@@ -324,31 +329,24 @@ class TestHiveManagedDbfsWorker:
     def _dbfs_config(self):
         cfg = _config_mock()
         cfg.migrate_hive_dbfs_root = True
-        cfg.hive_dbfs_target_path = "abfss://x@y.dfs.core.windows.net/hive_data"
-        cfg.hive_target_catalog = "uc_hive"
+        cfg.hive_dbfs_staging_path = "abfss://stage@acct.dfs.core.windows.net/hive_stage"
         return cfg
 
+    @patch("migrate.hive_managed_dbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_dbfs_worker.time")
     @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
-    def test_partitioned_source_preserves_partition_columns(self, mock_exec, mock_time):
-        """Review finding #4: a partitioned source must be written partitioned
-        on the target — the worker had no partitionBy, silently flattening it."""
+    def test_two_hop_stage_then_target_managed_ctas(self, mock_exec, mock_time, mock_wh_count):
         from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
 
         mock_time.time.side_effect = [100.0, 101.0]
         mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_wh_count.return_value = 5  # target managed count (via target warehouse)
 
         spark = MagicMock()
         df = MagicMock()
         df.count.return_value = 5
         spark.read.table.return_value = df
-        # DESCRIBE TABLE returns a partitioned schema (partitioned by country).
-        spark.sql.return_value.collect.return_value = self._describe_rows(
-            ("id", "int"), ("amount", "double"), ("country", "string"),
-            partition_cols=["country"],
-        )
-        # Independent re-read of the written path matches source count.
-        spark.read.format.return_value.load.return_value.count.return_value = 5
+        spark.sql.return_value.collect.return_value = self._describe_rows(("id", "int"))
 
         res = migrate_hive_managed_dbfs(
             {"object_name": "`hive_metastore`.`db`.`t`"},
@@ -356,59 +354,55 @@ class TestHiveManagedDbfsWorker:
             spark=spark, wh_id="wh",
         )
 
-        df.write.mode.return_value.format.return_value.partitionBy.assert_called_once_with("country")
+        # STAGE 1: wrote df to the shared staging path (not the final home).
+        staged = df.write.mode.return_value.format.return_value.save.call_args[0][0]
+        assert staged == "abfss://stage@acct.dfs.core.windows.net/hive_stage/db/t/"
+        # STAGE 2: target-side managed CTAS ran via the warehouse.
+        ctas = mock_exec.call_args[0][2]
+        assert ctas.startswith("CREATE OR REPLACE TABLE `hive_metastore`.`db`.`t`")
+        assert "LOCATION" not in ctas.upper()
         assert res["status"] == "validated"
+        assert res["target_row_count"] == 5
 
+    @patch("migrate.hive_managed_dbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_dbfs_worker.time")
     @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
-    def test_unpartitioned_source_does_not_call_partitionby(self, mock_exec, mock_time):
+    def test_target_count_mismatch_is_validation_failed(self, mock_exec, mock_time, mock_wh_count):
         from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
 
         mock_time.time.side_effect = [100.0, 101.0]
         mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_wh_count.return_value = 3  # target has fewer rows than source
 
         spark = MagicMock()
         df = MagicMock()
         df.count.return_value = 5
         spark.read.table.return_value = df
         spark.sql.return_value.collect.return_value = self._describe_rows(("id", "int"))
-        spark.read.format.return_value.load.return_value.count.return_value = 5
-
-        migrate_hive_managed_dbfs(
-            {"object_name": "`hive_metastore`.`db`.`t`"},
-            config=self._dbfs_config(), auth=MagicMock(), tracker=MagicMock(),
-            spark=spark, wh_id="wh",
-        )
-
-        df.write.mode.return_value.format.return_value.partitionBy.assert_not_called()
-
-    @patch("migrate.hive_managed_dbfs_worker.time")
-    @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
-    def test_validation_rereads_written_target_and_catches_mismatch(self, mock_exec, mock_time):
-        """Validation must re-read the actually-written data, not blindly
-        report target_row_count = source_row_count."""
-        from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
-
-        mock_time.time.side_effect = [100.0, 101.0]
-        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
-
-        spark = MagicMock()
-        df = MagicMock()
-        df.count.return_value = 5
-        spark.read.table.return_value = df
-        spark.sql.return_value.collect.return_value = self._describe_rows(("id", "int"))
-        # Re-read of the written path finds only 3 rows — a real divergence.
-        spark.read.format.return_value.load.return_value.count.return_value = 3
 
         res = migrate_hive_managed_dbfs(
             {"object_name": "`hive_metastore`.`db`.`t`"},
             config=self._dbfs_config(), auth=MagicMock(), tracker=MagicMock(),
             spark=spark, wh_id="wh",
         )
-
         assert res["status"] == "validation_failed"
-        assert res["target_row_count"] == 3
         assert res["source_row_count"] == 5
+        assert res["target_row_count"] == 3
+
+    @patch("migrate.hive_managed_dbfs_worker.time")
+    def test_missing_staging_path_fails_fast(self, mock_time):
+        from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
+
+        mock_time.time.side_effect = [100.0, 100.0]
+        cfg = self._dbfs_config()
+        cfg.hive_dbfs_staging_path = ""
+        res = migrate_hive_managed_dbfs(
+            {"object_name": "`hive_metastore`.`db`.`t`"},
+            config=cfg, auth=MagicMock(), tracker=MagicMock(),
+            spark=MagicMock(), wh_id="wh",
+        )
+        assert res["status"] == "failed"
+        assert "hive_dbfs_staging_path" in res["error_message"]
 
 
 # ----------------------------------------------------------------------

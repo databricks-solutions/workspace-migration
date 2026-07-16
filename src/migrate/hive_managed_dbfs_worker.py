@@ -17,9 +17,13 @@ except NameError:
     pass  # not running under a Databricks notebook (e.g. pytest)
 
 # COMMAND ----------
-# Hive Managed DBFS Root Worker: migrates Hive managed tables on DBFS root.
-# The data is copied off the source DBFS to a customer-provided ADLS path,
-# then re-registered as a UC external Delta table on the target workspace.
+# Hive Managed DBFS Root Worker: two-hop staging copy of Hive managed tables
+# on the source DBFS root into a MANAGED table in the target's own DBFS root
+# (like-for-like — stays managed in hive_metastore, never becomes UC external).
+# STAGE 1 (source-side): df.write the table data to a shared abfss staging
+# path reachable by both workspaces, preserving partition layout.
+# STAGE 2 (target-side): a target-warehouse CTAS reads the staged Delta data
+# and writes a MANAGED table (no LOCATION) that lands in the target DBFS root.
 
 import json
 import logging
@@ -27,7 +31,7 @@ import time
 
 from common.auth import AuthManager
 from common.config import MigrationConfig
-from common.sql_utils import execute_and_poll, find_warehouse
+from common.sql_utils import execute_and_poll, find_warehouse, warehouse_table_count
 from common.tracking import TrackingManager
 from migrate.reconciliation import resolve_current_job_run_id
 
@@ -76,6 +80,28 @@ def _source_partition_columns(spark, db: str, table: str) -> list[str]:
     return cols
 
 
+def _staging_ctas_sql(db: str, table: str, staging_path: str, partition_cols: list[str]) -> str:
+    """Target-side CTAS that lands a MANAGED table in the target DBFS root.
+
+    Reads the two-hop staging Delta directory and writes a managed table (NO
+    LOCATION) in hive_metastore so it lands in the target's own DBFS root.
+    Partition columns are preserved via ``PARTITIONED BY``.
+
+    Uses ``CREATE OR REPLACE`` so the worker is re-runnable: a retry (or a
+    second migration pass) overwrites the target from staging rather than
+    failing on an already-existing table (idempotency — findings #8/#12/#20).
+    """
+    src = f"{staging_path.rstrip('/')}/{db}/{table}/"
+    parts = ""
+    if partition_cols:
+        cols = ", ".join(f"`{c}`" for c in partition_cols)
+        parts = f" PARTITIONED BY ({cols})"
+    return (
+        f"CREATE OR REPLACE TABLE `hive_metastore`.`{db}`.`{table}` USING DELTA{parts} "
+        f"AS SELECT * FROM delta.`{src}`"
+    )
+
+
 # COMMAND ----------
 # Migrate a single Hive managed DBFS-root table
 
@@ -89,7 +115,8 @@ def migrate_hive_managed_dbfs(
     spark,
     wh_id: str,
 ) -> dict:
-    """Copy a Hive managed DBFS-root table to ADLS and register as UC external."""
+    """Two-hop staging copy of a Hive DBFS-root managed table into the target's
+    own DBFS root (like-for-like: stays managed in hive_metastore)."""
     obj_name = table_info["object_name"]
 
     # A. Opt-out check
@@ -103,12 +130,12 @@ def migrate_hive_managed_dbfs(
         }
 
     # B. Config validation (defensive — pre-check should catch this)
-    if not config.hive_dbfs_target_path:
+    if not config.hive_dbfs_staging_path:
         return {
             "object_name": obj_name,
             "object_type": "hive_managed_dbfs_root",
             "status": "failed",
-            "error_message": "hive_dbfs_target_path required but not set",
+            "error_message": "hive_dbfs_staging_path required but not set",
             "duration_seconds": 0.0,
         }
 
@@ -146,11 +173,11 @@ def migrate_hive_managed_dbfs(
             "duration_seconds": duration,
         }
 
-    target_path = f"{config.hive_dbfs_target_path.rstrip('/')}/{db}/{table}/"
+    staging_path = f"{config.hive_dbfs_staging_path.rstrip('/')}/{db}/{table}/"
 
     if config.dry_run:
         duration = time.time() - start
-        logger.info("[DRY RUN] Would copy %s to %s", obj_name, target_path)
+        logger.info("[DRY RUN] Would stage %s to %s then CTAS into target DBFS root", obj_name, staging_path)
         return {
             "object_name": obj_name,
             "object_type": "hive_managed_dbfs_root",
@@ -159,9 +186,8 @@ def migrate_hive_managed_dbfs(
             "duration_seconds": duration,
         }
 
-    # C. Data copy (source-side Spark reads hive_metastore directly).
-    #    Preserve the source partition layout (review finding #4) — a plain
-    #    df.write silently flattens a partitioned table on the target.
+    # STAGE 1: source-side write of table data to the shared abfss staging path
+    # (reachable by both workspaces). Preserve partition layout (finding #4).
     try:
         logger.info("Reading source table %s", obj_name)
         df = spark.read.table(f"hive_metastore.`{db}`.`{table}`")
@@ -171,23 +197,24 @@ def migrate_hive_managed_dbfs(
         if partition_cols:
             logger.info("Preserving partition columns %s for %s", partition_cols, obj_name)
             writer = writer.partitionBy(*partition_cols)
-        logger.info("Writing %d rows to %s", source_row_count, target_path)
-        writer.save(target_path)
+        logger.info("STAGE 1: writing %d rows to staging %s", source_row_count, staging_path)
+        writer.save(staging_path)
     except Exception as exc:  # noqa: BLE001
         duration = time.time() - start
         return {
             "object_name": obj_name,
             "object_type": "hive_managed_dbfs_root",
             "status": "failed",
-            "error_message": f"Data copy failed: {exc}",
+            "error_message": f"Staging write failed: {exc}",
             "duration_seconds": duration,
         }
 
-    # D. Register on target as UC external Delta
-    target_fqn = f"`{config.hive_target_catalog}`.`{db}`.`{table}`"
-    create_sql = f"CREATE TABLE IF NOT EXISTS {target_fqn} USING DELTA LOCATION '{target_path}'"
-    logger.info("Registering UC external table %s", target_fqn)
-    result = execute_and_poll(auth, wh_id, create_sql)
+    # STAGE 2: target-side CTAS that reads staging and writes a MANAGED table
+    # into the target's own DBFS root (no LOCATION), via the TARGET warehouse.
+    target_fqn = f"`hive_metastore`.`{db}`.`{table}`"
+    ctas_sql = _staging_ctas_sql(db, table, config.hive_dbfs_staging_path, partition_cols)
+    logger.info("STAGE 2: creating managed target table %s from staging", target_fqn)
+    result = execute_and_poll(auth, wh_id, ctas_sql)
     duration = time.time() - start
 
     if result["state"] != "SUCCEEDED":
@@ -200,17 +227,14 @@ def migrate_hive_managed_dbfs(
             "duration_seconds": duration,
         }
 
-    # E/F. Validate by independently RE-READING the data that actually landed
-    # at the target path (review finding #4) — don't blindly assume
-    # target_row_count == source_row_count. The source spark session can read
-    # the ADLS path it just wrote without needing the target metastore. If the
-    # re-read isn't an int (e.g. unit-test mock) we fall back to the source
-    # count rather than false-failing.
+    # Validate: compare the source row count to the TARGET managed table count
+    # (read through the target warehouse — the target metastore isn't visible
+    # to this worker's spark session).
     target_row_count = None
     try:
-        target_row_count = spark.read.format("delta").load(target_path).count()
+        target_row_count = warehouse_table_count(auth, wh_id, target_fqn)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Could not re-read target path %s for validation: %s", target_path, exc)
+        logger.warning("Could not read target count for %s: %s", target_fqn, exc)
 
     if isinstance(target_row_count, int) and target_row_count != source_row_count:
         return {
@@ -218,8 +242,8 @@ def migrate_hive_managed_dbfs(
             "object_type": "hive_managed_dbfs_root",
             "status": "validation_failed",
             "error_message": (
-                f"Row count mismatch after write: wrote {source_row_count}, "
-                f"target path has {target_row_count}"
+                f"Row count mismatch after target CTAS: source {source_row_count}, "
+                f"target managed table has {target_row_count}"
             ),
             "source_row_count": source_row_count,
             "target_row_count": target_row_count,

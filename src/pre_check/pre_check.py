@@ -315,23 +315,24 @@ def run(dbutils, spark):  # noqa: D103
                 f"{len(dbfs_root_tables)} Hive DBFS-root managed table(s) discovered; "
                 f"migration skipped because migrate_hive_dbfs_root=false.",
                 "Review the discovered list; set migrate_hive_dbfs_root=true "
-                "and hive_dbfs_target_path in config.yaml to include them.",
+                "and hive_dbfs_staging_path in config.yaml to include them.",
             )
-        elif not config.hive_dbfs_target_path:
+        elif not config.hive_dbfs_staging_path:
             _add(
                 "check_hive_dbfs_root_config",
                 "FAIL",
                 f"{len(dbfs_root_tables)} DBFS-root table(s) selected for migration but "
-                f"hive_dbfs_target_path is empty.",
-                "Set hive_dbfs_target_path in config.yaml to an ADLS location "
-                "the migration SPN can write to (e.g. abfss://hive@acct.dfs.core.windows.net/upgraded/).",
+                f"hive_dbfs_staging_path is empty.",
+                "Set hive_dbfs_staging_path in config.yaml to a shared abfss staging "
+                "location both workspaces can reach (e.g. abfss://hive@acct.dfs.core.windows.net/stage/); "
+                "the tables are staged there, then re-created as managed tables in the target's own DBFS root.",
             )
         else:
-            # Probe write to the configured path
+            # Probe write to the configured staging path
             from datetime import datetime
 
             ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            probe_path = config.hive_dbfs_target_path.rstrip("/") + f"/.precheck_probe_{ts}"
+            probe_path = config.hive_dbfs_staging_path.rstrip("/") + f"/.precheck_probe_{ts}"
             try:
                 spark.createDataFrame([(1,)], "x INT").write.mode("overwrite").format("delta").save(  # type: ignore[attr-defined]
                     probe_path
@@ -341,16 +342,16 @@ def run(dbutils, spark):  # noqa: D103
                 _add(
                     "check_hive_dbfs_root_config",
                     "PASS",
-                    f"{len(dbfs_root_tables)} DBFS-root table(s) will migrate to "
-                    f"{config.hive_dbfs_target_path}; write probe passed.",
+                    f"{len(dbfs_root_tables)} DBFS-root table(s) will be staged via "
+                    f"{config.hive_dbfs_staging_path} then re-created managed on target; write probe passed.",
                 )
             except Exception as probe_exc:  # noqa: BLE001
                 _add(
                     "check_hive_dbfs_root_config",
                     "FAIL",
-                    f"Cannot write to hive_dbfs_target_path {config.hive_dbfs_target_path}: {probe_exc}",
-                    "Verify the SPN has write access to this ADLS location, and that "
-                    "a storage credential + external location exists on target.",
+                    f"Cannot write to hive_dbfs_staging_path {config.hive_dbfs_staging_path}: {probe_exc}",
+                    "Verify the SPN has write access to this ADLS staging location, and that "
+                    "a storage credential + external location exists on both workspaces.",
                 )
     except Exception as e:
         _add(
