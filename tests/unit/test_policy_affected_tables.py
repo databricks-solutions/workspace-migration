@@ -7,8 +7,11 @@ migrate). Fixtures use the real ABAC ``definition`` JSON shape captured from
 
 from __future__ import annotations
 
+import json
+
 from common.policy_affected_tables import (
     affected_tables,
+    affected_tables_from_inventory,
     parse_tag_conditions,
     resolve_abac_affected_tables,
     tables_in_scope,
@@ -92,6 +95,51 @@ class TestAbacResolution:
         p["policy_type"] = "POLICY_TYPE_ROW_FILTER"
         out = resolve_abac_affected_tables([p], {}, TABLES)
         assert out["retail_prod.sales.orders"][0]["policy_type"] == "POLICY_TYPE_ROW_FILTER"
+
+
+def _row(object_type, object_name, metadata=None):
+    return {
+        "object_type": object_type,
+        "object_name": object_name,
+        "metadata_json": json.dumps(metadata) if metadata else None,
+    }
+
+
+class TestFromInventory:
+    """Adapter that reads discovery_inventory row dicts (metadata_json strings)."""
+
+    def test_extracts_legacy_and_abac_from_rows(self):
+        rows = [
+            _row("managed_table", "`retail_prod`.`sales`.`orders`"),
+            _row("managed_table", "`retail_prod`.`sales`.`customers`"),
+            _row("managed_table", "`retail_prod`.`ops`.`inventory`"),
+            # legacy row filter bound to orders
+            _row("row_filter", "`retail_prod`.`sales`.`orders`", {"table_fqn": "`retail_prod`.`sales`.`orders`"}),
+            # legacy column mask on customers.email
+            _row("column_mask", "`retail_prod`.`sales`.`customers`.email",
+                 {"table_fqn": "`retail_prod`.`sales`.`customers`", "column_name": "email"}),
+            # ABAC schema-scoped column mask matching access_class=bu_column
+            _row("policy", "retail_prod.ops::p1", {"definition": {
+                "policy_type": "POLICY_TYPE_COLUMN_MASK",
+                "on_securable_type": "SCHEMA", "on_securable_fullname": "retail_prod.ops",
+                "name": "p1",
+                "match_columns": [{"alias": "c", "condition": "has_tag_value('access_class','bu_column')"}],
+            }}),
+            # column tag that the ABAC policy matches, on inventory.sku
+            _row("tag", "`retail_prod`.`ops`.`inventory`.sku:access_class",
+                 {"securable_type": "COLUMN", "securable_fqn": "`retail_prod`.`ops`.`inventory`",
+                  "column_name": "sku", "tag_name": "access_class", "tag_value": "bu_column"}),
+        ]
+        out = affected_tables_from_inventory(rows)
+        assert set(out) == {
+            "retail_prod.sales.orders",       # legacy row filter
+            "retail_prod.sales.customers",    # legacy column mask
+            "retail_prod.ops.inventory",      # ABAC (tagged column in scope)
+        }
+
+    def test_no_policies_no_affected(self):
+        rows = [_row("managed_table", "`c`.`s`.`t`"), _row("view", "`c`.`s`.`v`")]
+        assert affected_tables_from_inventory(rows) == {}
 
 
 class TestCombined:

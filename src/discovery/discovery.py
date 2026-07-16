@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from common.auth import AuthManager
 from common.catalog_utils import CatalogExplorer
 from common.config import MigrationConfig
+from common.policy_affected_tables import affected_tables_from_inventory
 from common.sql_utils import find_warehouse, write_discovery_inventory_via_warehouse
 from common.stateful_utils import CAPABILITY, StatefulExplorer
 from common.tracking import TrackingManager, discovery_row, discovery_schema
@@ -408,6 +409,25 @@ def _discover_uc(config, explorer, now) -> tuple[list[dict], int]:
         )
 
     _warn_rls_cm_tables(rows, config)
+
+    # --- Policy-protected tables (findings #21/#16) ---
+    # Tables protected by a row filter, column mask, or ABAC policy are NOT
+    # migrated (copying reads through the policy → silent data loss). Compute
+    # the affected set from the rows just built and record one
+    # ``policy_protected_table`` marker per table so the orchestrator excludes
+    # them from managed-table migration and the dashboard can surface them.
+    for tfqn, reasons in affected_tables_from_inventory(rows).items():
+        rows.append(
+            discovery_row(
+                source_type="uc",
+                object_type="policy_protected_table",
+                object_name=tfqn,
+                catalog_name=None,
+                schema_name=None,
+                discovered_at=now,
+                metadata={"reasons": reasons},
+            )
+        )
 
     return rows, dlt_count
 

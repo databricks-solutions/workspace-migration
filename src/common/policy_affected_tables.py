@@ -27,6 +27,7 @@ ABAC definition shape (captured live from
 
 from __future__ import annotations
 
+import json
 import re
 
 # has_tag_value('key','value') — the only predicate ABAC MATCH COLUMNS accepts.
@@ -107,3 +108,46 @@ def affected_tables(
     for fqn, reasons in resolve_abac_affected_tables(abac_policies, column_tags, all_tables).items():
         out.setdefault(_norm(fqn), []).extend(reasons)
     return out
+
+
+def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
+    """Compute policy-protected tables directly from discovery_inventory row
+    dicts (each with ``object_type`` + ``metadata_json``). Extracts the legacy
+    RLS/CM table FQNs (row_filter / column_mask rows), ABAC policy definitions
+    (policy rows), per-table column tags (COLUMN tag rows), and the table
+    universe (managed/external_table rows), then delegates to
+    :func:`affected_tables`. Kept here (not in discovery) so it's unit-testable.
+    """
+    rls_cm: list[str] = []
+    abac: list[dict] = []
+    column_tags: dict[str, set[tuple[str, str]]] = {}
+    all_tables: list[str] = []
+    for r in rows:
+        ot = r.get("object_type")
+        md: dict = {}
+        mj = r.get("metadata_json")
+        if mj:
+            try:
+                md = json.loads(mj)
+            except Exception:  # noqa: BLE001
+                md = {}
+        if ot in ("managed_table", "external_table"):
+            all_tables.append(_norm(r.get("object_name", "")))
+        elif ot == "row_filter":
+            rls_cm.append(r.get("object_name", ""))  # object_name is the table FQN
+        elif ot == "column_mask":
+            rls_cm.append(md.get("table_fqn") or r.get("object_name", ""))
+        elif ot == "policy":
+            definition = md.get("definition") or {}
+            if definition:
+                abac.append(definition)
+        elif ot == "tag" and md.get("securable_type") == "COLUMN":
+            column_tags.setdefault(_norm(md.get("securable_fqn", "")), set()).add(
+                (md.get("tag_name"), md.get("tag_value"))
+            )
+    return affected_tables(
+        rls_cm_table_fqns=rls_cm,
+        abac_policies=abac,
+        column_tags=column_tags,
+        all_tables=all_tables,
+    )
