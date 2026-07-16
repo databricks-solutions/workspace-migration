@@ -265,6 +265,65 @@ class TestHiveGrantsWorker:
                 f"dropped with 'Skipping unknown object_type'."
             )
 
+    def test_skip_decision_when_already_owned(self):
+        from migrate.hive_grants_worker import _should_skip_owner_transfer
+
+        assert _should_skip_owner_transfer("alice@corp.com", "alice@corp.com") is True
+        assert _should_skip_owner_transfer("ALICE@corp.com", "alice@corp.com") is True
+        assert _should_skip_owner_transfer("bob@corp.com", "alice@corp.com") is False
+        assert _should_skip_owner_transfer(None, "alice@corp.com") is False
+
+    @patch("migrate.hive_grants_worker._current_owner")
+    @patch("migrate.hive_grants_worker.time")
+    @patch("migrate.hive_grants_worker.execute_and_poll")
+    def test_schema_own_grants_before_transfer(self, mock_exec, mock_time, mock_owner):
+        """SCHEMA OWN must GRANT USAGE, CREATE to the SPN BEFORE ALTER OWNER."""
+        from migrate.hive_grants_worker import _emit_grant
+
+        mock_time.time.side_effect = [100.0, 100.1, 100.2, 100.3]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_owner.return_value = "someoneelse@corp.com"  # not yet owned by target
+
+        _emit_grant(
+            action_type="OWN", securable_keyword="SCHEMA",
+            target_fqn="`hive_metastore`.`db`", principal="alice@corp.com",
+            auth=MagicMock(), wh_id="wh", dry_run=False,
+            transfer_ownership=True, spn_client_id="spn-123",
+        )
+        executed = [c.args[2] for c in mock_exec.call_args_list]
+        grant_idx = next(i for i, s in enumerate(executed) if s.startswith("GRANT USAGE, CREATE ON SCHEMA"))
+        owner_idx = next(i for i, s in enumerate(executed) if s.startswith("ALTER SCHEMA"))
+        assert "`hive_metastore`.`db`" in executed[grant_idx]
+        assert "`spn-123`" in executed[grant_idx]
+        assert grant_idx < owner_idx, "GRANT USAGE, CREATE must precede ALTER OWNER"
+
+    @patch("migrate.hive_grants_worker._current_owner")
+    @patch("migrate.hive_grants_worker.time")
+    @patch("migrate.hive_grants_worker.execute_and_poll")
+    def test_owner_transfer_skipped_when_already_owned(self, mock_exec, mock_time, mock_owner):
+        from migrate.hive_grants_worker import _emit_grant
+
+        mock_time.time.side_effect = [100.0, 100.1]
+        mock_owner.return_value = "alice@corp.com"  # target already owns
+        res = _emit_grant(
+            action_type="OWN", securable_keyword="SCHEMA",
+            target_fqn="`hive_metastore`.`db`", principal="alice@corp.com",
+            auth=MagicMock(), wh_id="wh", dry_run=False,
+            transfer_ownership=True, spn_client_id="spn-123",
+        )
+        assert res["status"] == "skipped"
+        assert "already owned" in res["error_message"].lower()
+        assert not any(c.args[2].startswith("ALTER SCHEMA") for c in mock_exec.call_args_list)
+
+    def test_run_skips_own_at_catalog_level(self):
+        """The built-in hive_metastore catalog ownership is never transferred."""
+        import pathlib
+
+        src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_grants_worker.py").read_text()
+        # No hive_target_catalog anywhere; catalog branch does not transfer OWN.
+        assert "hive_target_catalog" not in src
+        assert "hive_metastore catalog ownership not transferred" in src
+
 
 # ----------------------------------------------------------------------
 # hive_managed_dbfs_worker

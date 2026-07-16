@@ -17,9 +17,12 @@ except NameError:
     pass  # not running under a Databricks notebook (e.g. pytest)
 
 # COMMAND ----------
-# Hive Grants Worker: replays legacy hive_metastore ACLs as UC grants on the
-# target catalog. Runs AFTER hive table/view/function workers so that all
-# target securables exist.
+# Hive Grants Worker: replays hive_metastore ACLs + ownership onto the target
+# workspace's own hive_metastore, like-for-like (target FQN == source FQN).
+# Runs AFTER hive table/view/function workers so all target securables exist.
+# Ownership transfer uses grant-before-transfer (GRANT USAGE, CREATE to the SPN
+# before ALTER SCHEMA OWNER) so the SPN keeps write access on re-runs, and
+# skips the transfer when the target already owns the securable (finding #13).
 
 import logging
 import time
@@ -28,7 +31,7 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse
 from common.tracking import TrackingManager
-from migrate.hive_common import HIVE_TO_UC_PRIVILEGES, rewrite_hive_fqn
+from migrate.hive_common import HIVE_TO_UC_PRIVILEGES
 from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
@@ -68,6 +71,43 @@ def _skip_principal(principal: str) -> bool:
     return principal is None or principal.startswith("__")
 
 
+def _should_skip_owner_transfer(current_owner: str | None, target_principal: str) -> bool:
+    """Skip the ALTER … OWNER TO when the target already owns the securable —
+    makes re-runs idempotent (finding #13: no re-transfer failure)."""
+    if not current_owner:
+        return False
+    return current_owner.strip().lower() == target_principal.strip().lower()
+
+
+_OWNER_DESCRIBE = {
+    "CATALOG": "DESCRIBE CATALOG EXTENDED {fqn}",
+    "SCHEMA": "DESCRIBE SCHEMA EXTENDED {fqn}",
+    "TABLE": "DESCRIBE TABLE EXTENDED {fqn}",
+    "VIEW": "DESCRIBE TABLE EXTENDED {fqn}",
+    "FUNCTION": "DESCRIBE FUNCTION EXTENDED {fqn}",
+}
+
+
+def _current_owner(auth: AuthManager, wh_id: str, securable_keyword: str, target_fqn: str) -> str | None:
+    """Read the current owner of a securable via the target warehouse.
+
+    Parses the ``Owner`` row from ``DESCRIBE … EXTENDED``. Best-effort: any
+    failure returns None (caller then proceeds with the transfer).
+    """
+    tmpl = _OWNER_DESCRIBE.get(securable_keyword)
+    if not tmpl:
+        return None
+    res = execute_and_poll(auth, wh_id, tmpl.format(fqn=target_fqn))
+    if res.get("state") != "SUCCEEDED":
+        return None
+    for row in res.get("rows", []) or []:
+        cells = [str(c) if c is not None else "" for c in row]
+        for i, c in enumerate(cells):
+            if c.strip().lower() in ("owner", "table owner") and i + 1 < len(cells):
+                return cells[i + 1].strip() or None
+    return None
+
+
 def _emit_grant(
     *,
     action_type: str,
@@ -78,6 +118,7 @@ def _emit_grant(
     wh_id: str,
     dry_run: bool,
     transfer_ownership: bool = True,
+    spn_client_id: str = "",
 ) -> dict:
     """Build and emit a GRANT statement. Returns the migration_status record."""
     # Map Hive action to UC privilege.
@@ -85,53 +126,73 @@ def _emit_grant(
     obj_key = f"GRANT_{action_type}_{securable_keyword}_{target_fqn}_{principal}"
 
     if action_type.upper() == "OWN":
-        # Transfer ownership to the original owner (review finding #5). The
-        # migration SPN is a workspace admin, so it can ALTER OWNER regardless
-        # of order. Gated on transfer_ownership; fail-loud per row.
         if not transfer_ownership:
             logger.info(
-                "transfer_ownership=False: leaving %s %s owned by the migration SPN "
-                "(original owner %s not restored).",
-                securable_keyword, target_fqn, principal,
+                "transfer_ownership=False: leaving %s %s owned by the migration SPN.",
+                securable_keyword, target_fqn,
             )
             return {
-                "object_name": obj_key,
-                "object_type": "hive_grant",
-                "status": "skipped",
-                "error_message": "transfer_ownership disabled",
+                "object_name": obj_key, "object_type": "hive_grant",
+                "status": "skipped", "error_message": "transfer_ownership disabled",
                 "duration_seconds": 0.0,
             }
         owner_obj_key = f"OWNER_{securable_keyword}_{target_fqn}_{principal}"
-        owner_sql = f"ALTER {securable_keyword} {target_fqn} OWNER TO `{principal}`"
-        if dry_run:
-            logger.info("[DRY RUN] Would transfer ownership: %s", owner_sql)
+        # #14 moot: never transfer ownership of the built-in hive_metastore catalog.
+        if securable_keyword == "CATALOG":
             return {
-                "object_name": owner_obj_key,
-                "object_type": "hive_grant",
+                "object_name": owner_obj_key, "object_type": "hive_grant",
                 "status": "skipped",
-                "error_message": "dry_run",
+                "error_message": "hive_metastore catalog ownership not transferred (built-in)",
                 "duration_seconds": 0.0,
             }
+        owner_sql = f"ALTER {securable_keyword} {target_fqn} OWNER TO `{principal}`"
+        grant_sql = None
+        if securable_keyword == "SCHEMA" and spn_client_id:
+            grant_sql = f"GRANT USAGE, CREATE ON SCHEMA {target_fqn} TO `{spn_client_id}`"
+        if dry_run:
+            if grant_sql:
+                logger.info("[DRY RUN] Would grant-before-transfer: %s", grant_sql)
+            logger.info("[DRY RUN] Would transfer ownership: %s", owner_sql)
+            return {
+                "object_name": owner_obj_key, "object_type": "hive_grant",
+                "status": "skipped", "error_message": "dry_run", "duration_seconds": 0.0,
+            }
         start = time.time()
+        # skip-if-already-owned (finding #13): idempotent re-runs.
+        current = _current_owner(auth, wh_id, securable_keyword, target_fqn)
+        if _should_skip_owner_transfer(current, principal):
+            return {
+                "object_name": owner_obj_key, "object_type": "hive_grant",
+                "status": "skipped",
+                "error_message": f"already owned by target principal {principal!r}",
+                "duration_seconds": time.time() - start,
+            }
+        # grant-before-transfer: keep SPN CREATE on the schema after handing
+        # ownership back to the original owner (finding #13 lockout).
+        if grant_sql:
+            logger.info("Grant-before-transfer: %s", grant_sql)
+            g_res = execute_and_poll(auth, wh_id, grant_sql)
+            if g_res["state"] != "SUCCEEDED":
+                return {
+                    "object_name": owner_obj_key, "object_type": "hive_grant",
+                    "status": "failed",
+                    "error_message": f"grant-before-transfer failed: {g_res.get('error', g_res['state'])}",
+                    "duration_seconds": time.time() - start,
+                }
         logger.info("Transferring ownership: %s", owner_sql)
         result = execute_and_poll(auth, wh_id, owner_sql)
         duration = time.time() - start
         if result["state"] == "SUCCEEDED":
             return {
-                "object_name": owner_obj_key,
-                "object_type": "hive_grant",
-                "status": "validated",
-                "error_message": None,
-                "duration_seconds": duration,
+                "object_name": owner_obj_key, "object_type": "hive_grant",
+                "status": "validated", "error_message": None, "duration_seconds": duration,
             }
         return {
-            "object_name": owner_obj_key,
-            "object_type": "hive_grant",
+            "object_name": owner_obj_key, "object_type": "hive_grant",
             "status": "failed",
             "error_message": (
                 f"Ownership transfer to '{principal}' failed "
-                f"(does the principal exist on target?): "
-                f"{result.get('error', result['state'])}"
+                f"(does the principal exist on target?): {result.get('error', result['state'])}"
             ),
             "duration_seconds": duration,
         }
@@ -195,6 +256,7 @@ def _process_show_grants_rows(
     wh_id: str,
     dry_run: bool,
     transfer_ownership: bool = True,
+    spn_client_id: str = "",
 ) -> list[dict]:
     """Iterate SHOW GRANTS output rows and emit UC grants.
 
@@ -222,6 +284,7 @@ def _process_show_grants_rows(
                 wh_id=wh_id,
                 dry_run=dry_run,
                 transfer_ownership=transfer_ownership,
+                spn_client_id=spn_client_id,
             )
         )
     for action_type, principal in deferred_own:
@@ -235,6 +298,7 @@ def _process_show_grants_rows(
                 wh_id=wh_id,
                 dry_run=dry_run,
                 transfer_ownership=transfer_ownership,
+                spn_client_id=spn_client_id,
             )
         )
     return out
@@ -252,17 +316,19 @@ def run(dbutils, spark) -> None:
     tracker.job_run_id = resolve_current_job_run_id(dbutils)
     wh_id = find_warehouse(auth)
 
-    target_catalog = config.hive_target_catalog
     dry_run = config.dry_run
     transfer_ownership = config.transfer_ownership
+    spn_client_id = config.spn_client_id
 
     results: list[dict] = []
 
-    # 1. Catalog-level grants: hive_metastore -> target_catalog
+    # 1. Catalog-level grants: replayed on the target's built-in hive_metastore
+    # (like-for-like — target FQN == source FQN). The OWN row is skipped inside
+    # _emit_grant for CATALOG (built-in hive_metastore ownership, #14 moot).
     logger.info("Reading catalog-level grants on hive_metastore.")
     try:
         rows = spark.sql("SHOW GRANTS ON CATALOG hive_metastore").collect()
-        target_fqn = f"`{target_catalog}`"
+        target_fqn = "`hive_metastore`"
         results.extend(
             _process_show_grants_rows(
                 rows,
@@ -272,6 +338,7 @@ def run(dbutils, spark) -> None:
                 wh_id=wh_id,
                 dry_run=dry_run,
                 transfer_ownership=transfer_ownership,
+                spn_client_id=spn_client_id,
             )
         )
     except Exception as exc:  # noqa: BLE001
@@ -297,7 +364,7 @@ def run(dbutils, spark) -> None:
             schemas_seen.add(schema_name)
             try:
                 rows = spark.sql(f"SHOW GRANTS ON SCHEMA hive_metastore.`{schema_name}`").collect()
-                target_schema_fqn = f"`{target_catalog}`.`{schema_name}`"
+                target_schema_fqn = f"`hive_metastore`.`{schema_name}`"
                 results.extend(
                     _process_show_grants_rows(
                         rows,
@@ -306,6 +373,8 @@ def run(dbutils, spark) -> None:
                         auth=auth,
                         wh_id=wh_id,
                         dry_run=dry_run,
+                        transfer_ownership=transfer_ownership,
+                        spn_client_id=spn_client_id,
                     )
                 )
             except Exception as exc:  # noqa: BLE001
@@ -323,7 +392,7 @@ def run(dbutils, spark) -> None:
 
         try:
             rows = spark.sql(f"SHOW GRANTS ON {securable} {object_name}").collect()
-            target_obj_fqn = rewrite_hive_fqn(object_name, target_catalog)
+            target_obj_fqn = object_name  # like-for-like: target FQN == source FQN
             results.extend(
                 _process_show_grants_rows(
                     rows,
@@ -333,6 +402,7 @@ def run(dbutils, spark) -> None:
                     wh_id=wh_id,
                     dry_run=dry_run,
                     transfer_ownership=transfer_ownership,
+                    spn_client_id=spn_client_id,
                 )
             )
         except Exception as exc:  # noqa: BLE001
