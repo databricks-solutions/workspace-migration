@@ -449,7 +449,6 @@ def run(dbutils, spark):  # noqa: D103
             target_client=auth.target_client,
             discovery_rows=discovery_dicts,
             existing_status_keys=existing_status_keys,
-            hive_target_catalog=config.hive_target_catalog,
         )
         if not discovery_dicts:
             _add(
