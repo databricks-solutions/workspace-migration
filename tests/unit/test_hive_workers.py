@@ -110,20 +110,47 @@ class TestHiveViewsWorker:
 
 
 class TestHiveExternalWorker:
-    """hive_external_worker registers the table on target pointing at the
-    same storage LOCATION. The critical contract is that LOCATION is
-    preserved byte-identical."""
+    """Like-for-like: the external table is recreated in hive_metastore with
+    the SAME FQN and the replayed DDL keeps its hive_metastore namespace."""
 
-    def test_module_imports_cleanly(self):
-        """Smoke: module imports and expected entry points exist. Full
-        behavior covered by integration tests since the worker drives
-        a DESCRIBE TABLE EXTENDED dance to recover the LOCATION."""
-        from migrate import hive_external_worker
+    @patch("migrate.hive_external_worker.append_migration_status_via_warehouse")
+    @patch("migrate.hive_external_worker.warehouse_table_count")
+    @patch("migrate.hive_external_worker.time")
+    @patch("migrate.hive_external_worker.execute_and_poll")
+    def test_replays_ddl_into_hive_metastore_unchanged(
+        self, mock_exec, mock_time, mock_wh_count, mock_append
+    ):
+        from migrate.hive_external_worker import migrate_hive_external_table
 
-        # Has a run() entry point for the for_each task payload.
-        assert hasattr(hive_external_worker, "run") or callable(
-            getattr(hive_external_worker, "migrate_hive_external_table", None)
+        mock_time.time.side_effect = [100.0, 105.0]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_wh_count.return_value = 7
+
+        explorer = MagicMock()
+        explorer.get_create_statement.return_value = (
+            "CREATE TABLE hive_metastore.db.ext (id INT) USING delta "
+            "LOCATION 'abfss://ext@acct.dfs.core.windows.net/ext'"
         )
+        explorer.get_table_row_count.return_value = 7
+
+        res = migrate_hive_external_table(
+            {"object_name": "`hive_metastore`.`db`.`ext`"},
+            config=_config_mock(),
+            auth=MagicMock(),
+            explorer=explorer,
+            wh_id="wh",
+            tracking_fqn="migration_tracking.cp_migration",
+            job_run_id="jr-1",
+            status_wh_id="wh-src",
+        )
+
+        replayed = mock_exec.call_args[0][2]
+        # No namespace rewrite: hive_metastore stays, no hive_upgraded leak.
+        assert "hive_metastore.db.ext" in replayed
+        assert "hive_upgraded" not in replayed
+        # IF NOT EXISTS still injected for resumability.
+        assert "CREATE TABLE IF NOT EXISTS" in replayed
+        assert res["status"] == "validated"
 
 
 # ----------------------------------------------------------------------

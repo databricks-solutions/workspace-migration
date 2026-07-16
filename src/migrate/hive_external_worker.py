@@ -17,9 +17,9 @@ except NameError:
     pass  # not running under a Databricks notebook (e.g. pytest)
 
 # COMMAND ----------
-# Hive External Table Worker: recreates Hive external tables from
-# `hive_metastore` on the source as UC external tables under
-# `{hive_target_catalog}` on the target, preserving storage locations.
+# Hive External Table Worker: replays Hive external table DDL from the source
+# `hive_metastore` into the target `hive_metastore` unchanged, preserving
+# namespaces and storage locations.
 
 import json
 import logging
@@ -36,7 +36,7 @@ from common.sql_utils import (
     rewrite_ddl,
     warehouse_table_count,
 )
-from migrate.hive_common import configure_adls_account_key, rewrite_hive_fqn, rewrite_hive_namespace
+from migrate.hive_common import configure_adls_account_key
 from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
@@ -80,7 +80,7 @@ def migrate_hive_external_table(
     through the SQL warehouse (UC-capable), not the worker's spark session.
     """
     source_fqn = table_info["object_name"]
-    target_fqn = rewrite_hive_fqn(source_fqn, config.hive_target_catalog)
+    target_fqn = source_fqn  # like-for-like: same FQN in hive_metastore
 
     append_migration_status_via_warehouse(
         auth,
@@ -111,9 +111,7 @@ def migrate_hive_external_table(
             "duration_seconds": duration,
         }
 
-    # Rewrite hive_metastore.* -> {hive_target_catalog}.* so the DDL lands on UC
-    ddl = rewrite_hive_namespace(ddl, config.hive_target_catalog)
-    # Replace CREATE TABLE with CREATE TABLE IF NOT EXISTS
+    # Like-for-like: replay the DDL as-is into hive_metastore (no rewrite).
     ddl = rewrite_ddl(ddl, r"CREATE\s+TABLE\b", "CREATE TABLE IF NOT EXISTS")
 
     if config.dry_run:
