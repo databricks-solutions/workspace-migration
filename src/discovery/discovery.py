@@ -458,9 +458,28 @@ def _warn_rls_cm_tables(rows: list[dict], config) -> None:  # noqa: ARG001
     print()
 
 
+def mount_name_from_location(storage_location: str | None) -> str | None:
+    """Return the ``/mnt/<name>`` mount name for a DBFS-mount-backed table, else None.
+
+    ``/mnt``-backed Hive tables can only be recreated on the target once the
+    operator recreates the mount there — the tool never touches mount
+    credentials. Discovery surfaces each required mount as a prerequisite.
+    """
+    loc = (storage_location or "").lower()
+    prefix = "dbfs:/mnt/"
+    if not loc.startswith(prefix):
+        return None
+    rest = loc[len(prefix):]
+    name = rest.split("/", 1)[0].strip()
+    return name or None
+
+
 def _discover_hive(config, explorer, now) -> list[dict]:
     """Discover Hive objects. Returns rows list."""
     rows: list[dict] = []
+    # Accumulate /mnt-backed tables per required mount so discovery can emit one
+    # mount_prerequisite marker per mount (consumed by the pre_check guard + dashboard).
+    mount_tables: dict[str, list[str]] = {}
     databases = explorer.list_hive_databases()
     print(f"[hive] Discovered {len(databases)} database(s): {databases}")
 
@@ -492,6 +511,10 @@ def _discover_hive(config, explorer, now) -> list[dict]:
                 )
             )
 
+            _mnt = mount_name_from_location(tbl["storage_location"])
+            if _mnt:
+                mount_tables.setdefault(_mnt, []).append(tbl["fqn"])
+
         # --- Functions ---
         for func_fqn in explorer.list_hive_functions(database):
             rows.append(
@@ -508,6 +531,22 @@ def _discover_hive(config, explorer, now) -> list[dict]:
                     storage_location="",
                 )
             )
+
+    # --- /mnt mount prerequisites (one marker per required mount) ---
+    for mount, tables in sorted(mount_tables.items()):
+        rows.append(
+            discovery_row(
+                source_type="hive",
+                object_type="mount_prerequisite",
+                object_name=f"mnt:{mount}",
+                catalog_name="hive_metastore",
+                schema_name=None,
+                discovered_at=now,
+                data_category="mount_prerequisite",
+                storage_location=f"dbfs:/mnt/{mount}",
+                metadata={"mount": mount, "tables": sorted(tables)},
+            )
+        )
 
     return rows
 
