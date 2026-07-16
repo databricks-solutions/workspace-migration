@@ -54,9 +54,10 @@ replayed via DDL.
 
 - **Idempotent** — every worker is re-runnable; status is tracked per-object
   in a Delta table, so re-runs only act on pending objects.
-- **No source mutation** — the source workspace is never modified for
-  managed-table migration. Row-filter / column-mask tables use a staging-copy
-  pattern (Path A) that never strips source policies.
+- **No source mutation** — the source workspace is never modified. Tables
+  protected by a row filter, column mask, or ABAC policy are **not migrated**
+  (see the policy-protected-tables note below); they are excluded and reported
+  in the dashboard for manual handling.
 - **Standalone jobs** — UC, Hive, and Governance are independent workflows;
   operators decide ordering.
 - **Serverless-only compute** — no cluster management, no init scripts.
@@ -239,11 +240,18 @@ Section 8:
 - **Target storage credentials + external locations** created for any external
   table / DBFS-root path the migration touches.
 
-### Source state for RLS/CM
-- To migrate RLS / column-mask tables **with data**, every active filter/mask
-  function body must contain an admin-bypass call
-  (`is_account_group_member(`, `is_member(`, or `is_user_in_group(`);
-  `pre_check` enforces this.
+### Policy-protected tables are excluded (RLS / column mask / ABAC)
+Tables protected by a **row filter**, **column mask**, or an **ABAC policy**
+are **not migrated**. Copying them risks silent data loss — the copy reads
+*through* the policy, so it captures filtered/masked data — and there is no
+safe way to read the raw data without altering the live source. So discovery:
+- **excludes** every affected table from migration (recorded with status
+  `skipped_policy_protected` and the reason), and
+- **surfaces** them in the migration **dashboard** ("Policy-protected tables —
+  manual action required") so you can migrate them deliberately (e.g. remove
+  the policy on source, migrate, re-apply on target — a decision you own).
+
+No source-state preparation is needed; nothing on the source is changed.
 
 ---
 
@@ -332,7 +340,7 @@ spn_client_id:        "<spn-application-id>"
 spn_secret_scope:     "migration"
 spn_secret_key:       "spn-secret"
 catalog_filter:  []                 # scope the run
-rls_cm_strategy: "staging_copy"     # migrate RLS/CM tables with data
+rls_cm_strategy: ""                 # DEPRECATED — RLS/CM/ABAC tables are excluded + reported
 iceberg_strategy: "ddl_replay"      # if managed Iceberg present
 migrate_hive_dbfs_root: false       # true + hive_dbfs_target_path for DBFS-root Hive
 ```
@@ -366,8 +374,7 @@ collisions) → `migrate_uc` → `migrate_hive` (if applicable) →
 `migrate_vector_search` / `migrate_online_tables` / `migrate_lfc`.
 
 ### Step 1 — `pre_check`
-Validates connectivity, SPN grants, and (after discovery) target collisions +
-RLS/CM admin-bypass.
+Validates connectivity, SPN grants, and (after discovery) target collisions.
 ```sql
 SELECT check_name, status, severity, error_message
 FROM migration_tracking.cp_migration.pre_check_results
@@ -558,8 +565,9 @@ storage-credential keys are **not** transferable — re-provision on target.
   `on_target_collision: skip`.
 - **Customer share not appearing in discovery** — the SPN must own it or hold
   `USE SHARE` (see README, Delta Sharing prerequisites).
-- **RLS/CM table arrives empty** — set `rls_cm_strategy: staging_copy` and ensure
-  each filter/mask has an admin-bypass call.
+- **RLS/CM/ABAC table not migrated** — this is by design: policy-protected
+  tables are excluded and listed in the dashboard's "Policy-protected tables"
+  panel. Migrate them manually (remove policy on source → migrate → re-apply).
 - **Volume contents missing** — cross-region Delta Sharing propagation lags;
   re-run `migrate_uc` (idempotent).
 - **A worker keeps failing** — check `migration_status.error_message` + run logs;

@@ -177,15 +177,14 @@ class MigrationConfig:
     # Row filter / column mask on managed tables — Delta Sharing refuses to
     # share tables with legacy RLS/CM (``ALTER TABLE ... SET ROW FILTER`` /
     # ``SET MASK``). Supported values:
-    #   ""              — default; affected tables are recorded in
-    #                     migration_status with ``skipped_by_rls_cm_policy``
-    #                     and their data does not move to target.
-    #   "staging_copy"  — clone the table to an unprotected staging table on
-    #                     source (in the migration tracking schema), share
-    #                     the staging copy, CTAS into the target, then re-
-    #                     apply the original RLS/CM on the target. Source
-    #                     row filter / column mask are never altered. See
-    #                     README and docs/RLS_CM_STAGING_COPY.md.
+    # DEPRECATED (scope decision, findings #21/#16). Tables protected by a
+    # row filter, column mask, OR an ABAC policy are NOT migrated — copying
+    # them risks silent data loss (the copy reads through the policy) and
+    # there is no safe source-untouched way to read the raw data. Discovery
+    # now EXCLUDES all such tables and surfaces them in the dashboard for
+    # manual handling. The old ``staging_copy`` strategy is removed; only the
+    # default ("" = exclude + report) is meaningful. Field retained for
+    # backward compatibility until the staging_copy code path is fully torn out.
     rls_cm_strategy: str = ""
     # Lakeflow Connect (Phase 3) — name of the pre-existing UC connection on
     # target that the recreated query-based pipeline will use. Required only
