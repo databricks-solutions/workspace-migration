@@ -4,7 +4,14 @@ resources:
       name: "${var.job_prefix}-pre-check"
       run_as:
         service_principal_name: ${var.migration_spn_id}
+      environments:
+        - environment_key: migration_env
+          spec:
+            client: "5"
+            dependencies:
+              - databricks-sdk==0.120.0
       tasks:
         - task_key: pre_check
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/pre_check/pre_check.py

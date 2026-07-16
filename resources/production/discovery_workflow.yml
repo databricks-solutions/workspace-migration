@@ -31,10 +31,17 @@ resources:
               ResourceClass: "SingleNode"
             azure_attributes:
               availability: "ON_DEMAND_AZURE"
+      environments:
+        - environment_key: migration_env
+          spec:
+            client: "5"
+            dependencies:
+              - databricks-sdk==0.120.0
       tasks:
         # UC + stateful discovery on serverless (also creates the tracking
         # tables). Skips hive — discovered separately on the classic cluster.
         - task_key: discovery
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/discovery/discovery.py
             base_parameters:

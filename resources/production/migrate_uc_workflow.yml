@@ -9,14 +9,22 @@ resources:
         beforehand — run discovery first.
       run_as:
         service_principal_name: ${var.migration_spn_id}
+      environments:
+        - environment_key: migration_env
+          spec:
+            client: "5"
+            dependencies:
+              - databricks-sdk==0.120.0
       tasks:
         - task_key: setup_sharing
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/setup_sharing.py
 
         - task_key: orchestrator
           depends_on:
             - task_key: setup_sharing
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/orchestrator.py
 
@@ -27,6 +35,7 @@ resources:
             inputs: "{{tasks.orchestrator.values.managed_table_batches}}"
             task:
               task_key: managed_table_batch
+              environment_key: migration_env
               notebook_task:
                 notebook_path: ../../src/migrate/managed_table_worker.py
                 base_parameters:
@@ -39,6 +48,7 @@ resources:
             inputs: "{{tasks.orchestrator.values.external_table_batches}}"
             task:
               task_key: external_table_batch
+              environment_key: migration_env
               notebook_task:
                 notebook_path: ../../src/migrate/external_table_worker.py
                 base_parameters:
@@ -51,6 +61,7 @@ resources:
             inputs: "{{tasks.orchestrator.values.volume_batches}}"
             task:
               task_key: volume_batch
+              environment_key: migration_env
               notebook_task:
                 notebook_path: ../../src/migrate/volume_worker.py
                 base_parameters:
@@ -60,6 +71,7 @@ resources:
           depends_on:
             - task_key: migrate_managed_tables
             - task_key: migrate_external_tables
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/functions_worker.py
 
@@ -68,6 +80,7 @@ resources:
             - task_key: migrate_managed_tables
             - task_key: migrate_external_tables
             - task_key: migrate_functions
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/views_worker.py
 
@@ -78,6 +91,7 @@ resources:
             inputs: "{{tasks.orchestrator.values.mv_batches}}"
             task:
               task_key: mv_batch
+              environment_key: migration_env
               notebook_task:
                 notebook_path: ../../src/migrate/mv_st_worker.py
                 base_parameters:
@@ -90,6 +104,7 @@ resources:
             inputs: "{{tasks.orchestrator.values.st_batches}}"
             task:
               task_key: st_batch
+              environment_key: migration_env
               notebook_task:
                 notebook_path: ../../src/migrate/mv_st_worker.py
                 base_parameters:
@@ -101,17 +116,20 @@ resources:
             - task_key: migrate_volumes
             - task_key: migrate_mv_st
             - task_key: migrate_st
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/grants_worker.py
 
         - task_key: migrate_models
           depends_on:
             - task_key: migrate_grants
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/models_worker.py
 
         - task_key: cleanup_staging
           run_if: ALL_DONE
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/cleanup_staging.py
             source: WORKSPACE
@@ -130,6 +148,7 @@ resources:
           depends_on:
             - task_key: migrate_models
             - task_key: cleanup_staging
+          environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/summary.py
             base_parameters:
