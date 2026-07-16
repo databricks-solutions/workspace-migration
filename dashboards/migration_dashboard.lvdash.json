@@ -97,6 +97,18 @@
         "GROUP BY object_type\n",
         "ORDER BY count DESC"
       ]
+    },
+    {
+      "name": "policy_protected_tables",
+      "displayName": "Policy-Protected Tables (Excluded)",
+      "queryLines": [
+        "SELECT object_name, error_message AS reason, migrated_at\n",
+        "FROM (\n",
+        "  SELECT *,\n",
+        "    ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn\n",
+        "  FROM migration_tracking.cp_migration.migration_status\n",
+        ") WHERE rn = 1 AND status = 'skipped_policy_protected'\n"
+      ]
     }
   ],
   "pages": [
@@ -109,81 +121,185 @@
             "name": "overview_header",
             "textbox_spec": "# Migration Overview\n\nHigh-level view of UC migration progress. Status reflects the latest known state per object (deduplicated by object_name + object_type)."
           },
-          "position": {"x": 0, "y": 0, "width": 6, "height": 2}
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
         },
         {
           "widget": {
             "name": "status_summary_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "status_summary",
-                "fields": [{"name": "status", "expression": "`status`"}, {"name": "n", "expression": "`n`"}],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "status_summary",
+                  "fields": [
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "n",
+                      "expression": "`n`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 3,
               "widgetType": "bar",
               "encodings": {
-                "x": {"fieldName": "status", "displayName": "Status", "scale": {"type": "categorical"}},
-                "y": {"fieldName": "n", "displayName": "Count", "scale": {"type": "quantitative"}}
+                "x": {
+                  "fieldName": "status",
+                  "displayName": "Status",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "n",
+                  "displayName": "Count",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
               },
-              "frame": {"title": "Status breakdown", "showTitle": true}
+              "frame": {
+                "title": "Status breakdown",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 2, "width": 3, "height": 5}
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 3,
+            "height": 5
+          }
         },
         {
           "widget": {
             "name": "discovery_counts_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "discovery_counts",
-                "fields": [{"name": "object_type", "expression": "`object_type`"}, {"name": "count", "expression": "`count`"}],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "discovery_counts",
+                  "fields": [
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "count",
+                      "expression": "`count`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 3,
               "widgetType": "bar",
               "encodings": {
-                "x": {"fieldName": "object_type", "displayName": "Object Type", "scale": {"type": "categorical"}},
-                "y": {"fieldName": "count", "displayName": "Count", "scale": {"type": "quantitative"}}
+                "x": {
+                  "fieldName": "object_type",
+                  "displayName": "Object Type",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "count",
+                  "displayName": "Count",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                }
               },
-              "frame": {"title": "Discovered objects by type", "showTitle": true}
+              "frame": {
+                "title": "Discovered objects by type",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 3, "y": 2, "width": 3, "height": 5}
+          "position": {
+            "x": 3,
+            "y": 2,
+            "width": 3,
+            "height": 5
+          }
         },
         {
           "widget": {
             "name": "object_type_breakdown_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "object_type_breakdown",
-                "fields": [
-                  {"name": "object_type", "expression": "`object_type`"},
-                  {"name": "status", "expression": "`status`"},
-                  {"name": "n", "expression": "`n`"}
-                ],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "object_type_breakdown",
+                  "fields": [
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "n",
+                      "expression": "`n`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 3,
               "widgetType": "bar",
               "encodings": {
-                "x": {"fieldName": "object_type", "displayName": "Object Type", "scale": {"type": "categorical"}},
-                "y": {"fieldName": "n", "displayName": "Count", "scale": {"type": "quantitative"}},
-                "color": {"fieldName": "status", "displayName": "Status", "scale": {"type": "categorical"}}
+                "x": {
+                  "fieldName": "object_type",
+                  "displayName": "Object Type",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                },
+                "y": {
+                  "fieldName": "n",
+                  "displayName": "Count",
+                  "scale": {
+                    "type": "quantitative"
+                  }
+                },
+                "color": {
+                  "fieldName": "status",
+                  "displayName": "Status",
+                  "scale": {
+                    "type": "categorical"
+                  }
+                }
               },
-              "frame": {"title": "Migration status per object type", "showTitle": true}
+              "frame": {
+                "title": "Migration status per object type",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 7, "width": 6, "height": 5}
+          "position": {
+            "x": 0,
+            "y": 7,
+            "width": 6,
+            "height": 5
+          }
         }
       ]
     },
@@ -196,33 +312,120 @@
             "name": "detail_header",
             "textbox_spec": "# Migration Detail\n\nRecent migration activity. Use column filters to drill into specific object types or failure reasons."
           },
-          "position": {"x": 0, "y": 0, "width": 6, "height": 2}
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
         },
         {
           "widget": {
             "name": "recent_activity_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "recent_activity",
-                "fields": [
-                  {"name": "migrated_at", "expression": "`migrated_at`"},
-                  {"name": "object_type", "expression": "`object_type`"},
-                  {"name": "object_name", "expression": "`object_name`"},
-                  {"name": "status", "expression": "`status`"},
-                  {"name": "error_message", "expression": "`error_message`"},
-                  {"name": "duration_seconds", "expression": "`duration_seconds`"}
-                ],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "recent_activity",
+                  "fields": [
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    },
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "error_message",
+                      "expression": "`error_message`"
+                    },
+                    {
+                      "name": "duration_seconds",
+                      "expression": "`duration_seconds`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 1,
               "widgetType": "table",
-              "frame": {"title": "Recent activity (200 most recent)", "showTitle": true}
+              "frame": {
+                "title": "Recent activity (200 most recent)",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 2, "width": 6, "height": 10}
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 10
+          }
+        },
+        {
+          "widget": {
+            "name": "policy_protected_header",
+            "textbox_spec": "## Policy-protected tables \u2014 excluded (manual action required)\n\nManaged tables carrying a row filter, column mask, or ABAC policy are **not migrated** (copying would read through the policy and silently drop/mask data). Migrate these deliberately: remove the policy on source, migrate, re-apply on target."
+          },
+          "position": {
+            "x": 0,
+            "y": 12,
+            "width": 6,
+            "height": 2
+          }
+        },
+        {
+          "widget": {
+            "name": "policy_protected_widget",
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "policy_protected_tables",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "reason",
+                      "expression": "`reason`"
+                    },
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
+              }
+            ],
+            "spec": {
+              "version": 1,
+              "widgetType": "table",
+              "frame": {
+                "title": "Policy-protected tables (excluded from migration)",
+                "showTitle": true
+              }
+            }
+          },
+          "position": {
+            "x": 0,
+            "y": 14,
+            "width": 6,
+            "height": 8
+          }
         }
       ]
     },
@@ -235,58 +438,116 @@
             "name": "validation_header",
             "textbox_spec": "# Validation Results\n\nRow count validation and failure list. Any row-count mismatch should be investigated before cutover."
           },
-          "position": {"x": 0, "y": 0, "width": 6, "height": 2}
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
         },
         {
           "widget": {
             "name": "row_count_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "row_count_validation",
-                "fields": [
-                  {"name": "object_name", "expression": "`object_name`"},
-                  {"name": "object_type", "expression": "`object_type`"},
-                  {"name": "source_row_count", "expression": "`source_row_count`"},
-                  {"name": "target_row_count", "expression": "`target_row_count`"},
-                  {"name": "row_count_check", "expression": "`row_count_check`"},
-                  {"name": "migrated_at", "expression": "`migrated_at`"}
-                ],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "row_count_validation",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "source_row_count",
+                      "expression": "`source_row_count`"
+                    },
+                    {
+                      "name": "target_row_count",
+                      "expression": "`target_row_count`"
+                    },
+                    {
+                      "name": "row_count_check",
+                      "expression": "`row_count_check`"
+                    },
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 1,
               "widgetType": "table",
-              "frame": {"title": "Row count validation", "showTitle": true}
+              "frame": {
+                "title": "Row count validation",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 2, "width": 6, "height": 6}
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 6
+          }
         },
         {
           "widget": {
             "name": "failures_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "failures",
-                "fields": [
-                  {"name": "object_name", "expression": "`object_name`"},
-                  {"name": "object_type", "expression": "`object_type`"},
-                  {"name": "status", "expression": "`status`"},
-                  {"name": "error_message", "expression": "`error_message`"},
-                  {"name": "migrated_at", "expression": "`migrated_at`"}
-                ],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "failures",
+                  "fields": [
+                    {
+                      "name": "object_name",
+                      "expression": "`object_name`"
+                    },
+                    {
+                      "name": "object_type",
+                      "expression": "`object_type`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "error_message",
+                      "expression": "`error_message`"
+                    },
+                    {
+                      "name": "migrated_at",
+                      "expression": "`migrated_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 1,
               "widgetType": "table",
-              "frame": {"title": "Failures", "showTitle": true}
+              "frame": {
+                "title": "Failures",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 8, "width": 6, "height": 6}
+          "position": {
+            "x": 0,
+            "y": 8,
+            "width": 6,
+            "height": 6
+          }
         }
       ]
     },
@@ -299,32 +560,62 @@
             "name": "pre_check_header",
             "textbox_spec": "# Pre-Check Results\n\nLatest pre-check results. Any FAIL blocks migration; WARN statuses should be reviewed."
           },
-          "position": {"x": 0, "y": 0, "width": 6, "height": 2}
+          "position": {
+            "x": 0,
+            "y": 0,
+            "width": 6,
+            "height": 2
+          }
         },
         {
           "widget": {
             "name": "pre_check_widget",
-            "queries": [{
-              "name": "main_query",
-              "query": {
-                "datasetName": "pre_check_latest",
-                "fields": [
-                  {"name": "check_name", "expression": "`check_name`"},
-                  {"name": "status", "expression": "`status`"},
-                  {"name": "message", "expression": "`message`"},
-                  {"name": "action_required", "expression": "`action_required`"},
-                  {"name": "checked_at", "expression": "`checked_at`"}
-                ],
-                "disaggregated": true
+            "queries": [
+              {
+                "name": "main_query",
+                "query": {
+                  "datasetName": "pre_check_latest",
+                  "fields": [
+                    {
+                      "name": "check_name",
+                      "expression": "`check_name`"
+                    },
+                    {
+                      "name": "status",
+                      "expression": "`status`"
+                    },
+                    {
+                      "name": "message",
+                      "expression": "`message`"
+                    },
+                    {
+                      "name": "action_required",
+                      "expression": "`action_required`"
+                    },
+                    {
+                      "name": "checked_at",
+                      "expression": "`checked_at`"
+                    }
+                  ],
+                  "disaggregated": true
+                }
               }
-            }],
+            ],
             "spec": {
               "version": 1,
               "widgetType": "table",
-              "frame": {"title": "Pre-check results", "showTitle": true}
+              "frame": {
+                "title": "Pre-check results",
+                "showTitle": true
+              }
             }
           },
-          "position": {"x": 0, "y": 2, "width": 6, "height": 10}
+          "position": {
+            "x": 0,
+            "y": 2,
+            "width": 6,
+            "height": 10
+          }
         }
       ]
     }

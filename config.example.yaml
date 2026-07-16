@@ -48,14 +48,13 @@ hive_target_catalog: hive_upgraded
 # and tags. Leave empty to skip Iceberg tables.
 iceberg_strategy: ""
 
-# --- Row filter / column mask on managed tables ---
-# Delta Sharing refuses to share tables protected by legacy RLS/CM.
-# ""              — default: skip with status skipped_by_rls_cm_policy
-# "staging_copy"  — CTAS each affected table into the tracking catalog's
-#                   cp_migration_staging schema, share that copy, DEEP
-#                   CLONE on target, re-apply RLS/CM on target. Source
-#                   RLS/CM untouched. Requires the migration SPN to be
-#                   a workspace admin (admin-bypass in the source filter).
+# --- Row filter / column mask / ABAC policy on tables (DEPRECATED flag) ---
+# Tables protected by a row filter, column mask, or ABAC policy are NOT
+# migrated: copying them risks silent data loss (the copy reads through the
+# policy) and there is no safe source-untouched way to read the raw data.
+# Discovery EXCLUDES these tables and lists them in the migration dashboard
+# for you to handle manually. The old "staging_copy" strategy is removed;
+# leave this at "" (the only meaningful value).
 rls_cm_strategy: ""
 
 # --- Online Tables -> Lakebase synced table migration (migrate_online_tables) ---

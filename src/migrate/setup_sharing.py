@@ -29,11 +29,9 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.tracking import TrackingManager
 from migrate.reconciliation import resolve_current_job_run_id
-from migrate.rls_cm import capture_rls_cm, has_rls_cm, make_staging_table_fqn
 from migrate.sharing_lib import (  # noqa: F401,F403  (re-export; runtime can't import this notebook)
     SHARE_NAME,
     _add_rls_cm_from_tables_api,
-    _validate_rls_cm_strategy,
     add_tables_to_share,
     ensure_share_consumer_catalog,
     ensure_target_catalogs_and_schemas,
@@ -64,9 +62,6 @@ def _is_notebook() -> bool:
 def run(dbutils, spark) -> None:  # noqa: ARG001
     """Entry point when running as a Databricks notebook."""
     config = MigrationConfig.from_workspace_file()
-    # Validate config-gated flags BEFORE any side effects so operator errors
-    # (bad rls_cm_strategy value) don't leave orphan shares / recipients.
-    strategy = _validate_rls_cm_strategy(config)
     auth = AuthManager(config, dbutils)
     spark_session = spark
     tracker = TrackingManager(spark_session, config)
@@ -87,106 +82,41 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
     pending_tables = tracker.get_pending_objects("managed_table")
     logger.info("Found %d pending managed tables to share.", len(pending_tables))
 
-    # 4a. Filter out tables with row filter / column mask. Delta Sharing
-    #     refuses to share tables with legacy RLS/CM
-    #     (``InvalidParameterValue: Table has row level security or column
-    #     masks, which is not supported by Delta Sharing``). Strategy was
-    #     already validated at the top of ``run()``; only "" reaches here
-    #     today.
-    #
-    # Two sources feed the skip set, belt-and-braces:
-    #   1. ``tracker.get_tables_with_rls_cm()`` — reads discovery_inventory.
-    #   2. Live UC Tables API probe per pending managed table — catches
-    #      cases where discovery's ``list_row_filters`` /
-    #      ``list_column_masks`` silently suppressed an exception.
-    rls_cm_fqns: set[str] = set(tracker.get_tables_with_rls_cm())
-    _add_rls_cm_from_tables_api(auth, pending_tables, rls_cm_fqns)
-    logger.info("RLS/CM set after live probe: %s", sorted(rls_cm_fqns))
-    tables_to_share: list[dict] = []
-    skipped_rls_cm: list[dict] = []
-    staged_rls_cm: list[dict] = []  # Path A staging_copy counter
-    run_id = getattr(config, "current_run_id", "") or "unknown"
-    for t in pending_tables:
-        if t["object_name"] not in rls_cm_fqns:
-            tables_to_share.append(t)
-            continue
-        if strategy == "staging_copy":
-            # Path A: copy the table into cp_migration_staging via CTAS,
-            # then add the STAGING fqn to the share. Source RLS/CM is
-            # never touched. Migration SPN must be a workspace admin so
-            # the filter function's is_account_group_member('admins')
-            # bypass returns true and the CTAS reads unfiltered rows.
-            try:
-                captured = capture_rls_cm(auth, t["object_name"])
-                if not has_rls_cm(captured):
-                    # Live probe flagged it but the policy is already gone
-                    # (discovery caught a race). Safe to share as-is.
-                    tables_to_share.append(t)
-                    continue
-                staging_fqn = make_staging_table_fqn(
-                    t["object_name"], run_id, config.tracking_catalog
-                )
-                if not config.dry_run:
-                    spark_session.sql(
-                        f"CREATE OR REPLACE TABLE {staging_fqn} AS "
-                        f"SELECT * FROM {t['object_name']}"
-                    )
-                    tracker.record_staging_created(
-                        original_fqn=t["object_name"],
-                        staging_fqn=staging_fqn,
-                        run_id=run_id,
-                    )
-                # Share the staging FQN, not the original.
-                staging_share_entry = dict(t)
-                staging_share_entry["object_name"] = staging_fqn
-                tables_to_share.append(staging_share_entry)
-                staged_rls_cm.append(t)
-                continue
-            except Exception as exc:  # noqa: BLE001
-                logger.error(
-                    "Failed to create staging copy for %s; table will NOT be shared. "
-                    "Source state unchanged. Error: %s",
-                    t["object_name"],
-                    exc,
-                    exc_info=True,
-                )
-                skipped_rls_cm.append(t)
-                continue
-        # strategy == "" (skip): record the table as skipped_by_rls_cm_policy
-        # and don't add to the share. Source untouched.
-        skipped_rls_cm.append(t)
+    # 4a. Exclude policy-protected tables (row filter / column mask / ABAC)
+    #     from the share. Delta Sharing refuses them, and copying would read
+    #     THROUGH the policy → silent data loss (findings #21/#16). Discovery
+    #     flags these as ``policy_protected_table`` (legacy RLS/CM bound to a
+    #     table + ABAC-policy-resolved tables). A live UC Tables API probe is
+    #     kept as belt-and-braces for legacy RLS/CM discovery might miss.
+    #     Affected tables are recorded ``skipped_policy_protected`` (terminal)
+    #     and NOT migrated — surfaced in the dashboard for manual handling.
+    protected_fqns: set[str] = {p["object_name"] for p in tracker.get_policy_protected_tables()}
+    _add_rls_cm_from_tables_api(auth, pending_tables, protected_fqns)
+    logger.info("Policy-protected tables excluded from share: %s", sorted(protected_fqns))
 
-    if staged_rls_cm:
-        logger.info(
-            "staging_copy: copied %d table(s) with RLS/CM into "
-            "%s.cp_migration_staging. Source RLS/CM untouched. "
-            "cleanup_staging will drop staging tables after migrate completes.",
-            len(staged_rls_cm),
-            config.tracking_catalog,
-        )
-        for t in staged_rls_cm:
-            logger.info("  staged: %s", t["object_name"])
+    tables_to_share = [t for t in pending_tables if t["object_name"] not in protected_fqns]
+    skipped = [t for t in pending_tables if t["object_name"] in protected_fqns]
 
-    if skipped_rls_cm:
+    if skipped:
         logger.warning(
-            "Skipping %d managed table(s) with row filter / column mask — "
-            "Delta Sharing does not support sharing these. See README.md "
-            "section 'Row filter / column mask on managed tables'.",
-            len(skipped_rls_cm),
+            "Excluding %d policy-protected managed table(s) (row filter / column "
+            "mask / ABAC) from migration — see the dashboard's Policy-Protected "
+            "Tables panel. Migrate manually (remove policy on source → migrate → "
+            "re-apply on target).",
+            len(skipped),
         )
-        for t in skipped_rls_cm:
+        for t in skipped:
             logger.warning("  - %s", t["object_name"])
         tracker.append_migration_status(
             [
                 {
                     "object_name": t["object_name"],
                     "object_type": "managed_table",
-                    "status": "skipped_by_rls_cm_policy",
+                    "status": "skipped_policy_protected",
                     "error_message": (
-                        "Table has row filter or column mask; Delta Sharing "
-                        "refuses to share it. Data was not migrated to target. "
-                        "See README.md for options (migrate to ABAC, or set "
-                        "rls_cm_strategy='staging_copy')."
+                        "Protected by a row filter, column mask, or ABAC policy; "
+                        "not migrated (copying reads through the policy). Migrate "
+                        "manually: remove policy on source, migrate, re-apply on target."
                     ),
                     "job_run_id": None,
                     "task_run_id": None,
@@ -194,11 +124,11 @@ def run(dbutils, spark) -> None:  # noqa: ARG001
                     "target_row_count": None,
                     "duration_seconds": 0.0,
                 }
-                for t in skipped_rls_cm
+                for t in skipped
             ]
         )
 
-    # 5. Add tables to share (RLS/CM-affected tables excluded above)
+    # 5. Add tables to share (policy-protected tables excluded above)
     add_tables_to_share(auth, SHARE_NAME, tables_to_share, dry_run=config.dry_run)
 
     # 6. Grant SELECT on share to recipient

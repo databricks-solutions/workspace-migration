@@ -3,7 +3,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from migrate.setup_sharing import (
-    _validate_rls_cm_strategy,
     add_tables_to_share,
     ensure_share_consumer_catalog,
     ensure_target_catalogs_and_schemas,
@@ -305,54 +304,6 @@ class TestSetupSharing:
         auth.target_client.catalogs.create.assert_not_called()
 
 
-class TestRlsCmStrategyGating:
-    """Verify ``_validate_rls_cm_strategy``'s contract.
-
-    Path A: only ``""`` (skip) and ``"staging_copy"`` are accepted. Any
-    other non-empty value is rejected (typo protection). The validator
-    runs BEFORE any side-effecting setup so misconfiguration doesn't
-    leave orphan shares / recipients on source.
-    """
-
-    def _config(self, strategy: str) -> MagicMock:
-        config = MagicMock()
-        config.rls_cm_strategy = strategy
-        return config
-
-    def test_empty_strategy_returns_empty(self):
-        """Default skip path — validator returns the normalized empty string."""
-        assert _validate_rls_cm_strategy(self._config("")) == ""
-
-    def test_none_strategy_treated_as_empty(self):
-        """Some config loaders might yield None; treat as default skip."""
-        assert _validate_rls_cm_strategy(self._config(None)) == ""
-
-    def test_whitespace_strategy_treated_as_empty(self):
-        assert _validate_rls_cm_strategy(self._config("   ")) == ""
-
-    def test_staging_copy_returns_normalized(self):
-        """staging_copy is the only non-empty strategy now accepted."""
-        assert _validate_rls_cm_strategy(self._config("staging_copy")) == "staging_copy"
-
-    def test_staging_copy_mixed_case_normalized(self):
-        assert _validate_rls_cm_strategy(self._config("Staging_Copy")) == "staging_copy"
-
-    def test_drop_and_restore_now_rejected(self):
-        """Path A removed drop_and_restore — validator rejects it as unknown."""
-        with pytest.raises(ValueError, match="Unknown rls_cm_strategy"):
-            _validate_rls_cm_strategy(self._config("drop_and_restore"))
-
-    def test_unknown_value_raises_value_error(self):
-        with pytest.raises(ValueError, match="Unknown rls_cm_strategy"):
-            _validate_rls_cm_strategy(self._config("bogus_value"))
-
-    def test_unknown_value_error_includes_offending_string(self):
-        """Error message should surface the exact value so the operator
-        can locate their typo without a log scavenger hunt."""
-        with pytest.raises(ValueError, match="'typo_value'"):
-            _validate_rls_cm_strategy(self._config("typo_value"))
-
-
 class TestAddRlsCmFromTablesApi:
     """_add_rls_cm_from_tables_api is the belt-and-braces backup probe:
     discovery can silently miss row_filter / column_mask rows (information
@@ -513,7 +464,9 @@ class TestRunSkipsRlsCmTables:
 
         tracker = MagicMock()
         tracker.get_pending_objects.return_value = pending
-        tracker.get_tables_with_rls_cm.return_value = set()  # empty — probe populates
+        # Discovery markers (RLS/CM + ABAC) — empty by default; the live
+        # Tables API probe (_add_rls_cm_from_tables_api) populates legacy RLS/CM.
+        tracker.get_policy_protected_tables.return_value = []
         return config, auth, tracker
 
     def test_skip_path_records_status_and_excludes_from_share(self):
@@ -528,13 +481,12 @@ class TestRunSkipsRlsCmTables:
             {"object_name": dirty_fqn, "object_type": "managed_table"},
         ]
 
-        # Seed the tracker helper to already flag `dirty`; the Tables API
-        # probe can also populate this — either source suffices.
+        # The live Tables API probe flags `dirty` (it carries a row_filter);
+        # discovery markers could also flag it — either source suffices.
         config, auth, tracker = self._mock_deps(
             rls_cm_fqns={dirty_fqn},
             pending=pending,
         )
-        tracker.get_tables_with_rls_cm.return_value = {dirty_fqn}
 
         # Patch module-level bindings so run() uses our mocks.
         with (
@@ -554,14 +506,14 @@ class TestRunSkipsRlsCmTables:
         shared_fqns = {t["object_name"] for t in shared_tables}
         assert shared_fqns == {clean_fqn}
 
-        # And migration_status got a skipped_by_rls_cm_policy row for dirty.
+        # And migration_status got a skipped_policy_protected row for dirty.
         append_calls = [c.args[0] for c in tracker.append_migration_status.call_args_list]
         # Each call passes a list of dicts. Flatten and inspect.
         all_recorded = [row for call in append_calls for row in call]
-        skipped = [r for r in all_recorded if r["status"] == "skipped_by_rls_cm_policy"]
+        skipped = [r for r in all_recorded if r["status"] == "skipped_policy_protected"]
         assert len(skipped) == 1
         assert skipped[0]["object_name"] == dirty_fqn
-        assert "Delta Sharing" in (skipped[0]["error_message"] or "")
+        assert "policy" in (skipped[0]["error_message"] or "").lower()
 
     def test_no_rls_cm_tables_shares_everything(self):
         """Default green path: no flagged tables, all pending go to share,
@@ -589,132 +541,4 @@ class TestRunSkipsRlsCmTables:
         assert shared_fqns == {"`c`.`s`.`a`", "`c`.`s`.`b`"}
 
         recorded = [r for call in tracker.append_migration_status.call_args_list for r in call.args[0]]
-        assert not any(r["status"] == "skipped_by_rls_cm_policy" for r in recorded)
-
-
-class TestStagingCopyFlow:
-    """Path A staging_copy: when rls_cm_strategy='staging_copy' and a
-    pending table carries RLS/CM, setup_sharing must CTAS into the
-    cp_migration_staging schema and add the STAGING fqn to the share.
-    Source RLS/CM is never touched.
-    """
-
-    def _config(self) -> MagicMock:
-        config = MagicMock()
-        config.rls_cm_strategy = "staging_copy"
-        config.dry_run = False
-        config.tracking_catalog = "tcat"
-        config.current_run_id = "run-abc"
-        return config
-
-    def _mock_auth_tracker(self, pending_fqn: str):
-        """Builds auth + tracker mocks matching the run() side-effects we need."""
-        auth = MagicMock()
-        auth.source_client.shares.get.return_value = MagicMock(name="cp_migration_share")
-        auth.source_client.recipients.get.return_value = MagicMock(name="cp_migration_recipient_x")
-        auth.target_client.metastores.summary.return_value = MagicMock(global_metastore_id="m")
-
-        tracker = MagicMock()
-        tracker.get_pending_objects.return_value = [
-            {
-                "object_name": pending_fqn,
-                "object_type": "managed_table",
-                "catalog_name": "c",
-                "schema_name": "s",
-            }
-        ]
-        tracker.get_tables_with_rls_cm.return_value = {pending_fqn}
-        return auth, tracker
-
-    def test_staging_copy_creates_staging_table_via_ctas(self):
-        """CTAS must run into the cp_migration_staging schema and the source
-        must NOT be stripped (no DROP ROW FILTER / DROP MASK calls)."""
-        from migrate import setup_sharing
-
-        original_fqn = "`c`.`s`.`rls_table`"
-        config = self._config()
-        auth, tracker = self._mock_auth_tracker(original_fqn)
-        spark = MagicMock()
-
-        with (
-            patch("migrate.setup_sharing.MigrationConfig") as cfg_cls,
-            patch("migrate.setup_sharing.AuthManager", return_value=auth),
-            patch("migrate.setup_sharing.TrackingManager", return_value=tracker),
-            patch("migrate.setup_sharing._add_rls_cm_from_tables_api"),
-            patch(
-                "migrate.setup_sharing.capture_rls_cm",
-                return_value={
-                    "filter_fn_fqn": "fn",
-                    "filter_columns": [],
-                    "masks": [],
-                },
-            ),
-            patch("migrate.setup_sharing.has_rls_cm", return_value=True),
-            patch("migrate.setup_sharing.ensure_target_catalogs_and_schemas"),
-            patch("migrate.setup_sharing.ensure_share_consumer_catalog"),
-            patch("migrate.setup_sharing.add_tables_to_share"),
-        ):
-            cfg_cls.from_workspace_file.return_value = config
-            setup_sharing.run(dbutils=MagicMock(), spark=spark)
-
-        # Assert: spark.sql was called with a CREATE TABLE ... AS SELECT into staging schema.
-        ctas_calls = [
-            c.args[0]
-            for c in spark.sql.call_args_list
-            if "CREATE" in c.args[0]
-            and "cp_migration_staging" in c.args[0]
-            and "AS SELECT" in c.args[0]
-        ]
-        assert len(ctas_calls) == 1, f"Expected 1 CTAS call, got {len(ctas_calls)}: {ctas_calls}"
-        assert "AS SELECT * FROM" in ctas_calls[0]
-        assert original_fqn in ctas_calls[0]
-
-        # Manifest write happens.
-        tracker.record_staging_created.assert_called_once()
-        kwargs = tracker.record_staging_created.call_args.kwargs
-        assert kwargs["original_fqn"] == original_fqn
-        assert kwargs["run_id"] == "run-abc"
-
-        # Source NEVER stripped — no DROP ROW FILTER / DROP MASK SQL.
-        strip_calls = [
-            c.args[0]
-            for c in spark.sql.call_args_list
-            if "DROP ROW FILTER" in c.args[0] or "DROP MASK" in c.args[0]
-        ]
-        assert strip_calls == [], f"staging_copy must NOT strip source — found: {strip_calls}"
-
-    def test_staging_copy_adds_staging_fqn_to_share_not_original(self):
-        """The staging table goes into the share, NOT the original."""
-        from migrate import setup_sharing
-
-        original_fqn = "`c`.`s`.`rls_table`"
-        config = self._config()
-        auth, tracker = self._mock_auth_tracker(original_fqn)
-        spark = MagicMock()
-
-        with (
-            patch("migrate.setup_sharing.MigrationConfig") as cfg_cls,
-            patch("migrate.setup_sharing.AuthManager", return_value=auth),
-            patch("migrate.setup_sharing.TrackingManager", return_value=tracker),
-            patch("migrate.setup_sharing._add_rls_cm_from_tables_api"),
-            patch(
-                "migrate.setup_sharing.capture_rls_cm",
-                return_value={
-                    "filter_fn_fqn": "fn",
-                    "filter_columns": [],
-                    "masks": [],
-                },
-            ),
-            patch("migrate.setup_sharing.has_rls_cm", return_value=True),
-            patch("migrate.setup_sharing.ensure_target_catalogs_and_schemas"),
-            patch("migrate.setup_sharing.ensure_share_consumer_catalog"),
-            patch("migrate.setup_sharing.add_tables_to_share") as add_tables,
-        ):
-            cfg_cls.from_workspace_file.return_value = config
-            setup_sharing.run(dbutils=MagicMock(), spark=spark)
-
-        # add_tables_to_share gets the STAGING fqn, not the original.
-        added = add_tables.call_args.args[2]
-        assert len(added) == 1
-        assert "cp_migration_staging" in added[0]["object_name"]
-        assert added[0]["object_name"] != original_fqn
+        assert not any(r["status"] == "skipped_policy_protected" for r in recorded)

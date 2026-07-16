@@ -99,6 +99,12 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     "skipped_by_pipeline_migration",
     "skipped_target_exists",
     "skipped_by_stateful_service_migration",
+    # Managed table protected by a row filter / column mask / ABAC policy.
+    # Not migrated (copying reads through the policy → silent data loss;
+    # findings #21/#16). TERMINAL so the worker never re-attempts it —
+    # surfaced in the dashboard for manual handling. Replaces the old
+    # non-terminal, flag-gated ``skipped_by_rls_cm_policy``.
+    "skipped_policy_protected",
     # H6: object exceeded MAX_BATCH_BYTES and was excluded from for_each
     # batches. Re-picking it would just fail again — operator must trim
     # heavy metadata (or split the object) and clear the status row.
@@ -419,6 +425,33 @@ class TrackingManager:
             args={"obj_type": object_type},
         ).collect()
         return [row.asDict() for row in rows]
+
+    def get_policy_protected_tables(self) -> list[dict]:
+        """Managed tables discovery flagged as protected by a row filter,
+        column mask, or ABAC policy (``object_type='policy_protected_table'``).
+
+        Returned as ``[{object_name, reason}]`` so the orchestrator can record
+        a terminal ``skipped_policy_protected`` status (excluding them from
+        migration) and the dashboard can list them for manual handling
+        (findings #21/#16)."""
+        import json
+
+        rows = self.spark.sql(
+            f"SELECT object_name, metadata_json FROM {self._fqn}.discovery_inventory "
+            f"WHERE object_type = 'policy_protected_table'"
+        ).collect()
+        out: list[dict] = []
+        for r in rows:
+            reason = "policy-protected"
+            try:
+                md = json.loads(r.metadata_json) if r.metadata_json else {}
+                types = sorted({(x.get("policy_type") or "") for x in (md.get("reasons") or []) if x})
+                if any(types):
+                    reason = "policy-protected (" + ", ".join(t for t in types if t) + ")"
+            except Exception:  # noqa: BLE001
+                pass
+            out.append({"object_name": r.object_name, "reason": reason})
+        return out
 
     def get_row(self, object_type: str, object_name: str) -> dict | None:
         """Return a single discovery_inventory row by (object_type, object_name).

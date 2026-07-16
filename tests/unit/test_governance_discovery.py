@@ -225,6 +225,33 @@ class TestListPolicies:
         assert len(policies) == 1
         assert policies[0]["policy_name"] == "p1"
 
+    def test_permission_denied_surfaced_as_warning(self, caplog):
+        """A PermissionDenied reading a securable's policies must be WARNED, not
+        silently swallowed — else ABAC-protected tables go undetected and could
+        migrate with silent data loss (SPN must own the securable / be metastore
+        admin to read ABAC policies). Same class as the #6 connections swallow."""
+        import logging
+
+        from databricks.sdk.errors import PermissionDenied
+
+        auth = MagicMock()
+
+        def do(method, path, query=None):
+            _, _, sec = path.split("/policies/", 1)[1].partition("/")
+            if sec == "c.s":
+                raise PermissionDenied("PERMISSION_DENIED")
+            return {"policies": [{"name": "p1", "on_securable_type": "CATALOG", "on_securable_fullname": "c"}]}
+
+        auth.source_client.api_client.do.side_effect = do
+        explorer = _explorer(MagicMock(), auth)
+        with caplog.at_level(logging.WARNING, logger="catalog_utils"):
+            policies = explorer.list_policies([("CATALOG", "c"), ("SCHEMA", "c.s")])
+        # still collected from the readable securable...
+        assert [p["policy_name"] for p in policies] == ["p1"]
+        # ...and warned about the one it couldn't read.
+        assert any("ABAC policy read denied" in r.message for r in caplog.records)
+        assert any("SCHEMA c.s" in r.message for r in caplog.records)
+
     def test_deduplicates_across_inherited_returns(self):
         """If two securables return the same (securable, policy) pair
         (could happen if include_inherited is ever flipped on), it's

@@ -189,6 +189,34 @@ if _is_notebook():
     batch_output: dict[str, list[str]] = {}
     list_output: dict[str, str] = {}
 
+    # Exclude policy-protected managed tables (findings #21/#16). Discovery
+    # flagged tables carrying a row filter / column mask / ABAC policy; record
+    # a TERMINAL skipped_policy_protected status so get_pending_objects drops
+    # them from the managed-table pool (no silent-data-loss migration) and the
+    # dashboard surfaces them for manual handling.
+    _protected = tracker.get_policy_protected_tables()
+    if _protected:
+        tracker.append_migration_status(
+            [
+                {
+                    "object_name": p["object_name"],
+                    "object_type": "managed_table",
+                    "status": "skipped_policy_protected",
+                    "error_message": p.get("reason", "policy-protected"),
+                    "job_run_id": str(_job_run_id),
+                    "task_run_id": None,
+                    "source_row_count": None,
+                    "target_row_count": None,
+                    "duration_seconds": None,
+                }
+                for p in _protected
+            ]
+        )
+        logger.info(
+            "Excluded %d policy-protected managed table(s) from migration (RLS/CM/ABAC).",
+            len(_protected),
+        )
+
     for obj_type in BATCHED_TYPES:
         pending = tracker.get_pending_objects(obj_type)
         logger.info("Pending %s: %d objects", obj_type, len(pending))

@@ -177,6 +177,7 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
+            "'skipped_policy_protected', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
@@ -326,6 +327,7 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
+            "'skipped_policy_protected', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
@@ -336,6 +338,33 @@ class TestTrackingManager:
         # Guard against regression to the old LIKE filter that swept up
         # skipped_by_config + skipped_by_rls_cm_policy as terminal.
         assert "NOT LIKE 'skipped%'" not in sql
+
+    def test_skipped_policy_protected_is_terminal(self):
+        # Policy-protected tables must be TERMINAL so the worker never
+        # re-attempts them (findings #21/#16 — no silent data-loss migration).
+        from common.tracking import _TERMINAL_STATUSES
+
+        assert "skipped_policy_protected" in _TERMINAL_STATUSES
+
+    def test_get_policy_protected_tables(self, mock_spark, mock_config):
+        import json
+
+        mgr = TrackingManager(mock_spark, mock_config)
+        row = MagicMock()
+        row.object_name = "retail_prod.sales.orders"
+        row.metadata_json = json.dumps(
+            {"reasons": [{"policy_type": "LEGACY_RLS_CM"}, {"policy_type": "POLICY_TYPE_COLUMN_MASK"}]}
+        )
+        res = MagicMock()
+        res.collect.return_value = [row]
+        mock_spark.sql.return_value = res
+
+        out = mgr.get_policy_protected_tables()
+        assert out == [
+            {"object_name": "retail_prod.sales.orders",
+             "reason": "policy-protected (LEGACY_RLS_CM, POLICY_TYPE_COLUMN_MASK)"}
+        ]
+        assert "policy_protected_table" in mock_spark.sql.call_args[0][0]
 
     def test_get_pending_objects_reincludes_skipped_by_config(self, mock_spark, mock_config):
         """Regression for the Iceberg-re-run scenario: a table with
