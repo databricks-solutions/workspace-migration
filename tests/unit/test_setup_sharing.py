@@ -192,6 +192,86 @@ class TestSetupSharing:
                     remove_names.append(u.data_object.name)
         assert remove_names == ["cat.sch.t_removed"]
 
+    def test_add_tables_does_not_readd_objects_already_in_share(self):
+        """Finding #20: on a re-run the share still holds previously-added
+        tables. add_tables_to_share must NOT re-ADD an object that is already
+        in the share — a re-ADD raises ResourceAlreadyExists and aborts the
+        whole setup_sharing task. Objects already present are skipped; only
+        genuinely-new tables are added."""
+        auth = MagicMock()
+        obj1, obj2 = MagicMock(), MagicMock()
+        obj1.name, obj1.data_object_type = "cat.sch.t1", "TABLE"
+        obj2.name, obj2.data_object_type = "cat.sch.t2", "TABLE"
+        auth.source_client.shares.get.return_value = MagicMock(objects=[obj1, obj2])
+
+        # Re-run: desired == what's already in the share + one new table.
+        tables = [
+            {"object_name": "`cat`.`sch`.`t1`"},
+            {"object_name": "`cat`.`sch`.`t2`"},
+            {"object_name": "`cat`.`sch`.`t3`"},
+        ]
+
+        add_tables_to_share(auth, "myshare", tables)
+
+        added_names = []
+        for call in auth.source_client.shares.update.call_args_list:
+            for u in (call.kwargs.get("updates") or []):
+                if hasattr(u.action, "value") and u.action.value == "ADD":
+                    added_names.append(u.data_object.name)
+        # Only the genuinely-new table is ADDed; t1/t2 already present are skipped.
+        assert added_names == ["cat.sch.t3"]
+
+    def test_add_tables_idempotent_when_all_already_present(self):
+        """Finding #20: if every desired table is already in the share (a pure
+        re-run with no new objects), no ADD update is issued at all — the task
+        succeeds instead of aborting on ResourceAlreadyExists."""
+        auth = MagicMock()
+        obj1 = MagicMock()
+        obj1.name, obj1.data_object_type = "cat.sch.t1", "TABLE"
+        auth.source_client.shares.get.return_value = MagicMock(objects=[obj1])
+
+        tables = [{"object_name": "`cat`.`sch`.`t1`"}]
+
+        add_tables_to_share(auth, "myshare", tables)
+
+        added = [
+            u
+            for call in auth.source_client.shares.update.call_args_list
+            for u in (call.kwargs.get("updates") or [])
+            if hasattr(u.action, "value") and u.action.value == "ADD"
+        ]
+        assert added == []
+
+    def test_add_tables_tolerates_already_exists_race_on_add(self):
+        """Finding #20 race: the object was added to the share AFTER our
+        pre-clean read (so existing_names is stale) — the batch ADD then hits
+        ResourceAlreadyExists. The sharing API raises ResourceAlreadyExists,
+        which is a SIBLING of AlreadyExists, so the guard must catch the base
+        ResourceConflict. Must NOT raise / abort."""
+        from databricks.sdk.errors import ResourceAlreadyExists
+
+        auth = MagicMock()
+        # Pre-clean read shows an empty share -> existing_names is empty, so
+        # the worker WILL attempt to ADD t1 (the stale-read condition).
+        auth.source_client.shares.get.return_value = MagicMock(objects=[])
+
+        def _update_side_effect(*args, **kwargs):
+            updates = kwargs.get("updates") or []
+            adds = [u for u in updates if getattr(u.action, "value", "") == "ADD"]
+            # Both the batch add and the one-by-one retry raise — the object
+            # is already present from a prior run that raced our read.
+            if adds:
+                raise ResourceAlreadyExists("Shared Table 'cat.sch.t1' already exists.")
+            return MagicMock()
+
+        auth.source_client.shares.update.side_effect = _update_side_effect
+
+        tables = [{"object_name": "`cat`.`sch`.`t1`"}]
+        # Must NOT raise — already-present is a no-op, not a fatal error.
+        skipped = add_tables_to_share(auth, "test_share", tables)
+        # Not a vanished object, so it is not reported as skipped-vanished.
+        assert skipped == []
+
     def test_ensure_target_catalogs_dry_run(self):
         auth = MagicMock()
         tables = [

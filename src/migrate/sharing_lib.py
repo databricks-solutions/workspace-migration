@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from databricks.sdk.errors import NotFound
+from databricks.sdk.errors import NotFound, ResourceConflict
 from databricks.sdk.service.sharing import (
     AuthenticationType,
     SharedDataObject,
@@ -103,9 +103,15 @@ def add_tables_to_share(
         parts = obj_name.strip("`").split("`.`")
         if len(parts) == 3:
             desired_names.add(".".join(parts))
+    # Objects already present in the share. Seeded from the current share
+    # contents so the add loop below never re-ADDs an object that's already
+    # there — a re-ADD raises ResourceAlreadyExists and aborts the whole
+    # setup_sharing task, breaking re-runs (finding #20).
+    existing_names: set[str] = set()
     try:
         existing_share = source.shares.get(name=share_name, include_shared_data=True)
         existing_objects = existing_share.objects or []
+        existing_names = {o.name for o in existing_objects}
         removals = [
             SharedDataObjectUpdate(
                 action=SharedDataObjectUpdateAction.REMOVE,
@@ -114,6 +120,11 @@ def add_tables_to_share(
             for o in existing_objects
             if o.name not in desired_names
         ]
+        # A removed object is no longer in the share, so it must not count as
+        # "already present" — otherwise a drop-then-re-add in the same call
+        # would skip re-adding it.
+        removed_names = {u.data_object.name for u in removals}
+        existing_names -= removed_names
         if removals and not dry_run:
             source.shares.update(name=share_name, updates=removals)
             logger.info(
@@ -128,7 +139,7 @@ def add_tables_to_share(
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning("Could not pre-clean share: %s", exc, exc_info=True)
-    existing_names: set[str] = set()
+        existing_names = set()
     skipped_vanished: list[str] = []
 
     for i in range(0, len(tables), batch_size):
@@ -142,8 +153,12 @@ def add_tables_to_share(
                 logger.warning("Skipping malformed FQN: %s", obj_name)
                 continue
             clean_name = ".".join(parts)  # catalog.schema.table without backticks
+            # Skip objects already in the share (re-run) or already queued in
+            # this call (duplicate discovery rows) — a re-ADD raises
+            # ResourceAlreadyExists and aborts the task (finding #20).
             if clean_name in existing_names:
                 continue
+            existing_names.add(clean_name)
             # NOTE: don't set shared_as — let Databricks expose the original catalog.schema.table
             # structure in the consumer catalog. With shared_as as "schema.table", the UC
             # share-consumer catalog returned an internal schema UUID error on DEEP CLONE.
@@ -177,19 +192,33 @@ def add_tables_to_share(
                 share_name,
                 i // batch_size + 1,
             )
-        except NotFound as exc:
-            # A member of this batch vanished since discovery (stale inventory).
-            # Retry one-by-one so one missing object doesn't abort the migration.
+        except (NotFound, ResourceConflict) as exc:
+            # A member of this batch either vanished since discovery (stale
+            # inventory -> NotFound) or is already in the share from a prior
+            # run that raced our pre-clean read (finding #20). The sharing API
+            # raises ResourceAlreadyExists for the latter, which is a SIBLING
+            # of AlreadyExists (both extend ResourceConflict) — catch the base
+            # ResourceConflict so both variants are handled.
+            # Retry one-by-one so a single such object doesn't abort the task.
             logger.warning(
-                "Batch add to share '%s' hit NotFound (%s); retrying individually "
-                "to skip vanished source object(s).",
+                "Batch add to share '%s' hit %s (%s); retrying individually "
+                "to skip vanished / already-present object(s).",
                 share_name,
+                type(exc).__name__,
                 exc,
             )
             for u in updates:
                 name = u.data_object.name
                 try:
                     source.shares.update(name=share_name, updates=[u])
+                except ResourceConflict:
+                    # Already in the share (ResourceAlreadyExists) — a no-op for
+                    # our purposes (re-run safety); not a vanished object.
+                    logger.info(
+                        "Object '%s' already in share '%s'; skipping re-add.",
+                        name,
+                        share_name,
+                    )
                 except NotFound as exc2:
                     logger.warning(
                         "Skipping vanished source object '%s' — not added to share "
