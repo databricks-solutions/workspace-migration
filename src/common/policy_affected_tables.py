@@ -121,7 +121,7 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
     rls_cm: list[str] = []
     abac: list[dict] = []
     column_tags: dict[str, set[tuple[str, str]]] = {}
-    all_tables: list[str] = []
+    managed: set[str] = set()
     for r in rows:
         ot = r.get("object_type")
         md: dict = {}
@@ -131,8 +131,11 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
                 md = json.loads(mj)
             except Exception:  # noqa: BLE001
                 md = {}
-        if ot in ("managed_table", "external_table"):
-            all_tables.append(_norm(r.get("object_name", "")))
+        # Only MANAGED tables carry the Delta-Sharing data-loss risk. External
+        # tables migrate via DDL replay (no data copy) with their policies
+        # re-applied on target, so they are NOT excluded.
+        if ot == "managed_table":
+            managed.add(_norm(r.get("object_name", "")))
         elif ot == "row_filter":
             rls_cm.append(r.get("object_name", ""))  # object_name is the table FQN
         elif ot == "column_mask":
@@ -145,9 +148,11 @@ def affected_tables_from_inventory(rows: list[dict]) -> dict[str, list[dict]]:
             column_tags.setdefault(_norm(md.get("securable_fqn", "")), set()).add(
                 (md.get("tag_name"), md.get("tag_value"))
             )
-    return affected_tables(
+    resolved = affected_tables(
         rls_cm_table_fqns=rls_cm,
         abac_policies=abac,
         column_tags=column_tags,
-        all_tables=all_tables,
+        all_tables=sorted(managed),
     )
+    # Scope to managed tables only (external/other are migrated normally).
+    return {t: reasons for t, reasons in resolved.items() if _norm(t) in managed}

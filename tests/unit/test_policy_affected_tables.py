@@ -141,6 +141,16 @@ class TestFromInventory:
         rows = [_row("managed_table", "`c`.`s`.`t`"), _row("view", "`c`.`s`.`v`")]
         assert affected_tables_from_inventory(rows) == {}
 
+    def test_external_table_with_policy_is_not_flagged(self):
+        # External tables migrate via DDL replay (no data copy) with policies
+        # re-applied on target — they must NOT be excluded, only managed tables.
+        rows = [
+            _row("external_table", "`c`.`s`.`ext`"),
+            _row("row_filter", "`c`.`s`.`ext`", {"table_fqn": "`c`.`s`.`ext`"}),
+            _row("column_mask", "`c`.`s`.`ext`.email", {"table_fqn": "`c`.`s`.`ext`", "column_name": "email"}),
+        ]
+        assert affected_tables_from_inventory(rows) == {}
+
 
 class TestCombined:
     def test_union_of_legacy_and_abac(self):
