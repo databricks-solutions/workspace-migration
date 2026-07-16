@@ -101,6 +101,52 @@ class TestHiveViewsWorker:
 # ----------------------------------------------------------------------
 
 
+class TestHiveViewsWorkerSourceGuards:
+    """Source-level guards for hive_views_worker like-for-like behavior.
+
+    The run() function builds the target view FQN as hive_metastore (no catalog
+    rewrite); this contract has no unit coverage (run() requires Spark). These
+    source-text guards ensure the FQN construction remains identity-preserving
+    and rejects any hive_target_catalog rewrite reintroduction."""
+
+    def test_builds_view_fqn_in_hive_metastore(self):
+        """The view FQN constructor explicitly targets hive_metastore, not any
+        other catalog. Line ~195 in run() builds target_fqn with the backticked
+        hive_metastore header."""
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_views_worker.py"
+        ).read_text()
+        # Assert the backticked hive_metastore pattern is in the FQN builder.
+        # This pins the identity construction in run() and guards against
+        # migration to any other catalog.
+        assert "`hive_metastore`.`" in src, (
+            "hive_views_worker must build the target view FQN with `hive_metastore` "
+            "(like-for-like identity migration). The pattern `hive_metastore`.` "
+            "must appear in the target_fqn construction."
+        )
+
+    def test_no_catalog_rewrite_to_hive_target_catalog(self):
+        """Guard against reintroduction of catalog-rewrite logic.
+
+        Like-for-like Hive views migrate to hive_metastore, never to
+        hive_target_catalog or any other UC catalog. If this assertion fails,
+        someone has reintroduced the catalog-rewrite path (which would break
+        the contract for views that have intra-view dependencies)."""
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_views_worker.py"
+        ).read_text()
+        assert "hive_target_catalog" not in src, (
+            "hive_views_worker must NOT reference hive_target_catalog — views "
+            "migrate unchanged to hive_metastore (like-for-like). Any reference to "
+            "hive_target_catalog indicates a catalog-rewrite path has been added, "
+            "which breaks the identity contract."
+        )
+
+
 class TestHiveExternalWorker:
     """Like-for-like: the external table is recreated in hive_metastore with
     the SAME FQN and the replayed DDL keeps its hive_metastore namespace."""
