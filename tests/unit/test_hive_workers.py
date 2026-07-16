@@ -202,6 +202,31 @@ class TestHiveFunctionsWorker:
 
         assert hasattr(hive_functions_worker, "run")
 
+    @patch("migrate.hive_functions_worker.get_hive_function_ddl")
+    @patch("migrate.hive_functions_worker.time")
+    @patch("migrate.hive_functions_worker.execute_and_poll")
+    def test_replays_function_ddl_into_hive_metastore_unchanged(
+        self, mock_execute, mock_time, mock_ddl
+    ):
+        from migrate.hive_functions_worker import migrate_hive_function
+
+        mock_time.time.side_effect = [100.0, 105.0]
+        mock_execute.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        mock_ddl.return_value = (
+            "CREATE FUNCTION hive_metastore.db.triple(x DOUBLE) RETURNS DOUBLE RETURN x * 3"
+        )
+
+        res = migrate_hive_function(
+            {"object_name": "`hive_metastore`.`db`.`triple`"},
+            config=_config_mock(), auth=MagicMock(), tracker=MagicMock(),
+            spark=MagicMock(), wh_id="wh",
+        )
+        replayed = mock_execute.call_args[0][2]
+        assert "hive_metastore.db.triple" in replayed
+        assert "hive_upgraded" not in replayed
+        assert replayed.startswith("CREATE OR REPLACE FUNCTION")
+        assert res["status"] == "validated"
+
 
 # ----------------------------------------------------------------------
 # hive_grants_worker — Hive→UC privilege translation + TABLE gap
