@@ -420,6 +420,29 @@ for _t, _ok in _HIVE_EXPECTED.items():
         )
 
 # COMMAND ----------
+# --- migrate_hive idempotency re-run leg (finding #12) ---
+# Re-run the migrate_hive job once and assert a clean terminal state with no
+# LOCATION_OVERLAP / ALREADY_EXISTS signature — proves the object_name anti-join
+# + grant-before-transfer + skip-if-owned make re-runs safe (RERUN_COVERED_JOBS).
+from tests.integration._assertion_helpers import assert_migrate_idempotent  # type: ignore[import-not-found]
+
+_migrate_hive_job_id = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
+    taskKey="seed_hive", key="migrate_hive_job_id", debugValue=""
+)
+if _migrate_hive_job_id:
+    from databricks.sdk import WorkspaceClient
+
+    assert_migrate_idempotent(
+        WorkspaceClient(),
+        int(_migrate_hive_job_id),
+        error_messages,
+        label="migrate_hive re-run",
+    )
+    print("migrate_hive re-run leg executed.")
+else:
+    print("migrate_hive re-run leg skipped: no migrate_hive_job_id task value supplied.")
+
+# COMMAND ----------
 
 if error_messages:
     raise AssertionError(
