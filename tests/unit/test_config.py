@@ -29,8 +29,7 @@ class TestMigrationConfig:
         assert config.dry_run is False
         assert config.batch_size == 50
         assert config.migrate_hive_dbfs_root is False
-        assert config.hive_dbfs_target_path == ""
-        assert config.hive_target_catalog == "hive_upgraded"
+        assert config.hive_dbfs_staging_path == ""
 
     def test_from_workspace_file_minimal(self, tmp_path):
         path = _write(
@@ -67,8 +66,7 @@ tracking_schema: custom_schema
 dry_run: true
 batch_size: 25
 migrate_hive_dbfs_root: true
-hive_dbfs_target_path: abfss://hive@acct.dfs.core.windows.net/upgraded/
-hive_target_catalog: legacy_hive
+hive_dbfs_staging_path: abfss://hive@acct.dfs.core.windows.net/upgraded/
 iceberg_strategy: ddl_replay
 rls_cm_strategy: staging_copy
 """,
@@ -79,8 +77,7 @@ rls_cm_strategy: staging_copy
         assert config.dry_run is True
         assert config.batch_size == 25
         assert config.migrate_hive_dbfs_root is True
-        assert config.hive_dbfs_target_path.startswith("abfss://")
-        assert config.hive_target_catalog == "legacy_hive"
+        assert config.hive_dbfs_staging_path.startswith("abfss://")
         assert config.iceberg_strategy == "ddl_replay"
         assert config.rls_cm_strategy == "staging_copy"
 
@@ -385,3 +382,64 @@ def test_lfc_saas_cursor_columns_fail_loud_on_malformed_input():
         _coerce_cursor_columns('["a", "b"]')
     with pytest.raises(ValueError, match="lfc_saas_cursor_columns"):
         _coerce_cursor_columns(42)
+
+
+class TestHiveStagingPathAlias:
+    def test_default_staging_path_empty_and_no_target_catalog(self):
+        config = MigrationConfig(
+            source_workspace_url="https://src.azuredatabricks.net",
+            target_workspace_url="https://tgt.azuredatabricks.net",
+            spn_client_id="client-id",
+            spn_secret_scope="scope",
+            spn_secret_key="key",
+        )
+        assert config.hive_dbfs_staging_path == ""
+        assert not hasattr(config, "hive_target_catalog")
+
+    def test_new_key_parses(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+source_workspace_url: https://src.azuredatabricks.net
+target_workspace_url: https://tgt.azuredatabricks.net
+spn_client_id: client-id
+spn_secret_scope: migration
+spn_secret_key: spn-secret
+migrate_hive_dbfs_root: true
+hive_dbfs_staging_path: abfss://stage@acct.dfs.core.windows.net/hive/
+""",
+        )
+        config = MigrationConfig.from_workspace_file(str(path))
+        assert config.hive_dbfs_staging_path == "abfss://stage@acct.dfs.core.windows.net/hive/"
+
+    def test_deprecated_alias_maps_with_warning(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+source_workspace_url: https://src.azuredatabricks.net
+target_workspace_url: https://tgt.azuredatabricks.net
+spn_client_id: client-id
+spn_secret_scope: migration
+spn_secret_key: spn-secret
+hive_dbfs_target_path: abfss://legacy@acct.dfs.core.windows.net/old/
+""",
+        )
+        with pytest.warns(DeprecationWarning, match="hive_dbfs_target_path"):
+            config = MigrationConfig.from_workspace_file(str(path))
+        assert config.hive_dbfs_staging_path == "abfss://legacy@acct.dfs.core.windows.net/old/"
+
+    def test_new_key_wins_over_deprecated_alias(self, tmp_path):
+        path = _write(
+            tmp_path,
+            """
+source_workspace_url: https://src.azuredatabricks.net
+target_workspace_url: https://tgt.azuredatabricks.net
+spn_client_id: client-id
+spn_secret_scope: migration
+spn_secret_key: spn-secret
+hive_dbfs_staging_path: abfss://new@acct.dfs.core.windows.net/n/
+hive_dbfs_target_path: abfss://old@acct.dfs.core.windows.net/o/
+""",
+        )
+        config = MigrationConfig.from_workspace_file(str(path))
+        assert config.hive_dbfs_staging_path == "abfss://new@acct.dfs.core.windows.net/n/"
