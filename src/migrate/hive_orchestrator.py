@@ -18,8 +18,8 @@ except NameError:
 
 # COMMAND ----------
 # Hive Orchestrator: read discovery_inventory (source_type='hive'), emit per-category batches
-# as task values for downstream workers. Also sets up the target catalog
-# (hive_target_catalog) so workers don't race to CREATE CATALOG.
+# as task values for downstream workers. Also ensures target databases exist in
+# hive_metastore so workers don't race to CREATE DATABASE.
 
 import json
 import logging
@@ -82,27 +82,21 @@ if _is_notebook():
     """
     inventory_rows = spark.sql(_pending_sql).collect()  # noqa: F821
 
-    # Create the target catalog + schemas on the TARGET workspace via its SQL
-    # warehouse (not on source's spark, which would create them in the wrong
-    # metastore). Downstream workers just need the objects to exist on target.
+    # Ensure the target DATABASES exist on the TARGET workspace's hive_metastore
+    # via its SQL warehouse (not source spark, which would create them in the
+    # wrong metastore). Like-for-like: no UC catalog is created.
     auth = AuthManager(config, dbutils)  # type: ignore[name-defined] # noqa: F821
     wh_id = find_warehouse(auth)
     target_schemas = {r.schema_name for r in inventory_rows if r.schema_name}
 
-    cat_sql = f"CREATE CATALOG IF NOT EXISTS `{config.hive_target_catalog}`"
-    res = execute_and_poll(auth, wh_id, cat_sql)
-    if res["state"] != "SUCCEEDED":
-        raise RuntimeError(f"Failed to create target catalog: {res.get('error')}")
-
     for sch in target_schemas:
-        sch_sql = f"CREATE SCHEMA IF NOT EXISTS `{config.hive_target_catalog}`.`{sch}`"
-        res = execute_and_poll(auth, wh_id, sch_sql)
+        db_sql = f"CREATE DATABASE IF NOT EXISTS `hive_metastore`.`{sch}`"
+        res = execute_and_poll(auth, wh_id, db_sql)
         if res["state"] != "SUCCEEDED":
-            raise RuntimeError(f"Failed to create target schema {sch}: {res.get('error')}")
+            raise RuntimeError(f"Failed to create target database {sch}: {res.get('error')}")
 
     logger.info(
-        "Target catalog '%s' ready on target with %d schema(s).",
-        config.hive_target_catalog,
+        "Target hive_metastore ready with %d database(s).",
         len(target_schemas),
     )
 

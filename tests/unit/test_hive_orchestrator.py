@@ -82,3 +82,20 @@ class TestHivePendingAntiJoinIdempotency:
             "table, so this join would never match and re-runs would re-"
             "create the table (finding #12)."
         )
+
+
+class TestHiveOrchestratorCreatesDatabase:
+    """Like-for-like: the orchestrator ensures target DATABASES exist in
+    hive_metastore, and must NOT create a UC catalog."""
+
+    def test_creates_database_in_hive_metastore(self):
+        src = _source_text()
+        assert "CREATE DATABASE IF NOT EXISTS `hive_metastore`" in src
+
+    def test_does_not_create_catalog(self):
+        src = _source_text()
+        assert "CREATE CATALOG" not in src
+
+    def test_no_reference_to_hive_target_catalog(self):
+        src = _source_text()
+        assert "hive_target_catalog" not in src

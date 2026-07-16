@@ -445,21 +445,15 @@ class TestHiveOrchestratorBatching:
         for list_key in ("hive_view_list", "hive_function_list"):
             assert list_key in src, f"hive_orchestrator must publish {list_key}"
 
-    def test_creates_target_catalog_before_category_batches(self):
-        """CREATE CATALOG must come BEFORE the populate-path category
-        batch loop — workers CREATE TABLE into target and hit
-        NO_SUCH_CATALOG_EXCEPTION otherwise. Two category-iteration
-        occurrences exist (skip path + populate path); we check the
-        last (populate) one against CREATE CATALOG order."""
+    def test_creates_target_database_before_category_batches(self):
         import pathlib
 
         src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "migrate" / "hive_orchestrator.py").read_text()
-        create_idx = src.find("CREATE CATALOG IF NOT EXISTS")
+        create_idx = src.find("CREATE DATABASE IF NOT EXISTS `hive_metastore`")
         last_batch_idx = src.rfind('("hive_external", "hive_managed_nondbfs", "hive_managed_dbfs_root")')
-        assert create_idx != -1, "Orchestrator must CREATE target catalog"
+        assert create_idx != -1, "Orchestrator must ensure target databases exist"
         assert last_batch_idx != -1, "Category-iteration tuple not found in orchestrator"
         assert create_idx < last_batch_idx, (
-            "Target catalog creation must precede the populate-path "
-            "category iteration — otherwise downstream workers hit "
-            "NO_SUCH_CATALOG_EXCEPTION."
+            "Target database creation must precede the populate-path category "
+            "iteration — otherwise downstream workers hit NO_SUCH_DATABASE."
         )
