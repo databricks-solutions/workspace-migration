@@ -21,7 +21,7 @@ resources:
               iceberg_strategy: ""
               rls_cm_strategy: ""
               migrate_hive_dbfs_root: "false"
-              hive_dbfs_target_path: ""
+              hive_dbfs_staging_path: ""
               catalog_filter: "integration_test_src"
 
         - task_key: seed_vector_search

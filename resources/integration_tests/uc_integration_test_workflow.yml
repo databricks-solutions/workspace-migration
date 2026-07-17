@@ -19,7 +19,7 @@ resources:
               iceberg_strategy: "ddl_replay"
               rls_cm_strategy: "staging_copy"
               migrate_hive_dbfs_root: "false"
-              hive_dbfs_target_path: ""
+              hive_dbfs_staging_path: ""
 
         - task_key: seed_uc
           depends_on:

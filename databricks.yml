@@ -4,13 +4,14 @@ bundle:
 variables:
   job_prefix:
     default: "uc-migration"
-  hive_test_dbfs_target_path:
+  hive_test_dbfs_staging_path:
     description: |
-      ADLS path the hive integration test uses as the DBFS-root migration
-      target. Default empty (the DBFS-root migration leg is then config-gated
-      off). Set to an external-location-backed path readable by BOTH source and
-      target to exercise it, e.g.
-      ``--var hive_test_dbfs_target_path=abfss://<c>@<a>.dfs.core.windows.net/<p>``.
+      Shared abfss:// staging path the hive integration test uses for the
+      DBFS-root two-hop copy (like-for-like: staged there, then re-created
+      MANAGED in the target's own DBFS root). Default empty (the DBFS-root
+      migration leg is then config-gated off). Set to a container readable +
+      writable by BOTH source and target to exercise it, e.g.
+      ``--var hive_test_dbfs_staging_path=abfss://<c>@<a>.dfs.core.windows.net/<p>``.
     default: ""
   migration_spn_id:
     description: |

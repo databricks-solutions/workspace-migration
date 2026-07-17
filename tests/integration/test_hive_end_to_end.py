@@ -426,8 +426,14 @@ for _t, _ok in _HIVE_EXPECTED.items():
 # + grant-before-transfer + skip-if-owned make re-runs safe (RERUN_COVERED_JOBS).
 from tests.integration._assertion_helpers import assert_migrate_idempotent  # type: ignore[import-not-found]
 
+# NOTE: `default=""` (not `debugValue=""`) so an absent key is a graceful
+# no-op skip in a REAL job run. debugValue only applies in interactive/debug
+# mode; in a job, get() of an unset key with no default RAISES ValueError —
+# which would fail test_hive even though migrate_hive itself succeeded. The
+# re-run leg stays dormant until the workflow wires migrate_hive_job_id as a
+# seed_hive task value.
 _migrate_hive_job_id = dbutils.jobs.taskValues.get(  # type: ignore[name-defined]  # noqa: F821
-    taskKey="seed_hive", key="migrate_hive_job_id", debugValue=""
+    taskKey="seed_hive", key="migrate_hive_job_id", default="", debugValue=""
 )
 if _migrate_hive_job_id:
     from databricks.sdk import WorkspaceClient
