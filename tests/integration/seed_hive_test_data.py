@@ -51,6 +51,40 @@ with contextlib.suppress(Exception):
 
 spark.sql("CREATE DATABASE IF NOT EXISTS hive_metastore.integration_test_hive")  # noqa: F821
 
+# COMMAND ----------
+# Clean-slate the Hive tracking rows at the START of the run (finding H3).
+#
+# test_hive reads TrackingManager.get_latest_migration_status(), which returns
+# the latest row per (object_name, object_type) across ALL history — it is NOT
+# scoped to this run's job_run_id. Orphaned rows from a bygone fixture naming
+# (e.g. a prior lab seed that used different db/table names) are for objects
+# THIS run never re-migrates, so the latest-row window never supersedes them,
+# AND teardown's ``LIKE '%integration_test_hive%'`` delete never matches them —
+# so they linger forever and poison the coverage assertion with stale
+# 'failed' rows. Deleting every source_type='hive' row here makes each run
+# start from a clean slate, so the assertion only ever sees this run's rows.
+# On a pristine workspace this is a harmless no-op; the try/except tolerates
+# the tracking tables not existing yet (discovery creates them after seed).
+_hive_tracking_reset = (
+    f"DELETE FROM {config.tracking_catalog}.{config.tracking_schema}.migration_status "
+    f"WHERE object_type LIKE 'hive_%'"
+)
+_hive_disc_reset = (
+    f"DELETE FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory "
+    f"WHERE source_type = 'hive'"
+)
+try:
+    _reset_auth = AuthManager(config, dbutils)  # noqa: F821
+    _reset_wh = find_warehouse(_reset_auth)
+    for _sql in (_hive_tracking_reset, _hive_disc_reset):
+        _r = execute_and_poll(_reset_auth, _reset_wh, _sql)
+        if _r["state"] != "SUCCEEDED":
+            # Missing table (first run before discovery ever ran) is expected.
+            print(f"Hive tracking clean-slate skipped ({_r.get('error', _r['state'])}).")
+    print("Cleared prior hive_* rows from tracking tables (H3 clean-slate).")
+except Exception as _reset_exc:  # noqa: BLE001
+    print(f"Hive tracking clean-slate skipped: {_reset_exc}")
+
 # Managed Delta table on DBFS root — default for Hive CREATE TABLE
 spark.sql(  # noqa: F821
     """
