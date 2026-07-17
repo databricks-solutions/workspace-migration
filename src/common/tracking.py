@@ -105,6 +105,11 @@ _TERMINAL_STATUSES: tuple[str, ...] = (
     # surfaced in the dashboard for manual handling. Replaces the old
     # non-terminal, flag-gated ``skipped_by_rls_cm_policy``.
     "skipped_policy_protected",
+    # A dependent object (a view on a skipped/failed table, or a grant whose
+    # target object was not migrated) — recorded skipped, not failed, so the
+    # skip cascade doesn't read as a tool failure (finding #9). Terminal so
+    # re-runs don't reprocess it while its dependency stays unmigrated.
+    "skipped_dependency_not_migrated",
     # H6: object exceeded MAX_BATCH_BYTES and was excluded from for_each
     # batches. Re-picking it would just fail again — operator must trim
     # heavy metadata (or split the object) and clear the status row.
@@ -369,6 +374,41 @@ class TrackingManager:
             )
             WHERE rn = 1
         """)
+
+    def not_validated_object_names(self, source_type: str | None = None) -> set[str]:
+        """Object names whose LATEST migration_status is NOT 'validated'.
+
+        Used by the Hive views/grants workers to cascade-skip dependents of
+        objects that were not migrated (finding #9): a config-skipped DBFS-root
+        table, or a genuine failure. Reuses the latest-row window so a
+        superseded in_progress row never counts. When ``source_type`` is given,
+        joins discovery_inventory to scope to that source (e.g. 'hive').
+        """
+        where_src = ""
+        if source_type:
+            where_src = f"WHERE d.source_type = '{source_type}'"
+        rows = self.spark.sql(
+            f"""
+            WITH latest_status AS (
+                SELECT object_name, status
+                FROM (
+                    SELECT object_name, status,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY object_name, object_type
+                               ORDER BY migrated_at DESC
+                           ) AS rn
+                    FROM {self._fqn}.migration_status
+                )
+                WHERE rn = 1 AND status != 'validated'
+            )
+            SELECT DISTINCT s.object_name
+            FROM latest_status s
+            JOIN {self._fqn}.discovery_inventory d
+              ON s.object_name = d.object_name
+            {where_src}
+            """,
+        ).collect()
+        return {r.object_name for r in rows}
 
     def get_pending_objects(self, object_type: str) -> list[dict]:
         """Return discovery inventory objects that haven't reached a terminal status.
