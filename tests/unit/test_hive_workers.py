@@ -600,6 +600,86 @@ class TestHiveManagedNondbfsWorker:
 # ----------------------------------------------------------------------
 
 
+class TestHiveViewDependencySkip:
+    def test_flags_backticked_reference(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        assert view_dependency_skip(ddl, not_migrated) == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_flags_dotted_reference(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW hive_metastore.db.v AS SELECT * FROM hive_metastore.db.dbfs_orders"
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        assert view_dependency_skip(ddl, not_migrated) == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_none_when_all_deps_validated(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`good`"
+        assert view_dependency_skip(ddl, {"`hive_metastore`.`db`.`dbfs_orders`"}) is None
+
+    def test_empty_not_migrated_never_skips(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`x`"
+        assert view_dependency_skip(ddl, set()) is None
+
+    def test_transitive_view_on_skipped_view(self):
+        """A view on a view that was itself skipped is caught once the skipped
+        view's FQN is added to the not-migrated set (same-run transitivity)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        # v2 selects from v1; v1 was skipped this run and added to the set.
+        ddl_v2 = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v2` AS SELECT * FROM `hive_metastore`.`db`.`v1`"
+        not_migrated = {"`hive_metastore`.`db`.`v1`"}
+        assert view_dependency_skip(ddl_v2, not_migrated) == "`hive_metastore`.`db`.`v1`"
+
+
+class TestHiveViewCascadeInMigrate:
+    @patch("migrate.hive_views_worker.time")
+    @patch("migrate.hive_views_worker.execute_and_poll")
+    def test_view_on_not_migrated_table_is_skipped_not_executed(self, mock_exec, mock_time):
+        from migrate.hive_views_worker import migrate_hive_view
+
+        mock_time.time.side_effect = [100.0, 100.1]
+        ddl = "CREATE VIEW `hive_metastore`.`db`.`v_orders` AS SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        cfg = _config_mock()
+        res = migrate_hive_view(
+            {"object_name": "`hive_metastore`.`db`.`v_orders`"},
+            ddl,
+            config=cfg,
+            auth=MagicMock(),
+            wh_id="wh",
+            not_migrated_names={"`hive_metastore`.`db`.`dbfs_orders`"},
+        )
+        assert res["status"] == "skipped_dependency_not_migrated"
+        assert "dbfs_orders" in res["error_message"]
+        mock_exec.assert_not_called()
+
+    @patch("migrate.hive_views_worker.time")
+    @patch("migrate.hive_views_worker.execute_and_poll")
+    def test_view_with_validated_deps_migrates(self, mock_exec, mock_time):
+        from migrate.hive_views_worker import migrate_hive_view
+
+        mock_time.time.side_effect = [100.0, 100.5]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        ddl = "CREATE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`good`"
+        cfg = _config_mock()
+        res = migrate_hive_view(
+            {"object_name": "`hive_metastore`.`db`.`v`"},
+            ddl,
+            config=cfg,
+            auth=MagicMock(),
+            wh_id="wh",
+            not_migrated_names=set(),
+        )
+        assert res["status"] == "validated"
+        mock_exec.assert_called_once()
+
+
 class TestHiveOrchestratorBatching:
     """The existing test_hive_orchestrator.py covers the short-circuit
     path. These tests add batching-path guards."""

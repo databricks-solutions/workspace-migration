@@ -49,6 +49,25 @@ def _is_notebook() -> bool:
 
 
 # COMMAND ----------
+# Dependency-skip helper (finding #9)
+
+
+def view_dependency_skip(ddl: str, not_migrated_names: set[str]) -> str | None:
+    """Return the FQN of a not-migrated object the view DDL references, else None.
+
+    Uses the same textual match as ``_sort_views_by_deps``: an object is
+    referenced if its backticked (`hive_metastore`.`db`.`t`) OR dotted
+    (hive_metastore.db.t) form appears in the DDL. A view referencing any
+    not-migrated object is cascade-skipped (finding #9).
+    """
+    for fqn in not_migrated_names:
+        unquoted = fqn.strip("`").replace("`.`", ".")
+        if fqn in ddl or unquoted in ddl:
+            return fqn
+    return None
+
+
+# COMMAND ----------
 # Topological sort for Hive views (textual heuristic)
 
 
@@ -102,10 +121,25 @@ def migrate_hive_view(
     config: MigrationConfig,
     auth: AuthManager,
     wh_id: str,
+    not_migrated_names: set[str] | None = None,
 ) -> dict:
-    """Replay a single Hive view DDL into `hive_metastore` unchanged."""
+    """Replay a single Hive view DDL into `hive_metastore` unchanged.
+
+    If the view references an object that was not migrated (finding #9),
+    record ``skipped_dependency_not_migrated`` and do not execute the DDL.
+    """
     obj_name = view_info["object_name"]
     start = time.time()
+
+    dep = view_dependency_skip(ddl, not_migrated_names or set())
+    if dep is not None:
+        return {
+            "object_name": obj_name,
+            "object_type": "hive_view",
+            "status": "skipped_dependency_not_migrated",
+            "error_message": f"depends on not-migrated object {dep}",
+            "duration_seconds": time.time() - start,
+        }
 
     rewritten = ddl  # like-for-like: replay view DDL into hive_metastore as-is
     rewritten = rewrite_ddl(rewritten, r"CREATE\s+VIEW\b", "CREATE OR REPLACE VIEW")
@@ -164,6 +198,7 @@ def run(dbutils, spark) -> None:
 
     view_lookup: dict[str, dict] = {v["object_name"]: v for v in views_raw}
     wh_id = find_warehouse(auth)
+    not_migrated_names = tracker.not_validated_object_names(source_type="hive")
 
     # Step 1: fetch DDLs for all views.
     # SHOW CREATE TABLE's output for Hive views is not reliably replayable
@@ -242,7 +277,12 @@ def run(dbutils, spark) -> None:
                 config=config,
                 auth=auth,
                 wh_id=wh_id,
+                not_migrated_names=not_migrated_names,
             )
+            # Transitive cascade: a view skipped now becomes a not-migrated
+            # dependency for later views in topo order (finding #9).
+            if res["status"] == "skipped_dependency_not_migrated":
+                not_migrated_names.add(source_fqn)
         except Exception as exc:  # noqa: BLE001
             res = {
                 "object_name": source_fqn,
