@@ -324,6 +324,21 @@ class TestHiveGrantsWorker:
         assert "hive_target_catalog" not in src
         assert "hive_metastore catalog ownership not transferred" in src
 
+    def test_grant_target_skip_predicate(self):
+        from migrate.hive_grants_worker import _grant_target_not_migrated
+
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        assert _grant_target_not_migrated("`hive_metastore`.`db`.`dbfs_orders`", not_migrated) is True
+        assert _grant_target_not_migrated("`hive_metastore`.`db`.`good`", not_migrated) is False
+
+    def test_skipped_grant_record_shape(self):
+        from migrate.hive_grants_worker import _skipped_dependency_grant_row
+
+        row = _skipped_dependency_grant_row("`hive_metastore`.`db`.`dbfs_orders`")
+        assert row["object_type"] == "hive_grant"
+        assert row["status"] == "skipped_dependency_not_migrated"
+        assert "dbfs_orders" in row["error_message"]
+
 
 # ----------------------------------------------------------------------
 # hive_managed_dbfs_worker

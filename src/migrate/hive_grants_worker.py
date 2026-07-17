@@ -71,6 +71,23 @@ def _skip_principal(principal: str) -> bool:
     return principal is None or principal.startswith("__")
 
 
+def _grant_target_not_migrated(object_name: str, not_migrated_names: set[str]) -> bool:
+    """True when a per-object grant's target was not migrated (finding #9)."""
+    return object_name in not_migrated_names
+
+
+def _skipped_dependency_grant_row(object_name: str) -> dict:
+    """migration_status row for a grant skipped because its target object was
+    not migrated (finding #9) — recorded skipped, not failed."""
+    return {
+        "object_name": f"GRANT_SKIPPED_{object_name}",
+        "object_type": "hive_grant",
+        "status": "skipped_dependency_not_migrated",
+        "error_message": f"target object {object_name} was not migrated; grants skipped",
+        "duration_seconds": 0.0,
+    }
+
+
 def _should_skip_owner_transfer(current_owner: str | None, target_principal: str) -> bool:
     """Skip the ALTER … OWNER TO when the target already owns the securable —
     makes re-runs idempotent (finding #13: no re-transfer failure)."""
@@ -319,6 +336,7 @@ def run(dbutils, spark) -> None:
     dry_run = config.dry_run
     transfer_ownership = config.transfer_ownership
     spn_client_id = config.spn_client_id
+    not_migrated_names = tracker.not_validated_object_names(source_type="hive")
 
     results: list[dict] = []
 
@@ -388,6 +406,12 @@ def run(dbutils, spark) -> None:
         securable = _OBJECT_TYPE_TO_SECURABLE.get(object_type)
         if not securable:
             logger.info("Skipping unknown object_type %s for %s.", object_type, object_name)
+            continue
+
+        # Cascade skip (finding #9): don't grant on an object that wasn't migrated.
+        if _grant_target_not_migrated(object_name, not_migrated_names):
+            logger.info("Skipping grants for not-migrated object %s.", object_name)
+            results.append(_skipped_dependency_grant_row(object_name))
             continue
 
         try:
