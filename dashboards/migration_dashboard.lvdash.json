@@ -140,7 +140,7 @@
         "  SELECT *, ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn\n",
         "  FROM migration_tracking.cp_migration.migration_status\n",
         "  WHERE object_type LIKE 'hive_%'\n",
-        ") WHERE rn = 1 AND status IN ('failed', 'validation_failed', 'skipped', 'skipped_by_config')"
+        ") WHERE rn = 1 AND status IN ('failed', 'validation_failed', 'skipped', 'skipped_by_config', 'skipped_dependency_not_migrated')"
       ]
     }
   ],
