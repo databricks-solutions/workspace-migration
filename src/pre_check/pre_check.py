@@ -66,6 +66,32 @@ def missing_required_mounts(target_mounts: list[str], required_mounts: list[str]
     return [r for r in required_mounts if r not in norm]
 
 
+def target_dbfs_root_probe_verdict(result: dict) -> tuple[str, str]:
+    """Turn a target-warehouse DBFS-root probe result into a (status, message).
+
+    The DBFS-root two-hop creates MANAGED tables in the TARGET's own DBFS root
+    (``CREATE DATABASE`` / ``CREATE TABLE`` in the target ``hive_metastore``).
+    The probe runs that on the target warehouse; this maps its outcome:
+
+    - SUCCEEDED → PASS.
+    - FAILED with the ``DBFS_DISABLED`` signature (public DBFS root disabled on
+      the target) → FAIL: the DBFS-root leg cannot run. This is the exact error
+      the orchestrator hits mid-migration, surfaced at preflight instead.
+    - Any other FAILED → WARN (don't mask a real disabled-root behind a
+      transient warehouse error, but don't false-PASS either).
+    """
+    if result.get("state") == "SUCCEEDED":
+        return "PASS", "Target DBFS root is writable."
+    err = str(result.get("error", result.get("state", "")) or "")
+    if "DBFS_DISABLED" in err or "Public DBFS root is disabled" in err:
+        return (
+            "FAIL",
+            f"Target DBFS root is disabled — the DBFS-root two-hop cannot create "
+            f"managed tables in the target hive_metastore: {err[:200]}",
+        )
+    return "WARN", f"Could not confirm target DBFS-root writability: {err[:200]}"
+
+
 # COMMAND ----------
 
 
@@ -558,25 +584,32 @@ def run(dbutils, spark):  # noqa: D103
         )
 
     # 14b. check_target_dbfs_root — the DBFS-root two-hop lands MANAGED tables in
-    # the TARGET DBFS root, so the target must have DBFS-root writes enabled when
-    # any DBFS-root table is in scope.
+    # the TARGET's own DBFS root (CREATE DATABASE / CREATE TABLE in the target
+    # hive_metastore). Probe the TARGET via its warehouse — NOT dbutils.fs,
+    # which runs on the SOURCE (deploy) workspace and gave a false PASS while
+    # the target's DBFS root was disabled. A create-then-drop of a throwaway
+    # database reproduces the exact DBFS_DISABLED error the orchestrator hits.
     try:
-        dbfs_in_scope = config.migrate_hive_dbfs_root
-        if not dbfs_in_scope:
+        if not config.migrate_hive_dbfs_root:
             _add("check_target_dbfs_root", "PASS", "No DBFS-root migration requested (migrate_hive_dbfs_root=false).")
         else:
-            probe = f"dbfs:/tmp/.wsm_dbfs_root_probe_{__import__('time').strftime('%H%M%S')}"
-            try:
-                dbutils.fs.put(probe, "x", True)  # type: ignore[attr-defined]  # noqa: F821
-                dbutils.fs.rm(probe, True)  # type: ignore[attr-defined]  # noqa: F821
-                _add("check_target_dbfs_root", "PASS", "Target DBFS root is writable.")
-            except Exception as pe:  # noqa: BLE001
-                _add(
-                    "check_target_dbfs_root", "FAIL",
-                    f"Target DBFS root not writable: {pe}",
-                    "Enable DBFS-root writes on the target workspace (required for the "
-                    "DBFS-root two-hop copy) or set migrate_hive_dbfs_root=false.",
-                )
+            from common.sql_utils import execute_and_poll, find_warehouse
+
+            _t_wh = find_warehouse(auth)  # defaults to the TARGET workspace
+            ts = __import__("time").strftime("%H%M%S")
+            probe_db = f"hive_metastore.__wsm_dbfs_root_probe_{ts}"
+            res = execute_and_poll(auth, _t_wh, f"CREATE DATABASE IF NOT EXISTS {probe_db}")
+            status, message = target_dbfs_root_probe_verdict(res)
+            # Best-effort cleanup if it did get created.
+            if res.get("state") == "SUCCEEDED":
+                execute_and_poll(auth, _t_wh, f"DROP DATABASE IF EXISTS {probe_db}")
+            action = (
+                "Enable the DBFS root on the target workspace (required for the "
+                "DBFS-root two-hop copy), or set migrate_hive_dbfs_root=false."
+                if status == "FAIL"
+                else ""
+            )
+            _add("check_target_dbfs_root", status, message, action)
     except Exception as e:  # noqa: BLE001
         _add("check_target_dbfs_root", "WARN", f"Could not probe target DBFS root: {e}")
 
