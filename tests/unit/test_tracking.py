@@ -636,7 +636,8 @@ class TestNotValidatedObjectNames:
         assert "PARTITION BY OBJECT_NAME, OBJECT_TYPE" in sql
         assert "ORDER BY MIGRATED_AT DESC" in sql
         assert "!= 'VALIDATED'" in sql or "<> 'VALIDATED'" in sql
-        assert "SOURCE_TYPE = 'HIVE'" in sql
+        assert "SOURCE_TYPE = :SRC" in sql
+        assert spark.sql.call_args.kwargs.get("args") == {"src": "hive"}
         assert result == {"`hive_metastore`.`db`.`t1`", "`hive_metastore`.`db`.`t2`"}
 
     def test_no_source_type_filter_when_omitted(self):
@@ -651,6 +652,7 @@ class TestNotValidatedObjectNames:
         TrackingManager(spark, config).not_validated_object_names()
         sql = spark.sql.call_args[0][0].upper()
         assert "SOURCE_TYPE" not in sql
+        assert spark.sql.call_args.kwargs.get("args") in (None, {})
 
 
 class TestDependencySkipStatusIsTerminal:

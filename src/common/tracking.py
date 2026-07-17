@@ -385,8 +385,10 @@ class TrackingManager:
         joins discovery_inventory to scope to that source (e.g. 'hive').
         """
         where_src = ""
+        args: dict = {}
         if source_type:
-            where_src = f"WHERE d.source_type = '{source_type}'"
+            where_src = "WHERE d.source_type = :src"
+            args["src"] = source_type
         rows = self.spark.sql(
             f"""
             WITH latest_status AS (
@@ -407,6 +409,7 @@ class TrackingManager:
               ON s.object_name = d.object_name
             {where_src}
             """,
+            args=args,
         ).collect()
         return {r.object_name for r in rows}
 
