@@ -621,26 +621,29 @@ class TestHiveViewDependencySkip:
 
         ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
         not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
-        assert view_dependency_skip(ddl, not_migrated) == "`hive_metastore`.`db`.`dbfs_orders`"
+        # view_fqn is the view itself, NOT in not_migrated — behavior unchanged
+        result = view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
 
     def test_flags_dotted_reference(self):
         from migrate.hive_views_worker import view_dependency_skip
 
         ddl = "CREATE OR REPLACE VIEW hive_metastore.db.v AS SELECT * FROM hive_metastore.db.dbfs_orders"
         not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
-        assert view_dependency_skip(ddl, not_migrated) == "`hive_metastore`.`db`.`dbfs_orders`"
+        result = view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
 
     def test_none_when_all_deps_validated(self):
         from migrate.hive_views_worker import view_dependency_skip
 
         ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`good`"
-        assert view_dependency_skip(ddl, {"`hive_metastore`.`db`.`dbfs_orders`"}) is None
+        assert view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, {"`hive_metastore`.`db`.`dbfs_orders`"}) is None
 
     def test_empty_not_migrated_never_skips(self):
         from migrate.hive_views_worker import view_dependency_skip
 
         ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`x`"
-        assert view_dependency_skip(ddl, set()) is None
+        assert view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, set()) is None
 
     def test_transitive_view_on_skipped_view(self):
         """A view on a view that was itself skipped is caught once the skipped
@@ -650,7 +653,68 @@ class TestHiveViewDependencySkip:
         # v2 selects from v1; v1 was skipped this run and added to the set.
         ddl_v2 = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v2` AS SELECT * FROM `hive_metastore`.`db`.`v1`"
         not_migrated = {"`hive_metastore`.`db`.`v1`"}
-        assert view_dependency_skip(ddl_v2, not_migrated) == "`hive_metastore`.`db`.`v1`"
+        assert view_dependency_skip("`hive_metastore`.`db`.`v2`", ddl_v2, not_migrated) == "`hive_metastore`.`db`.`v1`"
+
+    # ------------------------------------------------------------------
+    # New regression tests (critical + important findings from final review)
+    # ------------------------------------------------------------------
+
+    def test_self_exclusion_critical_regression(self):
+        """A view whose own FQN is in not_migrated (re-run scenario) must NOT
+        self-match the CREATE OR REPLACE VIEW header — returns None when its
+        only not-migrated entry is itself."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`db`.`v_orders`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v_orders` AS "
+            "SELECT * FROM `hive_metastore`.`db`.`good`"
+        )
+        not_migrated = {"`hive_metastore`.`db`.`v_orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) is None
+
+    def test_self_excluded_but_real_dep_still_caught(self):
+        """When the view itself AND a real not-migrated dep are both in the set,
+        the real dep is returned (not the view's own FQN)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`db`.`v_orders`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v_orders` AS "
+            "SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        )
+        not_migrated = {
+            "`hive_metastore`.`db`.`v_orders`",
+            "`hive_metastore`.`db`.`dbfs_orders`",
+        }
+        result = view_dependency_skip(view_fqn, ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_substring_false_positive_important_regression(self):
+        """not_migrated contains `orders`; DDL references `orders_2024` (dotted)
+        only — must NOT be flagged (substring false-positive guard)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`sales`.`v`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`sales`.`v` AS "
+            "SELECT * FROM hive_metastore.sales.orders_2024"
+        )
+        not_migrated = {"`hive_metastore`.`sales`.`orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) is None
+
+    def test_boundary_true_positive(self):
+        """not_migrated contains `orders`; DDL references dotted `orders` at
+        end of token (not followed by an identifier char) — must be flagged."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`sales`.`v`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`sales`.`v` AS "
+            "SELECT * FROM hive_metastore.sales.orders WHERE id > 0"
+        )
+        not_migrated = {"`hive_metastore`.`sales`.`orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) == "`hive_metastore`.`sales`.`orders`"
 
 
 class TestHiveViewCascadeInMigrate:

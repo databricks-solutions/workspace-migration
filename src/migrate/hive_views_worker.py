@@ -23,6 +23,7 @@ except NameError:
 
 import json
 import logging
+import re
 import time
 from collections import deque
 
@@ -52,17 +53,35 @@ def _is_notebook() -> bool:
 # Dependency-skip helper (finding #9)
 
 
-def view_dependency_skip(ddl: str, not_migrated_names: set[str]) -> str | None:
+def view_dependency_skip(view_fqn: str, ddl: str, not_migrated_names: set[str]) -> str | None:
     """Return the FQN of a not-migrated object the view DDL references, else None.
 
-    Uses the same textual match as ``_sort_views_by_deps``: an object is
-    referenced if its backticked (`hive_metastore`.`db`.`t`) OR dotted
-    (hive_metastore.db.t) form appears in the DDL. A view referencing any
-    not-migrated object is cascade-skipped (finding #9).
+    Takes the view's own FQN to exclude it from consideration (a view's own
+    FQN appears in the ``CREATE OR REPLACE VIEW <fqn> AS …`` header and must
+    not self-match on re-runs when the view has a non-validated status).
+
+    Matching rules:
+    - Backticked form (e.g. `` `hive_metastore`.`db`.`t` ``): plain
+      substring search — backtick boundaries prevent prefix collisions.
+    - Dotted/unquoted form (e.g. ``hive_metastore.db.t``): requires the match
+      NOT be immediately followed by an identifier character (``[A-Za-z0-9_]``)
+      so ``orders`` does not match inside ``orders_2024``.
+
+    A view referencing any not-migrated object is cascade-skipped (finding #9).
     """
+    # Normalize the view's own FQN to the dotted form for comparison
+    own_dotted = view_fqn.strip("`").replace("`.`", ".")
+
     for fqn in not_migrated_names:
-        unquoted = fqn.strip("`").replace("`.`", ".")
-        if fqn in ddl or unquoted in ddl:
+        dotted = fqn.strip("`").replace("`.`", ".")
+        # Exclude the view's own FQN (compare on dotted form to handle quoting variants)
+        if dotted == own_dotted:
+            continue
+        # Backtick form: plain substring (backticks act as natural boundaries)
+        if fqn in ddl:
+            return fqn
+        # Dotted form: require a token boundary (not followed by an identifier char)
+        if re.search(re.escape(dotted) + r"(?![A-Za-z0-9_])", ddl):
             return fqn
     return None
 
@@ -131,7 +150,7 @@ def migrate_hive_view(
     obj_name = view_info["object_name"]
     start = time.time()
 
-    dep = view_dependency_skip(ddl, not_migrated_names or set())
+    dep = view_dependency_skip(obj_name, ddl, not_migrated_names or set())
     if dep is not None:
         return {
             "object_name": obj_name,
