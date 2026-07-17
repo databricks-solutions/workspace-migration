@@ -23,6 +23,7 @@ except NameError:
 
 import json
 import logging
+import re
 import time
 from collections import deque
 
@@ -46,6 +47,43 @@ def _is_notebook() -> bool:
         return True
     except NameError:
         return False
+
+
+# COMMAND ----------
+# Dependency-skip helper (finding #9)
+
+
+def view_dependency_skip(view_fqn: str, ddl: str, not_migrated_names: set[str]) -> str | None:
+    """Return the FQN of a not-migrated object the view DDL references, else None.
+
+    Takes the view's own FQN to exclude it from consideration (a view's own
+    FQN appears in the ``CREATE OR REPLACE VIEW <fqn> AS …`` header and must
+    not self-match on re-runs when the view has a non-validated status).
+
+    Matching rules:
+    - Backticked form (e.g. `` `hive_metastore`.`db`.`t` ``): plain
+      substring search — backtick boundaries prevent prefix collisions.
+    - Dotted/unquoted form (e.g. ``hive_metastore.db.t``): requires the match
+      NOT be immediately followed by an identifier character (``[A-Za-z0-9_]``)
+      so ``orders`` does not match inside ``orders_2024``.
+
+    A view referencing any not-migrated object is cascade-skipped (finding #9).
+    """
+    # Normalize the view's own FQN to the dotted form for comparison
+    own_dotted = view_fqn.strip("`").replace("`.`", ".")
+
+    for fqn in not_migrated_names:
+        dotted = fqn.strip("`").replace("`.`", ".")
+        # Exclude the view's own FQN (compare on dotted form to handle quoting variants)
+        if dotted == own_dotted:
+            continue
+        # Backtick form: plain substring (backticks act as natural boundaries)
+        if fqn in ddl:
+            return fqn
+        # Dotted form: require a token boundary (not followed by an identifier char)
+        if re.search(re.escape(dotted) + r"(?![A-Za-z0-9_])", ddl):
+            return fqn
+    return None
 
 
 # COMMAND ----------
@@ -102,10 +140,25 @@ def migrate_hive_view(
     config: MigrationConfig,
     auth: AuthManager,
     wh_id: str,
+    not_migrated_names: set[str] | None = None,
 ) -> dict:
-    """Replay a single Hive view DDL into `hive_metastore` unchanged."""
+    """Replay a single Hive view DDL into `hive_metastore` unchanged.
+
+    If the view references an object that was not migrated (finding #9),
+    record ``skipped_dependency_not_migrated`` and do not execute the DDL.
+    """
     obj_name = view_info["object_name"]
     start = time.time()
+
+    dep = view_dependency_skip(obj_name, ddl, not_migrated_names or set())
+    if dep is not None:
+        return {
+            "object_name": obj_name,
+            "object_type": "hive_view",
+            "status": "skipped_dependency_not_migrated",
+            "error_message": f"depends on not-migrated object {dep}",
+            "duration_seconds": time.time() - start,
+        }
 
     rewritten = ddl  # like-for-like: replay view DDL into hive_metastore as-is
     rewritten = rewrite_ddl(rewritten, r"CREATE\s+VIEW\b", "CREATE OR REPLACE VIEW")
@@ -164,6 +217,7 @@ def run(dbutils, spark) -> None:
 
     view_lookup: dict[str, dict] = {v["object_name"]: v for v in views_raw}
     wh_id = find_warehouse(auth)
+    not_migrated_names = tracker.not_validated_object_names(source_type="hive")
 
     # Step 1: fetch DDLs for all views.
     # SHOW CREATE TABLE's output for Hive views is not reliably replayable
@@ -242,7 +296,12 @@ def run(dbutils, spark) -> None:
                 config=config,
                 auth=auth,
                 wh_id=wh_id,
+                not_migrated_names=not_migrated_names,
             )
+            # Transitive cascade: a view skipped now becomes a not-migrated
+            # dependency for later views in topo order (finding #9).
+            if res["status"] == "skipped_dependency_not_migrated":
+                not_migrated_names.add(source_fqn)
         except Exception as exc:  # noqa: BLE001
             res = {
                 "object_name": source_fqn,

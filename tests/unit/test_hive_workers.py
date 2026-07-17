@@ -324,6 +324,21 @@ class TestHiveGrantsWorker:
         assert "hive_target_catalog" not in src
         assert "hive_metastore catalog ownership not transferred" in src
 
+    def test_grant_target_skip_predicate(self):
+        from migrate.hive_grants_worker import _grant_target_not_migrated
+
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        assert _grant_target_not_migrated("`hive_metastore`.`db`.`dbfs_orders`", not_migrated) is True
+        assert _grant_target_not_migrated("`hive_metastore`.`db`.`good`", not_migrated) is False
+
+    def test_skipped_grant_record_shape(self):
+        from migrate.hive_grants_worker import _skipped_dependency_grant_row
+
+        row = _skipped_dependency_grant_row("`hive_metastore`.`db`.`dbfs_orders`")
+        assert row["object_type"] == "hive_grant"
+        assert row["status"] == "skipped_dependency_not_migrated"
+        assert "dbfs_orders" in row["error_message"]
+
 
 # ----------------------------------------------------------------------
 # hive_managed_dbfs_worker
@@ -598,6 +613,150 @@ class TestHiveManagedNondbfsWorker:
 # ----------------------------------------------------------------------
 # hive_orchestrator batching — covered by test_hive_orchestrator.py
 # ----------------------------------------------------------------------
+
+
+class TestHiveViewDependencySkip:
+    def test_flags_backticked_reference(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        # view_fqn is the view itself, NOT in not_migrated — behavior unchanged
+        result = view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_flags_dotted_reference(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW hive_metastore.db.v AS SELECT * FROM hive_metastore.db.dbfs_orders"
+        not_migrated = {"`hive_metastore`.`db`.`dbfs_orders`"}
+        result = view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_none_when_all_deps_validated(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`good`"
+        assert view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, {"`hive_metastore`.`db`.`dbfs_orders`"}) is None
+
+    def test_empty_not_migrated_never_skips(self):
+        from migrate.hive_views_worker import view_dependency_skip
+
+        ddl = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`x`"
+        assert view_dependency_skip("`hive_metastore`.`db`.`v`", ddl, set()) is None
+
+    def test_transitive_view_on_skipped_view(self):
+        """A view on a view that was itself skipped is caught once the skipped
+        view's FQN is added to the not-migrated set (same-run transitivity)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        # v2 selects from v1; v1 was skipped this run and added to the set.
+        ddl_v2 = "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v2` AS SELECT * FROM `hive_metastore`.`db`.`v1`"
+        not_migrated = {"`hive_metastore`.`db`.`v1`"}
+        assert view_dependency_skip("`hive_metastore`.`db`.`v2`", ddl_v2, not_migrated) == "`hive_metastore`.`db`.`v1`"
+
+    # ------------------------------------------------------------------
+    # New regression tests (critical + important findings from final review)
+    # ------------------------------------------------------------------
+
+    def test_self_exclusion_critical_regression(self):
+        """A view whose own FQN is in not_migrated (re-run scenario) must NOT
+        self-match the CREATE OR REPLACE VIEW header — returns None when its
+        only not-migrated entry is itself."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`db`.`v_orders`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v_orders` AS "
+            "SELECT * FROM `hive_metastore`.`db`.`good`"
+        )
+        not_migrated = {"`hive_metastore`.`db`.`v_orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) is None
+
+    def test_self_excluded_but_real_dep_still_caught(self):
+        """When the view itself AND a real not-migrated dep are both in the set,
+        the real dep is returned (not the view's own FQN)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`db`.`v_orders`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`db`.`v_orders` AS "
+            "SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        )
+        not_migrated = {
+            "`hive_metastore`.`db`.`v_orders`",
+            "`hive_metastore`.`db`.`dbfs_orders`",
+        }
+        result = view_dependency_skip(view_fqn, ddl, not_migrated)
+        assert result == "`hive_metastore`.`db`.`dbfs_orders`"
+
+    def test_substring_false_positive_important_regression(self):
+        """not_migrated contains `orders`; DDL references `orders_2024` (dotted)
+        only — must NOT be flagged (substring false-positive guard)."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`sales`.`v`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`sales`.`v` AS "
+            "SELECT * FROM hive_metastore.sales.orders_2024"
+        )
+        not_migrated = {"`hive_metastore`.`sales`.`orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) is None
+
+    def test_boundary_true_positive(self):
+        """not_migrated contains `orders`; DDL references dotted `orders` at
+        end of token (not followed by an identifier char) — must be flagged."""
+        from migrate.hive_views_worker import view_dependency_skip
+
+        view_fqn = "`hive_metastore`.`sales`.`v`"
+        ddl = (
+            "CREATE OR REPLACE VIEW `hive_metastore`.`sales`.`v` AS "
+            "SELECT * FROM hive_metastore.sales.orders WHERE id > 0"
+        )
+        not_migrated = {"`hive_metastore`.`sales`.`orders`"}
+        assert view_dependency_skip(view_fqn, ddl, not_migrated) == "`hive_metastore`.`sales`.`orders`"
+
+
+class TestHiveViewCascadeInMigrate:
+    @patch("migrate.hive_views_worker.time")
+    @patch("migrate.hive_views_worker.execute_and_poll")
+    def test_view_on_not_migrated_table_is_skipped_not_executed(self, mock_exec, mock_time):
+        from migrate.hive_views_worker import migrate_hive_view
+
+        mock_time.time.side_effect = [100.0, 100.1]
+        ddl = "CREATE VIEW `hive_metastore`.`db`.`v_orders` AS SELECT * FROM `hive_metastore`.`db`.`dbfs_orders`"
+        cfg = _config_mock()
+        res = migrate_hive_view(
+            {"object_name": "`hive_metastore`.`db`.`v_orders`"},
+            ddl,
+            config=cfg,
+            auth=MagicMock(),
+            wh_id="wh",
+            not_migrated_names={"`hive_metastore`.`db`.`dbfs_orders`"},
+        )
+        assert res["status"] == "skipped_dependency_not_migrated"
+        assert "dbfs_orders" in res["error_message"]
+        mock_exec.assert_not_called()
+
+    @patch("migrate.hive_views_worker.time")
+    @patch("migrate.hive_views_worker.execute_and_poll")
+    def test_view_with_validated_deps_migrates(self, mock_exec, mock_time):
+        from migrate.hive_views_worker import migrate_hive_view
+
+        mock_time.time.side_effect = [100.0, 100.5]
+        mock_exec.return_value = {"state": "SUCCEEDED", "statement_id": "s"}
+        ddl = "CREATE VIEW `hive_metastore`.`db`.`v` AS SELECT * FROM `hive_metastore`.`db`.`good`"
+        cfg = _config_mock()
+        res = migrate_hive_view(
+            {"object_name": "`hive_metastore`.`db`.`v`"},
+            ddl,
+            config=cfg,
+            auth=MagicMock(),
+            wh_id="wh",
+            not_migrated_names=set(),
+        )
+        assert res["status"] == "validated"
+        mock_exec.assert_called_once()
 
 
 class TestHiveOrchestratorBatching:

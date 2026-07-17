@@ -177,7 +177,7 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
-            "'skipped_policy_protected', "
+            "'skipped_policy_protected', 'skipped_dependency_not_migrated', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
@@ -327,7 +327,7 @@ class TestTrackingManager:
         assert (
             "status NOT IN ('validated', 'skipped_by_pipeline_migration', "
             "'skipped_target_exists', 'skipped_by_stateful_service_migration', "
-            "'skipped_policy_protected', "
+            "'skipped_policy_protected', 'skipped_dependency_not_migrated', "
             "'failed_batch_oversize', 'created_resync_pending', "
             "'skipped_direct_access_unsupported', "
             "'lfc_pipeline_created_incremental', 'lfc_view_created', "
@@ -611,3 +611,52 @@ def test_vector_search_terminal_statuses_present():
     assert "created_resync_pending" in _TERMINAL_STATUSES
     assert "skipped_direct_access_unsupported" in _TERMINAL_STATUSES
     assert "skipped_endpoint_not_ready" not in _TERMINAL_STATUSES
+
+
+class TestNotValidatedObjectNames:
+    def test_sql_uses_latest_window_and_excludes_validated(self):
+        from common.tracking import TrackingManager
+
+        spark = MagicMock()
+        config = MagicMock()
+        config.tracking_catalog = "migration_tracking"
+        config.tracking_schema = "cp_migration"
+        # Two rows come back from the (mocked) query.
+        row_a = MagicMock()
+        row_a.object_name = "`hive_metastore`.`db`.`t1`"
+        row_b = MagicMock()
+        row_b.object_name = "`hive_metastore`.`db`.`t2`"
+        spark.sql.return_value.collect.return_value = [row_a, row_b]
+
+        tracker = TrackingManager(spark, config)
+        result = tracker.not_validated_object_names(source_type="hive")
+
+        sql = spark.sql.call_args[0][0].upper()
+        assert "ROW_NUMBER()" in sql
+        assert "PARTITION BY OBJECT_NAME, OBJECT_TYPE" in sql
+        assert "ORDER BY MIGRATED_AT DESC" in sql
+        assert "!= 'VALIDATED'" in sql or "<> 'VALIDATED'" in sql
+        assert "SOURCE_TYPE = :SRC" in sql
+        assert spark.sql.call_args.kwargs.get("args") == {"src": "hive"}
+        assert result == {"`hive_metastore`.`db`.`t1`", "`hive_metastore`.`db`.`t2`"}
+
+    def test_no_source_type_filter_when_omitted(self):
+        from common.tracking import TrackingManager
+
+        spark = MagicMock()
+        config = MagicMock()
+        config.tracking_catalog = "migration_tracking"
+        config.tracking_schema = "cp_migration"
+        spark.sql.return_value.collect.return_value = []
+
+        TrackingManager(spark, config).not_validated_object_names()
+        sql = spark.sql.call_args[0][0].upper()
+        assert "SOURCE_TYPE" not in sql
+        assert spark.sql.call_args.kwargs.get("args") in (None, {})
+
+
+class TestDependencySkipStatusIsTerminal:
+    def test_skipped_dependency_not_migrated_is_terminal(self):
+        from common.tracking import _TERMINAL_STATUSES
+
+        assert "skipped_dependency_not_migrated" in _TERMINAL_STATUSES
