@@ -90,14 +90,21 @@ For each object class: the **complexity**, the **migration approach**, and
 **how this tool handles it**. Objects are sequenced by the priority in
 Section 3.7.
 
+The Hive path migrates `hive_metastore` content **like-for-like** into the
+target workspace's own `hive_metastore` — same database/table names, same
+storage — rather than upgrading it into a UC catalog.
+
 ### 3.1 Hive managed tables — DBFS-root storage
 - **Complexity:** HIGH. Data lives in the workspace-scoped DBFS root; the new
   workspace has its own DBFS storage it can't reach, so bytes must be copied.
-- **Approach:** Delta → `DEEP CLONE`; non-Delta → CTAS.
-- **This tool:** `migrate_hive` with `migrate_hive_dbfs_root: true` copies the
-  DBFS-root bytes to `hive_dbfs_target_path` and registers the target table as
-  **external** in the Hive→UC target catalog (`hive_target_catalog`, default
-  `hive_upgraded`).
+- **Approach:** two-hop staging copy — write the source table to a shared
+  staging path, then re-create it as a MANAGED table in the target's own DBFS
+  root.
+- **This tool:** `migrate_hive` with `migrate_hive_dbfs_root: true` stages the
+  DBFS-root bytes via `hive_dbfs_staging_path` (a shared `abfss://` location both
+  workspaces can reach) and re-creates the table **managed** in the target
+  `hive_metastore` (same database/table name) — DBFS root must be enabled on the
+  target.
 
 ### 3.2 Hive managed tables — non-DBFS storage
 - **Complexity:** MEDIUM–HIGH. Data is on customer-owned storage but registered
@@ -105,14 +112,15 @@ Section 3.7.
 - **Approach:** re-register against the same location (Delta reads schema from
   the log; non-Delta needs `MSCK REPAIR`).
 - **This tool:** `migrate_hive` (`hive_managed_nondbfs_worker`) re-registers the
-  table on target pointing at the same storage.
+  table in the target `hive_metastore` pointing at the same storage (LOCATION
+  preserved).
 
 ### 3.3 Hive external tables — external storage (ADLS)
 - **Complexity:** LOW. Data stays in ADLS; only metadata (DDL) is recreated.
-- **Approach:** recreate the table pointing at the same location; recommended
-  path is **Hive external → UC external** (same storage path).
+- **Approach:** recreate the table pointing at the same location; like-for-like
+  **Hive external → Hive external** (same storage path).
 - **This tool:** `migrate_hive` (`hive_external_worker`) replays the DDL into the
-  UC target catalog against the same ADLS path.
+  target `hive_metastore` against the same ADLS path (target FQN == source FQN).
 
 ### 3.4 External Hive metastore
 - **Complexity:** LOW. The metastore lives in customer-configured storage
@@ -122,6 +130,41 @@ Section 3.7.
   connectivity.
 - **This tool:** out of scope — operator reconnects the external metastore. See
   [external_hive_metastore.md](reference/external_hive_metastore.md).
+
+### SPN permissions on hive_metastore (like-for-like Hive path)
+
+The Hive path migrates `hive_metastore` content **like-for-like** into the
+target workspace's own `hive_metastore` (same database/table names, same
+storage). The SPN needs:
+
+**Source workspace (read):**
+- Legacy Hive `SELECT` + `READ_METADATA` on the migrated `hive_metastore`
+  databases/tables (for `SHOW CREATE TABLE`, `SHOW GRANTS`, and reading rows for
+  the DBFS-root staging copy).
+- Source DBFS-root read access (runs on a classic cluster; workspace-level).
+- ADLS storage account key (secret) for ADLS-backed HMS external/non-DBFS tables
+  (legacy `fs.azure.account.key`; UC vending doesn't cover HMS `LOCATION`s).
+- **Write** access to the shared staging container (`hive_dbfs_staging_path`).
+
+**Target workspace (write):**
+- Legacy Hive `CREATE` on `hive_metastore` (create databases) and on each target
+  database (create tables).
+- Target **DBFS root enabled** + write access.
+- **Read** on the shared staging container.
+- Storage access to the same cloud paths for external tables (so replayed
+  external tables resolve).
+- Required `/mnt` mounts pre-existing (recreate them first — the tool never
+  touches mount credentials; pre_check verifies each required mount exists).
+
+**What changed vs the UC-upgrade path — no longer needs:**
+- `CREATE CATALOG` on the metastore.
+- UC `CREATE SCHEMA` / `CREATE TABLE` / `USE CATALOG` in a UC catalog.
+- Delta Sharing privileges (`CREATE SHARE`, `CREATE RECIPIENT`) for the Hive path.
+- UC external-location grants (`CREATE EXTERNAL TABLE` / `READ FILES`) for the
+  Hive path.
+
+**Now needs:** legacy Hive `CREATE` on target `hive_metastore` + databases,
+target DBFS root enabled + write access, and shared-staging container access.
 
 ### 3.5 UC managed tables
 - **Complexity:** MEDIUM–HIGH. Data is in UC-managed storage; the new metastore
@@ -342,7 +385,7 @@ spn_secret_key:       "spn-secret"
 catalog_filter:  []                 # scope the run
 rls_cm_strategy: ""                 # DEPRECATED — RLS/CM/ABAC tables are excluded + reported
 iceberg_strategy: "ddl_replay"      # if managed Iceberg present
-migrate_hive_dbfs_root: false       # true + hive_dbfs_target_path for DBFS-root Hive
+migrate_hive_dbfs_root: false       # true + hive_dbfs_staging_path for DBFS-root Hive (two-hop staging)
 ```
 > Don't edit the workspace-side copy — `bundle deploy` overwrites it from your
 > local copy.
@@ -400,8 +443,9 @@ WHERE source_type='uc' GROUP BY object_type, status;
 ```
 
 ### Step 5 — `migrate_hive` (only if migrating from Hive)
-Same shape, scoped to Hive sources; writes into `hive_target_catalog`
-(default `hive_upgraded`). See [external_hive_metastore.md](reference/external_hive_metastore.md)
+Same shape, scoped to Hive sources; writes **like-for-like** into the target
+workspace's own `hive_metastore` (same database/table names — no UC catalog).
+See [external_hive_metastore.md](reference/external_hive_metastore.md)
 for the classic-compute cluster/init-script requirements for ADLS-backed Hive
 tables.
 

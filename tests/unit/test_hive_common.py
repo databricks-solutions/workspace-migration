@@ -13,70 +13,45 @@ from unittest.mock import MagicMock
 from migrate.hive_common import (
     HIVE_CATALOG,
     HIVE_TO_UC_PRIVILEGES,
-    ensure_target_catalog_and_schema,
+    ensure_target_database,
     rewrite_hive_fqn,
     rewrite_hive_namespace,
 )
 
 
-class TestRewriteHiveNamespace:
-    def test_rewrites_backticked_hive_metastore_references(self):
-        sql = "CREATE VIEW `c`.`s`.`v` AS SELECT * FROM `hive_metastore`.`x`.`y`"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        assert "`hive_metastore`.`x`.`y`" not in out
-        assert "`hive_upgraded`.`x`.`y`" in out
+class TestRewriteHiveNamespaceIsIdentity:
+    """Like-for-like: DDL is replayed into hive_metastore as-is, so the
+    namespace rewrite must be a no-op (target namespace == source)."""
 
-    def test_rewrites_unbackticked_references(self):
+    def test_leaves_hive_metastore_references_untouched(self):
+        sql = "CREATE VIEW `hive_metastore`.`s`.`v` AS SELECT * FROM `hive_metastore`.`x`.`y`"
+        assert rewrite_hive_namespace(sql) == sql
+
+    def test_unbackticked_references_untouched(self):
         sql = "SELECT * FROM hive_metastore.schema.table"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        assert "hive_metastore.schema.table" not in out
-        assert "hive_upgraded.schema.table" in out
+        assert rewrite_hive_namespace(sql) == sql
 
-    def test_rewrites_both_forms_in_same_sql(self):
-        sql = "SELECT a.col, b.col FROM `hive_metastore`.`s`.`a` a JOIN hive_metastore.s.b b ON a.id = b.id"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        # Both occurrences rewritten.
-        assert "`hive_metastore`" not in out
-        assert "hive_metastore." not in out
-
-    def test_does_not_rewrite_references_to_other_catalogs(self):
-        """``hive_metastore_v2`` or ``my_hive_metastore`` are different
-        catalog names — must not be touched by the rewrite."""
-        sql = "SELECT * FROM `hive_metastore_v2`.`s`.`t`"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        assert "`hive_metastore_v2`.`s`.`t`" in out
-
-    def test_handles_no_hive_references(self):
-        sql = "SELECT * FROM `other_catalog`.`s`.`t`"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        assert out == sql
+    def test_target_arg_ignored_when_passed(self):
+        sql = "SELECT * FROM hive_metastore.s.t"
+        assert rewrite_hive_namespace(sql, "anything") == sql
 
 
-class TestRewriteHiveFqn:
-    def test_backticked_fqn(self):
-        assert rewrite_hive_fqn("`hive_metastore`.`s`.`t`", "hive_upgraded") == "`hive_upgraded`.`s`.`t`"
+class TestRewriteHiveFqnIsIdentity:
+    def test_backticked_fqn_unchanged(self):
+        fqn = "`hive_metastore`.`s`.`t`"
+        assert rewrite_hive_fqn(fqn) == fqn
 
-    def test_dotted_fqn(self):
-        assert rewrite_hive_fqn("hive_metastore.s.t", "hive_upgraded") == "`hive_upgraded`.`s`.`t`"
-
-    def test_non_hive_fqn_passes_through(self):
-        """A non-hive FQN is returned unchanged — ensures the helper
-        doesn't mangle UC references that happen to flow through."""
-        fqn = "`other`.`s`.`t`"
-        assert rewrite_hive_fqn(fqn, "hive_upgraded") == fqn
-
-    def test_malformed_fqn_passes_through(self):
-        """2-part or malformed input shouldn't crash."""
-        assert rewrite_hive_fqn("just_table", "hive_upgraded") == "just_table"
+    def test_dotted_fqn_unchanged(self):
+        assert rewrite_hive_fqn("hive_metastore.s.t") == "hive_metastore.s.t"
 
 
-class TestEnsureTargetCatalogAndSchema:
-    def test_issues_create_catalog_and_create_schema(self):
+class TestEnsureTargetDatabase:
+    def test_issues_create_database_in_hive_metastore(self):
         spark = MagicMock()
-        ensure_target_catalog_and_schema(spark, "hive_upgraded", "sch")
+        ensure_target_database(spark, "sch")
         calls = [c.args[0] for c in spark.sql.call_args_list]
-        assert any("CREATE CATALOG IF NOT EXISTS `hive_upgraded`" in s for s in calls)
-        assert any("CREATE SCHEMA IF NOT EXISTS `hive_upgraded`.`sch`" in s for s in calls)
+        assert any("CREATE DATABASE IF NOT EXISTS `hive_metastore`.`sch`" in s for s in calls)
+        assert not any("CREATE CATALOG" in s for s in calls)
 
 
 class TestHiveToUcPrivilegeMap:

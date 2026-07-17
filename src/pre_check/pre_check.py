@@ -48,6 +48,24 @@ def _is_notebook() -> bool:
         return False
 
 
+def missing_required_mounts(target_mounts: list[str], required_mounts: list[str]) -> list[str]:
+    """Return required mount names absent from the target's mounts.
+
+    Normalizes target entries to their bare ``<name>`` (accepts ``/mnt/x``,
+    ``/mnt/x/`` or ``x``). /mnt-backed Hive tables can't be recreated on the
+    target until the operator recreates the mount there.
+    """
+    norm = set()
+    for m in target_mounts:
+        s = (m or "").strip().strip("/")
+        if s.startswith("mnt/"):
+            s = s[len("mnt/"):]
+        s = s.split("/", 1)[0]
+        if s:
+            norm.add(s)
+    return [r for r in required_mounts if r not in norm]
+
+
 # COMMAND ----------
 
 
@@ -315,23 +333,24 @@ def run(dbutils, spark):  # noqa: D103
                 f"{len(dbfs_root_tables)} Hive DBFS-root managed table(s) discovered; "
                 f"migration skipped because migrate_hive_dbfs_root=false.",
                 "Review the discovered list; set migrate_hive_dbfs_root=true "
-                "and hive_dbfs_target_path in config.yaml to include them.",
+                "and hive_dbfs_staging_path in config.yaml to include them.",
             )
-        elif not config.hive_dbfs_target_path:
+        elif not config.hive_dbfs_staging_path:
             _add(
                 "check_hive_dbfs_root_config",
                 "FAIL",
                 f"{len(dbfs_root_tables)} DBFS-root table(s) selected for migration but "
-                f"hive_dbfs_target_path is empty.",
-                "Set hive_dbfs_target_path in config.yaml to an ADLS location "
-                "the migration SPN can write to (e.g. abfss://hive@acct.dfs.core.windows.net/upgraded/).",
+                f"hive_dbfs_staging_path is empty.",
+                "Set hive_dbfs_staging_path in config.yaml to a shared abfss staging "
+                "location both workspaces can reach (e.g. abfss://hive@acct.dfs.core.windows.net/stage/); "
+                "the tables are staged there, then re-created as managed tables in the target's own DBFS root.",
             )
         else:
-            # Probe write to the configured path
+            # Probe write to the configured staging path
             from datetime import datetime
 
             ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
-            probe_path = config.hive_dbfs_target_path.rstrip("/") + f"/.precheck_probe_{ts}"
+            probe_path = config.hive_dbfs_staging_path.rstrip("/") + f"/.precheck_probe_{ts}"
             try:
                 spark.createDataFrame([(1,)], "x INT").write.mode("overwrite").format("delta").save(  # type: ignore[attr-defined]
                     probe_path
@@ -341,16 +360,16 @@ def run(dbutils, spark):  # noqa: D103
                 _add(
                     "check_hive_dbfs_root_config",
                     "PASS",
-                    f"{len(dbfs_root_tables)} DBFS-root table(s) will migrate to "
-                    f"{config.hive_dbfs_target_path}; write probe passed.",
+                    f"{len(dbfs_root_tables)} DBFS-root table(s) will be staged via "
+                    f"{config.hive_dbfs_staging_path} then re-created managed on target; write probe passed.",
                 )
             except Exception as probe_exc:  # noqa: BLE001
                 _add(
                     "check_hive_dbfs_root_config",
                     "FAIL",
-                    f"Cannot write to hive_dbfs_target_path {config.hive_dbfs_target_path}: {probe_exc}",
-                    "Verify the SPN has write access to this ADLS location, and that "
-                    "a storage credential + external location exists on target.",
+                    f"Cannot write to hive_dbfs_staging_path {config.hive_dbfs_staging_path}: {probe_exc}",
+                    "Verify the SPN has write access to this ADLS staging location, and that "
+                    "a storage credential + external location exists on both workspaces.",
                 )
     except Exception as e:
         _add(
@@ -449,7 +468,6 @@ def run(dbutils, spark):  # noqa: D103
             target_client=auth.target_client,
             discovery_rows=discovery_dicts,
             existing_status_keys=existing_status_keys,
-            hive_target_catalog=config.hive_target_catalog,
         )
         if not discovery_dicts:
             _add(
@@ -538,6 +556,88 @@ def run(dbutils, spark):  # noqa: D103
             f"Collision detection skipped: {e}",
             "Run discovery before re-running pre-check to enable collision detection.",
         )
+
+    # 14b. check_target_dbfs_root — the DBFS-root two-hop lands MANAGED tables in
+    # the TARGET DBFS root, so the target must have DBFS-root writes enabled when
+    # any DBFS-root table is in scope.
+    try:
+        dbfs_in_scope = config.migrate_hive_dbfs_root
+        if not dbfs_in_scope:
+            _add("check_target_dbfs_root", "PASS", "No DBFS-root migration requested (migrate_hive_dbfs_root=false).")
+        else:
+            probe = f"dbfs:/tmp/.wsm_dbfs_root_probe_{__import__('time').strftime('%H%M%S')}"
+            try:
+                dbutils.fs.put(probe, "x", True)  # type: ignore[attr-defined]  # noqa: F821
+                dbutils.fs.rm(probe, True)  # type: ignore[attr-defined]  # noqa: F821
+                _add("check_target_dbfs_root", "PASS", "Target DBFS root is writable.")
+            except Exception as pe:  # noqa: BLE001
+                _add(
+                    "check_target_dbfs_root", "FAIL",
+                    f"Target DBFS root not writable: {pe}",
+                    "Enable DBFS-root writes on the target workspace (required for the "
+                    "DBFS-root two-hop copy) or set migrate_hive_dbfs_root=false.",
+                )
+    except Exception as e:  # noqa: BLE001
+        _add("check_target_dbfs_root", "WARN", f"Could not probe target DBFS root: {e}")
+
+    # 14c. check_target_mounts — every /mnt mount required by a /mnt-backed Hive
+    # table (mount_prerequisite markers from discovery) must already exist on the
+    # target; the tool never recreates mounts or touches mount credentials.
+    try:
+        marker_rows = spark.sql(
+            f"""
+            SELECT metadata_json FROM {config.tracking_catalog}.{config.tracking_schema}.discovery_inventory
+            WHERE object_type = 'mount_prerequisite'
+            """
+        ).collect()
+        import json as _json
+        required = sorted({_json.loads(r.metadata_json).get("mount") for r in marker_rows if r.metadata_json})
+        required = [m for m in required if m]
+        if not required:
+            _add("check_target_mounts", "PASS", "No /mnt-backed Hive tables require a target mount.")
+        else:
+            target_mounts = [m.mountPoint for m in dbutils.fs.mounts()]  # type: ignore[attr-defined]  # noqa: F821
+            missing = missing_required_mounts(target_mounts, required)
+            if missing:
+                _add(
+                    "check_target_mounts", "FAIL",
+                    f"Required target mount(s) missing: {missing}",
+                    "Recreate the listed /mnt mount(s) on the target workspace before "
+                    "migrating the /mnt-backed Hive tables (see the dashboard's mount "
+                    "prerequisites panel).",
+                )
+            else:
+                _add("check_target_mounts", "PASS", f"All {len(required)} required target mount(s) present.")
+    except Exception as e:  # noqa: BLE001
+        _add(
+            "check_target_mounts", "WARN",
+            f"Could not verify target mounts: {e}",
+            "Run discovery first so mount_prerequisite markers exist, then re-run pre_check.",
+        )
+
+    # 14d. check_staging_path_reachable — best-effort ls of the shared abfss
+    # staging area used by the DBFS-root two-hop copy.
+    try:
+        if not config.migrate_hive_dbfs_root:
+            _add("check_staging_path_reachable", "PASS", "DBFS-root migration disabled; staging path not needed.")
+        elif not config.hive_dbfs_staging_path:
+            _add(
+                "check_staging_path_reachable", "FAIL",
+                "hive_dbfs_staging_path is empty but DBFS-root migration is enabled.",
+                "Set hive_dbfs_staging_path to a shared abfss:// location both workspaces can reach.",
+            )
+        else:
+            try:
+                dbutils.fs.ls(config.hive_dbfs_staging_path)  # type: ignore[attr-defined]  # noqa: F821
+                _add("check_staging_path_reachable", "PASS", f"Staging path reachable: {config.hive_dbfs_staging_path}")
+            except Exception as se:  # noqa: BLE001
+                _add(
+                    "check_staging_path_reachable", "WARN",
+                    f"Could not list staging path {config.hive_dbfs_staging_path}: {se}",
+                    "Verify the SPN can read/write the shared staging container from both workspaces.",
+                )
+    except Exception as e:  # noqa: BLE001
+        _add("check_staging_path_reachable", "WARN", f"Staging path check skipped: {e}")
 
     # Persist results
     tracker.append_pre_check_results(results)

@@ -30,7 +30,6 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
-from migrate.hive_common import rewrite_hive_namespace
 from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
@@ -140,8 +139,7 @@ def migrate_hive_function(
             "duration_seconds": duration,
         }
 
-    # Rewrite hive_metastore. -> target_catalog.
-    ddl = rewrite_hive_namespace(ddl, config.hive_target_catalog)
+    # Like-for-like: replay the function DDL into hive_metastore unchanged.
 
     # Replace CREATE FUNCTION with CREATE OR REPLACE FUNCTION
     ddl = rewrite_ddl(ddl, r"CREATE\s+FUNCTION\b", "CREATE OR REPLACE FUNCTION")

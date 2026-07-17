@@ -48,8 +48,7 @@ def _baseline_config() -> dict:
         "tracking_catalog": "migration_tracking",
         "tracking_schema": "cp_migration",
         "migrate_hive_dbfs_root": False,
-        "hive_dbfs_target_path": "operator-provided-adls-url",
-        "hive_target_catalog": "hive_upgraded",
+        "hive_dbfs_staging_path": "operator-provided-adls-url",
         "iceberg_strategy": "",
         "rls_cm_strategy": "",
     }
@@ -64,7 +63,7 @@ UC_OVERRIDES = dict(
     iceberg_strategy="ddl_replay",
     rls_cm_strategy="staging_copy",
     migrate_hive_dbfs_root=False,
-    hive_dbfs_target_path="",
+    hive_dbfs_staging_path="",
     batch_size_raw="",
     catalog_filter_raw="",
 )
@@ -73,7 +72,7 @@ HIVE_OVERRIDES = dict(
     iceberg_strategy="",
     rls_cm_strategy="",
     migrate_hive_dbfs_root=True,
-    hive_dbfs_target_path="",
+    hive_dbfs_staging_path="",
     batch_size_raw="10",
     catalog_filter_raw="integration_test_src",
 )
@@ -82,7 +81,7 @@ NEG_X31_OVERRIDES = dict(
     iceberg_strategy="",
     rls_cm_strategy="",
     migrate_hive_dbfs_root=False,
-    hive_dbfs_target_path="",
+    hive_dbfs_staging_path="",
     batch_size_raw="",
     catalog_filter_raw="",
     inject_bad_spn_id=True,
@@ -144,14 +143,14 @@ class TestSetupTestConfigSourceGuards:
 class TestSetupTestConfigHelperSourceGuards:
     """Source-level checks on the extracted helper."""
 
-    def test_preserves_existing_hive_dbfs_target_path_when_empty_param(self):
-        """Env-specific fields like hive_dbfs_target_path are operator-
+    def test_preserves_existing_hive_dbfs_staging_path_when_empty_param(self):
+        """Env-specific fields like hive_dbfs_staging_path are operator-
         configured once post-deploy. The helper must only override
         them when the corresponding task param is non-empty, preserving
         the operator's value when the param is the default empty
         string."""
         src = _helper_source_text()
-        assert "if hive_dbfs_target_path:" in src
+        assert "if hive_dbfs_staging_path:" in src
 
     def test_no_legacy_drop_and_restore_residue(self):
         """Path A removed drop_and_restore + the maintenance-window
@@ -212,8 +211,8 @@ class TestApplyIntegrationOverridesBehavior:
         # batch_size + catalog_filter unset in UC workflow → baseline preserved.
         assert cfg["batch_size"] == 50
         assert cfg["catalog_filter"] == ""
-        # hive_dbfs_target_path empty param → baseline operator-value kept.
-        assert cfg["hive_dbfs_target_path"] == "operator-provided-adls-url"
+        # hive_dbfs_staging_path empty param → baseline operator-value kept.
+        assert cfg["hive_dbfs_staging_path"] == "operator-provided-adls-url"
 
     def test_hive_overrides_shape(self):
         cfg = apply_integration_overrides(_baseline_config(), **HIVE_OVERRIDES)
@@ -222,7 +221,7 @@ class TestApplyIntegrationOverridesBehavior:
         assert cfg["migrate_hive_dbfs_root"] is True
         assert cfg["batch_size"] == 10
         assert cfg["catalog_filter"] == ["integration_test_src"]
-        assert cfg["hive_dbfs_target_path"] == "operator-provided-adls-url"
+        assert cfg["hive_dbfs_staging_path"] == "operator-provided-adls-url"
 
     def test_helper_deep_copies_baseline(self):
         """Caller's baseline dict must survive untouched so it can be
@@ -356,7 +355,7 @@ class TestOverrideCycleCleanSlate:
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
-            hive_dbfs_target_path="",
+            hive_dbfs_staging_path="",
             batch_size_raw="",
             catalog_filter_raw="",
             inject_bad_spn_id=True,
@@ -374,7 +373,7 @@ class TestOverrideCycleCleanSlate:
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
-            hive_dbfs_target_path="",
+            hive_dbfs_staging_path="",
             batch_size_raw="",
             catalog_filter_raw="",
             inject_unreachable_target=True,
@@ -396,7 +395,7 @@ class TestOverrideCycleCleanSlate:
             iceberg_strategy="",
             rls_cm_strategy="",
             migrate_hive_dbfs_root=False,
-            hive_dbfs_target_path="",
+            hive_dbfs_staging_path="",
             batch_size_raw="",
             catalog_filter_raw="",
         )

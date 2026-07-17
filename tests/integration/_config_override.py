@@ -37,7 +37,7 @@ def apply_integration_overrides(
     iceberg_strategy: str,
     rls_cm_strategy: str,
     migrate_hive_dbfs_root: bool,
-    hive_dbfs_target_path: str,
+    hive_dbfs_staging_path: str,
     batch_size_raw: str,
     catalog_filter_raw: str,
     lfc_target_connection_name_raw: str = "",
@@ -56,9 +56,9 @@ def apply_integration_overrides(
     cfg["iceberg_strategy"] = iceberg_strategy
     cfg["rls_cm_strategy"] = rls_cm_strategy
     cfg["migrate_hive_dbfs_root"] = migrate_hive_dbfs_root
-    if hive_dbfs_target_path:
-        cfg["hive_dbfs_target_path"] = hive_dbfs_target_path
-    # If hive_dbfs_target_path is not provided, leave the existing
+    if hive_dbfs_staging_path:
+        cfg["hive_dbfs_staging_path"] = hive_dbfs_staging_path
+    # If hive_dbfs_staging_path is not provided, leave the existing
     # operator-configured value in place.
     if batch_size_raw:
         try:

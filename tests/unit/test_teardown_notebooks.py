@@ -64,20 +64,23 @@ class TestTeardownUcTargetCleanup:
 
 
 class TestTeardownHiveTargetCleanup:
-    """teardown_hive must drop the hive_target_catalog on both sides."""
+    """teardown_hive must drop the migrated target hive_metastore test
+    database on both sides — like-for-like migration lands Hive objects
+    back into hive_metastore, so no UC catalog is created anymore."""
 
     def test_drops_source_database(self):
         src = _teardown_hive_text()
         assert "DROP DATABASE IF EXISTS hive_metastore.integration_test_hive CASCADE" in src
 
-    def test_drops_target_hive_target_catalog(self):
-        """hive_upgraded (or whatever hive_target_catalog is) must be
-        dropped on target, not just the source database."""
-        src = _teardown_hive_text()
-        # The catalog name comes from config.hive_target_catalog — the
-        # f-string pattern is what we're locking in.
-        assert "config.hive_target_catalog" in src
-        assert "DROP CATALOG" in src
+    def test_teardown_hive_drops_target_hive_metastore_database(self):
+        import pathlib
+
+        src = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "tests" / "integration" / "teardown_hive.py"
+        ).read_text()
+        assert "DROP DATABASE IF EXISTS `hive_metastore`" in src
+        assert "hive_target_catalog" not in src
 
     def test_uses_execute_and_poll_for_target(self):
         src = _teardown_hive_text()

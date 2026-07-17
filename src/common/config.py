@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -53,6 +54,30 @@ def _coerce_bool(raw: object) -> bool:
     if raw is None:
         return False
     return str(raw).strip().lower() in ("true", "1", "yes")
+
+
+def _coerce_hive_staging_path(raw: dict) -> str:
+    """Resolve the shared abfss staging path for the DBFS-root two-hop copy.
+
+    Prefers the current ``hive_dbfs_staging_path`` key. Falls back to the
+    deprecated ``hive_dbfs_target_path`` (the old UC-rehome key) with a
+    DeprecationWarning so existing config.yaml files keep working through the
+    like-for-like rename. Returns "" when neither is set.
+    """
+    new = raw.get("hive_dbfs_staging_path")
+    if new:
+        return str(new)
+    old = raw.get("hive_dbfs_target_path")
+    if old:
+        warnings.warn(
+            "hive_dbfs_target_path is deprecated; rename it to "
+            "hive_dbfs_staging_path (shared abfss staging for the DBFS-root "
+            "two-hop copy). The old key is still honoured for now.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return str(old)
+    return ""
 
 
 _COLLISION_POLICIES = ("fail", "skip")
@@ -203,8 +228,7 @@ class MigrationConfig:
     # Hive (Phase 2) — unused in Phase 1 notebooks but fields exist so the
     # dataclass matches the full config file schema.
     migrate_hive_dbfs_root: bool = False
-    hive_dbfs_target_path: str = ""
-    hive_target_catalog: str = "hive_upgraded"
+    hive_dbfs_staging_path: str = ""
     # Online Tables → Lakebase synced table migration (migrate_online_tables).
     # The job creates this Lakebase database instance if it does not exist.
     lakebase_instance_name: str = "cp-migration-lakebase"
@@ -290,8 +314,7 @@ class MigrationConfig:
             lfc_target_connection_name=str(raw.get("lfc_target_connection_name", "")),
             lfc_saas_cursor_columns=_coerce_cursor_columns(raw.get("lfc_saas_cursor_columns")),
             migrate_hive_dbfs_root=_coerce_bool(raw.get("migrate_hive_dbfs_root")),
-            hive_dbfs_target_path=str(raw.get("hive_dbfs_target_path", "")),
-            hive_target_catalog=str(raw.get("hive_target_catalog", "hive_upgraded")),
+            hive_dbfs_staging_path=_coerce_hive_staging_path(raw),
             lakebase_instance_name=str(raw.get("lakebase_instance_name", "cp-migration-lakebase")),
             lakebase_logical_database=str(raw.get("lakebase_logical_database", "databricks_postgres")),
             lakebase_capacity=str(raw.get("lakebase_capacity", "CU_1")),

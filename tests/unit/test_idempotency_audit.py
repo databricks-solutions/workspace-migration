@@ -931,7 +931,9 @@ class TestHiveExternalIdempotency:
     @patch("migrate.hive_external_worker.warehouse_table_count")
     @patch("migrate.hive_external_worker.time")
     @patch("migrate.hive_external_worker.execute_and_poll")
-    def test_uses_if_not_exists_and_rewrites_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
+    def test_uses_if_not_exists_and_keeps_namespace(self, mock_exec, mock_time, mock_wh_count, mock_append):
+        """Like-for-like migration: rewrite_hive_namespace is identity,
+        so hive_metastore references pass through unchanged."""
         from migrate.hive_external_worker import migrate_hive_external_table
 
         mock_time.time.side_effect = [100.0, 101.0]
@@ -958,9 +960,8 @@ class TestHiveExternalIdempotency:
         # target count are routed through the patched warehouse helpers).
         sql = mock_exec.call_args[0][2]
         assert "CREATE TABLE IF NOT EXISTS" in sql
-        # Namespace rewrite: hive_metastore -> uc_hive
-        assert "`uc_hive`" in sql
-        assert "`hive_metastore`" not in sql
+        # Like-for-like: hive_metastore references unchanged
+        assert "`hive_metastore`.`db`.`t`" in sql
         assert res["status"] == "validated"
 
 
@@ -1009,19 +1010,22 @@ class TestHiveFunctionsIdempotency:
 
 
 class TestHiveManagedDbfsIdempotency:
+    @patch("migrate.hive_managed_dbfs_worker.warehouse_table_count")
     @patch("migrate.hive_managed_dbfs_worker.time")
     @patch("migrate.hive_managed_dbfs_worker.execute_and_poll")
-    def test_overwrite_then_register_with_if_not_exists(self, mock_exec, mock_time):
-        """Pin: DBFS managed path uses mode('overwrite') for data and IF NOT EXISTS for registration."""
+    def test_stage_overwrite_then_create_or_replace(self, mock_exec, mock_time, mock_wh_count):
+        """Pin: the two-hop DBFS managed path is re-runnable — STAGE 1 stages the
+        data with mode('overwrite') and STAGE 2 lands the target managed table via
+        CREATE OR REPLACE (not a bare CREATE that would fail on re-run)."""
         from migrate.hive_managed_dbfs_worker import migrate_hive_managed_dbfs
 
         mock_time.time.side_effect = [100.0, 101.0]
         mock_exec.return_value = _ok()
+        mock_wh_count.return_value = 5
         config = MagicMock()
         config.dry_run = False
         config.migrate_hive_dbfs_root = True
-        config.hive_dbfs_target_path = "abfss://x@y/hive_dbfs"
-        config.hive_target_catalog = "uc_hive"
+        config.hive_dbfs_staging_path = "abfss://stage@acct.dfs.core.windows.net/hive_stage"
         spark = MagicMock()
         df = MagicMock()
         df.count.return_value = 5
@@ -1031,11 +1035,11 @@ class TestHiveManagedDbfsIdempotency:
             config=config, auth=MagicMock(), tracker=MagicMock(),
             spark=spark, wh_id="wh",
         )
-        # Data write was overwrite
+        # STAGE 1: staging write was overwrite (re-runnable stage)
         df.write.mode.assert_called_with("overwrite")
-        # Registration is CREATE TABLE IF NOT EXISTS
+        # STAGE 2: target CTAS is CREATE OR REPLACE (re-runnable registration)
         sql = mock_exec.call_args[0][2]
-        assert "CREATE TABLE IF NOT EXISTS" in sql
+        assert "CREATE OR REPLACE TABLE" in sql
         assert res["status"] == "validated"
 
     def test_opt_out_yields_skipped_by_config(self):

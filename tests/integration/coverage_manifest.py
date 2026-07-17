@@ -84,13 +84,12 @@ COVERAGE_EXEMPT: dict[str, str] = {
 }
 
 # Migrate jobs that must have an idempotency re-run leg (findings #8/#12/#20).
-RERUN_COVERED_JOBS: frozenset[str] = frozenset()
+RERUN_COVERED_JOBS: frozenset[str] = frozenset({"migrate_hive"})
 RERUN_JOBS_IN_SCOPE: frozenset[str] = frozenset(
     {"discovery", "migrate_uc", "migrate_hive", "migrate_governance"}
 )
 RERUN_EXEMPT: dict[str, str] = {
     "discovery": "pending #8 re-run leg (dedup MERGE fixed in code; live re-run assert pending)",
     "migrate_uc": "pending #20 re-run leg (setup_sharing idempotency)",
-    "migrate_hive": "pending #12 re-run leg (hive taxonomy/idempotency)",
     "migrate_governance": "pending re-run leg",
 }

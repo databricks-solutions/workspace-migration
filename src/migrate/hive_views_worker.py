@@ -17,9 +17,9 @@ except NameError:
     pass  # not running under a Databricks notebook (e.g. pytest)
 
 # COMMAND ----------
-# Hive Views Worker: replays Hive view DDLs on the target UC catalog,
-# rewriting `hive_metastore.` references to the configured target catalog
-# and processing views in dependency order via a topological sort.
+# Hive Views Worker: replays Hive view DDLs into `hive_metastore` unchanged
+# (like-for-like migration — no namespace rewrite), processing views in
+# dependency order via a topological sort.
 
 import json
 import logging
@@ -30,7 +30,6 @@ from common.auth import AuthManager
 from common.config import MigrationConfig
 from common.sql_utils import execute_and_poll, find_warehouse, rewrite_ddl
 from common.tracking import TrackingManager
-from migrate.hive_common import rewrite_hive_namespace
 from migrate.reconciliation import resolve_current_job_run_id
 
 logging.basicConfig(level=logging.INFO)
@@ -104,11 +103,11 @@ def migrate_hive_view(
     auth: AuthManager,
     wh_id: str,
 ) -> dict:
-    """Rewrite and replay a single Hive view DDL on the target catalog."""
+    """Replay a single Hive view DDL into `hive_metastore` unchanged."""
     obj_name = view_info["object_name"]
     start = time.time()
 
-    rewritten = rewrite_hive_namespace(ddl, config.hive_target_catalog)
+    rewritten = ddl  # like-for-like: replay view DDL into hive_metastore as-is
     rewritten = rewrite_ddl(rewritten, r"CREATE\s+VIEW\b", "CREATE OR REPLACE VIEW")
 
     if config.dry_run:
@@ -167,10 +166,9 @@ def run(dbutils, spark) -> None:
     wh_id = find_warehouse(auth)
 
     # Step 1: fetch DDLs for all views.
-    # For Hive views, SHOW CREATE TABLE can emit DDL that survives a naive
-    # namespace rewrite poorly (empty catalog after rewrite, inner refs that
-    # resolve to the wrong catalog on target). Build the DDL ourselves from
-    # DESCRIBE EXTENDED's `View Text` field and a fully-qualified target header.
+    # SHOW CREATE TABLE's output for Hive views is not reliably replayable
+    # as-is, so we build the DDL ourselves from DESCRIBE EXTENDED's
+    # `View Text` field and a fully-qualified `hive_metastore` header.
     def _fetch_view_body(source_fqn: str) -> str:
         rows = spark.sql(f"DESCRIBE EXTENDED {source_fqn}").collect()
         body = None
@@ -194,7 +192,7 @@ def run(dbutils, spark) -> None:
             body = _fetch_view_body(source_fqn)
             # Target-side fully-qualified header
             parts = source_fqn.strip("`").split("`.`")
-            target_fqn = f"`{config.hive_target_catalog}`.`{parts[1]}`.`{parts[2]}`"
+            target_fqn = f"`hive_metastore`.`{parts[1]}`.`{parts[2]}`"
             ddls[source_fqn] = f"CREATE OR REPLACE VIEW {target_fqn} AS {body}"
         except Exception as exc:  # noqa: BLE001
             logger.warning("Could not get DDL for %s: %s", source_fqn, exc, exc_info=True)

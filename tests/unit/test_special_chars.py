@@ -420,25 +420,25 @@ class TestRewriteDdlOnSpecialChars:
 
 
 class TestRewriteHiveNamespaceSpecialChars:
-    """``rewrite_hive_namespace`` rewrites ``hive_metastore.`` references
-    to ``<target_catalog>.``. The body may reference objects with
-    special-char names and those names must pass through untouched."""
+    """Like-for-like migration: ``rewrite_hive_namespace`` and
+    ``rewrite_hive_fqn`` are identity functions. The body may reference
+    objects with special-char names and those names must pass through untouched."""
 
     @pytest.mark.parametrize("name", SPECIAL_NAMES)
     def test_rewrite_preserves_special_char_names_in_body(self, name):
         sql = f"SELECT * FROM `hive_metastore`.`sch`.`{name}`"
-        out = rewrite_hive_namespace(sql, "hive_upgraded")
-        assert out == f"SELECT * FROM `hive_upgraded`.`sch`.`{name}`"
+        out = rewrite_hive_namespace(sql)
+        assert out == sql
 
     def test_rewrite_fqn_preserves_special_chars(self):
         fqn = "`hive_metastore`.`sch`.`my-table`"
-        out = rewrite_hive_fqn(fqn, "target_cat")
-        assert out == "`target_cat`.`sch`.`my-table`"
+        out = rewrite_hive_fqn(fqn)
+        assert out == fqn
 
     def test_rewrite_fqn_preserves_unicode(self):
         fqn = "`hive_metastore`.`sch`.`日本語`"
-        out = rewrite_hive_fqn(fqn, "target_cat")
-        assert out == "`target_cat`.`sch`.`日本語`"
+        out = rewrite_hive_fqn(fqn)
+        assert out == fqn
 
 
 # ---------------------------------------------------------------------------

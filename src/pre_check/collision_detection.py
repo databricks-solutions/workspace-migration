@@ -25,8 +25,8 @@ Supported object types (UC core):
     - ``volume``
 
 Hive-target collisions are covered too: a Hive source table lands on
-target as ``<hive_target_catalog>.<db>.<table>``, and that three-part FQN
-is checked via ``tables.get``.
+target in ``hive_metastore`` under the same db/table names (like-for-like),
+and that three-part FQN is checked via ``tables.get``.
 
 Phase 3 governance objects (shares, recipients, monitors, models,
 connections, foreign catalogs, online tables) are intentionally out of
@@ -191,8 +191,8 @@ _NOT_PROBED_TYPES: dict[str, str] = {
 }
 
 
-# Hive source object types land on target as UC tables/views under
-# ``hive_target_catalog`` — probe them via ``tables.get`` too.
+# Hive source object types land on target in hive_metastore under the same
+# names (like-for-like) — probe them via ``tables.get`` too.
 _HIVE_PROBES: dict[str, Callable[[WorkspaceClient, str], bool]] = {
     "hive_table": _table_exists,
     "hive_view": _table_exists,
@@ -210,16 +210,10 @@ def _normalize_full_name(fqn: str) -> str:
     return ".".join(parts)
 
 
-def _rewrite_hive_fqn(fqn: str, hive_target_catalog: str) -> str:
-    """Map a ``hive_metastore.db.t`` FQN to its target UC FQN.
-
-    Mirrors ``migrate.hive_common.rewrite_hive_namespace`` — we can't
-    import that here without pulling the full migrate package into
-    pre_check's dependency tree. Keep this tiny local copy in lockstep.
-    """
+def _hive_target_fqn(fqn: str) -> str:
+    """Like-for-like: the target FQN is the same hive_metastore.db.t as the
+    source (dotted form for the UC SDK ``*.get`` endpoints)."""
     parts = _fqn_to_parts(fqn)
-    if len(parts) == 3 and parts[0] == "hive_metastore":
-        return f"{hive_target_catalog}.{parts[1]}.{parts[2]}"
     return ".".join(parts)
 
 
@@ -237,7 +231,6 @@ def detect_collisions(
     target_client: WorkspaceClient,
     discovery_rows: list[dict],
     existing_status_keys: set[tuple[str, str]],
-    hive_target_catalog: str = "hive_upgraded",
 ) -> list[dict]:
     """Return collision records for every source object already on target.
 
@@ -266,8 +259,6 @@ def detect_collisions(
             least previously marked by us) so we skip the collision probe
             for them — that's what makes collision detection additive to
             X.2's idempotency guarantees.
-        hive_target_catalog: config value used to map
-            ``hive_metastore.db.t`` source FQNs to their target UC FQN.
     """
     collisions: list[dict] = []
     for row in discovery_rows:
@@ -285,7 +276,7 @@ def detect_collisions(
             probe = _HIVE_PROBES.get(object_type)
             if probe is None:
                 continue
-            target_fqn = _rewrite_hive_fqn(object_name, hive_target_catalog)
+            target_fqn = _hive_target_fqn(object_name)
         else:
             probe = _PROBES.get(object_type)
             if probe is None:

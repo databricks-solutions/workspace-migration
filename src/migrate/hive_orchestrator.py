@@ -18,8 +18,8 @@ except NameError:
 
 # COMMAND ----------
 # Hive Orchestrator: read discovery_inventory (source_type='hive'), emit per-category batches
-# as task values for downstream workers. Also sets up the target catalog
-# (hive_target_catalog) so workers don't race to CREATE CATALOG.
+# as task values for downstream workers. Also ensures target databases exist in
+# hive_metastore so workers don't race to CREATE DATABASE.
 
 import json
 import logging
@@ -54,44 +54,49 @@ if _is_notebook():
     completed_fqn = f"{config.tracking_catalog}.{config.tracking_schema}.migration_status"
 
     # Subtract already-validated objects from the pending list (idempotent re-runs).
+    #
+    # Finding #12: discovery records hive tables as object_type='hive_table',
+    # but the workers record their migration status under the CLASSIFIED type
+    # ('hive_external' / 'hive_managed_nondbfs' / 'hive_managed_dbfs_root').
+    # Matching the anti-join on object_type therefore NEVER subtracts an
+    # already-migrated hive table, so every re-run re-creates it → the target
+    # external table's ADLS path collides (LOCATION_OVERLAP). Both sides share
+    # the same object_name (the source hive FQN), and hive object_names are
+    # namespace-unique (`hive_metastore`.<db>.<name>), so match on object_name
+    # ALONE. (hive_view / hive_function already share the type on both sides;
+    # object-name matching is still correct for them.)
     _pending_sql = f"""
         SELECT i.object_name, i.object_type, i.catalog_name, i.schema_name,
                i.data_category, i.table_type, i.provider, i.storage_location
         FROM {inv_fqn} i
         LEFT ANTI JOIN (
-          SELECT object_name, object_type
+          SELECT object_name
           FROM (
-            SELECT object_name, object_type, status,
-              ROW_NUMBER() OVER (PARTITION BY object_name, object_type ORDER BY migrated_at DESC) AS rn
+            SELECT object_name, status,
+              ROW_NUMBER() OVER (PARTITION BY object_name ORDER BY migrated_at DESC) AS rn
             FROM {completed_fqn}
           ) WHERE rn = 1 AND status = 'validated'
         ) c
-          ON i.object_name = c.object_name AND i.object_type = c.object_type
+          ON i.object_name = c.object_name
         WHERE i.source_type = 'hive'
     """
     inventory_rows = spark.sql(_pending_sql).collect()  # noqa: F821
 
-    # Create the target catalog + schemas on the TARGET workspace via its SQL
-    # warehouse (not on source's spark, which would create them in the wrong
-    # metastore). Downstream workers just need the objects to exist on target.
+    # Ensure the target DATABASES exist on the TARGET workspace's hive_metastore
+    # via its SQL warehouse (not source spark, which would create them in the
+    # wrong metastore). Like-for-like: no UC catalog is created.
     auth = AuthManager(config, dbutils)  # type: ignore[name-defined] # noqa: F821
     wh_id = find_warehouse(auth)
     target_schemas = {r.schema_name for r in inventory_rows if r.schema_name}
 
-    cat_sql = f"CREATE CATALOG IF NOT EXISTS `{config.hive_target_catalog}`"
-    res = execute_and_poll(auth, wh_id, cat_sql)
-    if res["state"] != "SUCCEEDED":
-        raise RuntimeError(f"Failed to create target catalog: {res.get('error')}")
-
     for sch in target_schemas:
-        sch_sql = f"CREATE SCHEMA IF NOT EXISTS `{config.hive_target_catalog}`.`{sch}`"
-        res = execute_and_poll(auth, wh_id, sch_sql)
+        db_sql = f"CREATE DATABASE IF NOT EXISTS `hive_metastore`.`{sch}`"
+        res = execute_and_poll(auth, wh_id, db_sql)
         if res["state"] != "SUCCEEDED":
-            raise RuntimeError(f"Failed to create target schema {sch}: {res.get('error')}")
+            raise RuntimeError(f"Failed to create target database {sch}: {res.get('error')}")
 
     logger.info(
-        "Target catalog '%s' ready on target with %d schema(s).",
-        config.hive_target_catalog,
+        "Target hive_metastore ready with %d database(s).",
         len(target_schemas),
     )
 

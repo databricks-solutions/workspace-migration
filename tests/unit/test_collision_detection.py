@@ -283,67 +283,31 @@ class TestCollisionProbesRoute:
         client.volumes.read.assert_called_once_with(name="c.s.v")
 
 
-class TestCollisionHiveRewrite:
-    """Hive source objects land on target under ``hive_target_catalog`` —
-    detection must probe the rewritten target FQN, not the source one."""
+class TestHiveCollisionsLikeForLike:
+    """Hive source objects land on target in hive_metastore under the SAME
+    db/table names — collision probing targets hive_metastore.<db>.<t>."""
 
-    def test_hive_table_rewritten_to_target_catalog(self):
-        client = _found_client()
-        rows = [
-            {
-                "object_name": "`hive_metastore`.`sales`.`t`",
-                "object_type": "hive_table",
-                "source_type": "hive",
-            }
-        ]
-        out = detect_collisions(
+    def test_hive_table_probed_in_hive_metastore(self):
+        client = MagicMock()
+        # tables.get succeeds -> the object already exists on target
+        client.tables.get.return_value = object()
+        rows = [{
+            "object_name": "`hive_metastore`.`db`.`t`",
+            "object_type": "hive_table",
+            "source_type": "hive",
+        }]
+        collisions = detect_collisions(
             target_client=client,
             discovery_rows=rows,
             existing_status_keys=set(),
-            hive_target_catalog="hive_upgraded",
         )
-        assert len(out) == 1
-        # Source FQN is preserved; target FQN is rewritten under the
-        # configured upgrade catalog.
-        assert out[0]["target_fqn"] == "hive_upgraded.sales.t"
-        client.tables.get.assert_called_once_with(full_name="hive_upgraded.sales.t")
+        assert len(collisions) == 1
+        assert collisions[0]["target_fqn"] == "hive_metastore.db.t"
 
-    def test_hive_view_rewritten_to_target_catalog(self):
-        client = _found_client()
-        rows = [
-            {
-                "object_name": "`hive_metastore`.`sales`.`v`",
-                "object_type": "hive_view",
-                "source_type": "hive",
-            }
-        ]
-        out = detect_collisions(
-            target_client=client,
-            discovery_rows=rows,
-            existing_status_keys=set(),
-            hive_target_catalog="custom_hive_target",
-        )
-        assert len(out) == 1
-        assert out[0]["target_fqn"] == "custom_hive_target.sales.v"
-
-    def test_hive_function_rewritten_and_probed_via_functions_get(self):
-        client = _found_client()
-        rows = [
-            {
-                "object_name": "`hive_metastore`.`sales`.`fn`",
-                "object_type": "hive_function",
-                "source_type": "hive",
-            }
-        ]
-        out = detect_collisions(
-            target_client=client,
-            discovery_rows=rows,
-            existing_status_keys=set(),
-            hive_target_catalog="hive_upgraded",
-        )
-        assert len(out) == 1
-        assert out[0]["target_fqn"] == "hive_upgraded.sales.fn"
-        client.functions.get.assert_called_once_with(name="hive_upgraded.sales.fn")
+    def test_detect_collisions_rejects_hive_target_catalog_kwarg(self):
+        import inspect
+        sig = inspect.signature(detect_collisions)
+        assert "hive_target_catalog" not in sig.parameters
 
 
 class TestCollisionUnsupportedTypes:
