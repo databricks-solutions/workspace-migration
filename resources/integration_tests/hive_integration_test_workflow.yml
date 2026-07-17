@@ -39,17 +39,17 @@ resources:
             notebook_path: ../../tests/integration/setup_test_config.py
             # Hive integration test: DBFS-root migration on. iceberg_strategy
             # stays empty — no Iceberg fixture on the Hive side.
-            # hive_dbfs_target_path comes from the ``hive_test_dbfs_target_path``
+            # hive_dbfs_staging_path comes from the ``hive_test_dbfs_staging_path``
             # bundle var (default "") so no env-specific ADLS URL is baked into
             # the repo. Set it at run time to exercise the DBFS-root migration
             # leg, e.g.:
             #   databricks bundle run hive_integration_test -t dev \
-            #     --var hive_test_dbfs_target_path=abfss://<container>@<acct>.dfs.core.windows.net/<path>
+            #     --var hive_test_dbfs_staging_path=abfss://<container>@<acct>.dfs.core.windows.net/<path>
             base_parameters:
               iceberg_strategy: ""
               rls_cm_strategy: ""
               migrate_hive_dbfs_root: "true"
-              hive_dbfs_target_path: ${var.hive_test_dbfs_target_path}
+              hive_dbfs_staging_path: ${var.hive_test_dbfs_staging_path}
               # batch_size=10 with 12 batch_tbl_* fixtures still forces
               # the orchestrator to emit multiple DBFS-root batches
               # (integration item 2.14). The orchestrator also self-

@@ -493,9 +493,9 @@ class TestWorkflowOverrideContractsMatchYaml:
         # under H8 (fail-loud cross-catalog discovery). Hive migrates all
         # discovered catalogs now.
         assert "catalog_filter" not in params
-        # hive_dbfs_target_path is driven by a bundle var so the path can vary
+        # hive_dbfs_staging_path is driven by a bundle var so the path can vary
         # per target workspace without editing the workflow.
-        assert params.get("hive_dbfs_target_path") == "${var.hive_test_dbfs_target_path}"
+        assert params.get("hive_dbfs_staging_path") == "${var.hive_test_dbfs_staging_path}"
         # Path A removed the maintenance-window consent flag.
         assert "rls_cm_maintenance_window_confirmed" not in params
 

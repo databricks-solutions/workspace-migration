@@ -19,15 +19,14 @@
 #   iceberg_strategy         — "" or "ddl_replay"
 #   rls_cm_strategy          — "" (skip) or "staging_copy".
 #   migrate_hive_dbfs_root   — "true" / "false"
-#   hive_dbfs_target_path    — ADLS URL for Hive DBFS-root migration; may
-#                              be empty when ``migrate_hive_dbfs_root`` is
-#                              false. Typically provided by an operator-
-#                              set BUNDLE_VAR or left at the workspace
-#                              config.yaml's value for subsequent reads.
-#                              Written into config.yaml under the current
-#                              ``hive_dbfs_staging_path`` key (the task
-#                              parameter name itself is unchanged so the
-#                              existing workflow YAML wiring keeps working).
+#   hive_dbfs_staging_path   — shared abfss:// staging path for the Hive
+#                              DBFS-root two-hop copy; may be empty when
+#                              ``migrate_hive_dbfs_root`` is false. Supplied by
+#                              the ``hive_test_dbfs_staging_path`` bundle var
+#                              (default ""); when empty the operator's existing
+#                              config.yaml value is preserved. Written into
+#                              config.yaml under the ``hive_dbfs_staging_path``
+#                              key.
 #   batch_size               — integer ≥ 1 overriding batch_size in
 #                              config.yaml. Empty → leave existing value.
 #                              Hive integration passes "10" so its 12-
@@ -114,7 +113,7 @@ else:
 dbutils.widgets.text("iceberg_strategy", "")  # noqa: F821
 dbutils.widgets.text("rls_cm_strategy", "")  # noqa: F821
 dbutils.widgets.text("migrate_hive_dbfs_root", "false")  # noqa: F821
-dbutils.widgets.text("hive_dbfs_target_path", "")  # noqa: F821
+dbutils.widgets.text("hive_dbfs_staging_path", "")  # noqa: F821
 dbutils.widgets.text("batch_size", "")  # noqa: F821
 dbutils.widgets.text("catalog_filter", "")  # noqa: F821
 dbutils.widgets.text("lfc_target_connection_name", "")  # noqa: F821
@@ -136,7 +135,7 @@ def _get_str(key: str, default: str = "") -> str:
 iceberg_strategy = _get_str("iceberg_strategy", "")
 rls_cm_strategy = _get_str("rls_cm_strategy", "")
 migrate_hive_dbfs_root = _get_bool("migrate_hive_dbfs_root", "false")
-hive_dbfs_target_path = _get_str("hive_dbfs_target_path", "")
+hive_dbfs_staging_path = _get_str("hive_dbfs_staging_path", "")
 batch_size_raw = _get_str("batch_size", "")
 catalog_filter_raw = _get_str("catalog_filter", "")
 lfc_target_connection_name_raw = _get_str("lfc_target_connection_name", "")
@@ -164,7 +163,7 @@ cfg = apply_integration_overrides(
     iceberg_strategy=iceberg_strategy,
     rls_cm_strategy=rls_cm_strategy,
     migrate_hive_dbfs_root=migrate_hive_dbfs_root,
-    hive_dbfs_staging_path=hive_dbfs_target_path,
+    hive_dbfs_staging_path=hive_dbfs_staging_path,
     batch_size_raw=batch_size_raw,
     catalog_filter_raw=catalog_filter_raw,
     lfc_target_connection_name_raw=lfc_target_connection_name_raw,
