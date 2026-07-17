@@ -24,7 +24,10 @@ migrations, account consolidations, or moving between Azure regions.
 
 **Legacy Hive Metastore** (standalone `migrate_hive` job, run only when needed)
 - Databases, managed + external tables, views, functions, grants
-- Managed tables migrated into a UC target catalog (`hive_target_catalog`)
+- Migrated **like-for-like** into the target workspace's own `hive_metastore`
+  (same database/table names, same storage) — not upgraded into a UC catalog.
+  DBFS-root managed tables move via a two-hop shared staging path into the
+  target's own DBFS root (gated on `migrate_hive_dbfs_root`)
 
 **Stateful services** (optional standalone jobs — run as needed)
 - **Vector Search** (`migrate_vector_search`) — Delta Sync indexes recreated +
@@ -91,9 +94,11 @@ operators must supply them for every deploy:
 | `dashboard_warehouse_name` | Name of the SQL warehouse the dashboard reads from (resolved to an ID via lookup). Defaults to `cp-migration` — override if your warehouse has a different name | `--var dashboard_warehouse_name=<name>` or env `BUNDLE_VAR_dashboard_warehouse_name` |
 
 The SPN needs: workspace admin on source + target, metastore-level
-`CREATE_*` privileges, `USE_PROVIDER` on target, and
-`READ_FILES`/`WRITE_FILES`/`CREATE_EXTERNAL_TABLE` on any external
-location used for Hive DBFS-root migration.
+`CREATE_*` privileges, and `USE_PROVIDER` on target. For the Hive path it
+also needs legacy `hive_metastore` `CREATE` on target (create databases +
+tables), target DBFS root enabled + write access, and read/write on the
+shared `hive_dbfs_staging_path` container — see the Hive section in
+[docs/user_guide.md](docs/user_guide.md) for the full list.
 
 #### Terraform / CLI compatibility note
 
@@ -126,9 +131,8 @@ databricks bundle deploy -t dev
 | `iceberg_strategy` | no | `""` | `""` skips Iceberg managed tables (marking `skipped_by_config`). `"ddl_replay"` opts into the Option A path — rebuild schema + re-ingest via `cp_migration_share`. Loses snapshot history / time travel / branches + tags. |
 | `rls_cm_strategy` | no | `""` | Managed tables carrying legacy row filter / column mask. `""` skips them (marking `skipped_by_rls_cm_policy`). `"staging_copy"` CTAS-copies each affected table into `<tracking_catalog>.cp_migration_staging`, shares the staging copy, DEEP CLONEs on target, then drops the staging copy. Source RLS/CM is never mutated. Requires the migration SPN to be a workspace admin and every active filter/mask to contain an admin-bypass call (`pre_check` enforces both). |
 | `on_target_collision` | no | `"fail"` | What to do when a discovered source object has the same FQN as an object already on target AND no `migration_status` row says the tool created it. `"fail"` (default) — pre_check emits a FAIL `check_target_collisions` row and the migrate workflow refuses to start; operator must rename / drop the colliding object and rerun pre_check. `"skip"` — pre_check emits a WARN row and seeds `skipped_target_exists` migration_status rows; workers skip those objects on the next migrate run (target copy left untouched). See [docs/reference/idempotency_audit.md](docs/reference/idempotency_audit.md#collision-handling-x4). |
-| `migrate_hive_dbfs_root` | no | `false` | Enables `hive_managed_dbfs_worker` — copies DBFS-root bytes to `hive_dbfs_target_path` and registers the target table as EXTERNAL |
-| `hive_dbfs_target_path` | conditional | `""` | ADLS/S3/GCS path where DBFS-root bytes land on target. Required when `migrate_hive_dbfs_root=true`. The SPN needs `READ_FILES`/`WRITE_FILES`/`CREATE_EXTERNAL_TABLE` on the external location that owns this path. |
-| `hive_target_catalog` | no | `hive_upgraded` | Target catalog name for Hive-to-UC migration. Created during migrate if missing. |
+| `migrate_hive_dbfs_root` | no | `false` | Enables `hive_managed_dbfs_worker` — two-hop staging copy of a DBFS-root managed table into the target's own DBFS root (stays **managed** in `hive_metastore`, like-for-like) |
+| `hive_dbfs_staging_path` | conditional | `""` | Shared `abfss://` staging path both workspaces can reach, used by the DBFS-root two-hop copy. Required when `migrate_hive_dbfs_root=true`. The SPN needs read/write on the container; the target also needs DBFS root enabled. (The deprecated `hive_dbfs_target_path` is still accepted as an alias with a warning.) |
 | `overwrite_existing` | no | `false` | When `true`, workers replace an existing target object instead of skipping it. Leave `false` for the safe idempotent default (paired with `on_target_collision`). |
 | `transfer_ownership` | no | `true` | When `true`, grants workers transfer object ownership to match source. Set `false` to leave target ownership as-created. |
 
@@ -141,7 +145,7 @@ databricks bundle deploy -t dev
    - `spn_client_id` + `spn_secret_scope`/`spn_secret_key` (OAuth service
      principal with access to both workspaces)
    - optional: `catalog_filter`, `schema_filter`, `iceberg_strategy`,
-     `migrate_hive_dbfs_root`, `hive_dbfs_target_path`,
+     `migrate_hive_dbfs_root`, `hive_dbfs_staging_path`,
      `overwrite_existing` (default false), `transfer_ownership` (default true)
 3. `databricks bundle deploy -t dev --var migration_spn_id=<your-app-id>`
    (optionally `--var migration_admin_group=<your-admin-group>` to scope job
@@ -218,9 +222,9 @@ environment-specific fields **once** after deploy.
 2. Edit `${workspace.file_path}/config.yaml` with the environment-specific
    fields once:
    - Real workspace URLs, SPN app ID, secret scope/key
-   - `hive_dbfs_target_path: abfss://<container>@<account>.dfs.core.windows.net/<path>`
-     (the SPN needs `READ_FILES` + `WRITE_FILES` +
-     `CREATE_EXTERNAL_TABLE` on the corresponding external location)
+   - `hive_dbfs_staging_path: abfss://<container>@<account>.dfs.core.windows.net/<path>`
+     (a shared staging container both workspaces can reach; the SPN needs
+     read/write on it, and the target workspace needs DBFS root enabled)
 3. Trigger `uc_integration_test` — the first task (`setup_test_config`)
    rewrites the workspace config.yaml with UC-appropriate behavioural
    settings (`iceberg_strategy=ddl_replay`), runs
@@ -229,7 +233,7 @@ environment-specific fields **once** after deploy.
 4. Trigger `hive_integration_test` — same pattern, with Hive-appropriate
    settings (`migrate_hive_dbfs_root=true`, `iceberg_strategy=""`),
    running seed → pre_check → discovery → `migrate_hive` → test. Your
-   operator-set `hive_dbfs_target_path` from step 2 is preserved —
+   operator-set `hive_dbfs_staging_path` from step 2 is preserved —
    workflows don't overwrite env-specific paths, only the behavioural
    settings.
 5. Trigger `governance_integration_test` — exercises the standalone
