@@ -151,10 +151,39 @@ storage). The SPN needs:
   database (create tables).
 - Target **DBFS root enabled** + write access.
 - **Read** on the shared staging container.
-- Storage access to the same cloud paths for external tables (so replayed
-  external tables resolve).
 - Required `/mnt` mounts pre-existing (recreate them first — the tool never
   touches mount credentials; pre_check verifies each required mount exists).
+
+#### Target SQL Warehouse — storage access for `hive_metastore` writes
+
+The Hive workers issue the target-side `CREATE DATABASE` / `CREATE TABLE`
+through the **target SQL warehouse**. Legacy `hive_metastore` tables bypass
+Unity Catalog and access storage directly through the Hadoop filesystem, so the
+target warehouse must be able to reach the relevant cloud storage **itself** —
+UC external locations do NOT cover `hive_metastore` `LOCATION`s. Configure this
+in **Admin Settings → SQL Warehouse Settings → Data Access Configuration** (a
+workspace-level setting that applies to all SQL warehouses):
+
+- **Shared staging container** (`hive_dbfs_staging_path`) — the DBFS-root
+  two-hop reads staged Delta from here via the target warehouse.
+- **External-table ADLS/S3/GCS paths** — any `hive_metastore` **external** table
+  is recreated with its original `LOCATION`, so the warehouse must authenticate
+  to that path.
+
+**The auth mechanism is the customer's choice** — the tool does not require a
+storage account key. Any of these in the warehouse Data Access Configuration
+works, per your security posture:
+- **Azure:** OAuth with a **service principal + client secret**
+  (`fs.azure.account.auth.type…=OAuth`, `…oauth.provider.type`, `…client.id`,
+  `…client.secret`, `…client.endpoint`), **or** a storage **account key**
+  (`spark.hadoop.fs.azure.account.key.<account>.dfs.core.windows.net`).
+- **AWS/GCP:** the equivalent instance-profile / service-account or key-based
+  Hadoop configs.
+
+Without this, external-ADLS tables (and the DBFS-root staging read) fail on the
+target with `Invalid configuration value detected for fs.azure.account.key` (or
+the cloud's equivalent). This is a one-time workspace setup step, independent of
+the migration SPN's UC grants above.
 
 **What changed vs the UC-upgrade path — no longer needs:**
 - `CREATE CATALOG` on the metastore.
@@ -164,7 +193,10 @@ storage). The SPN needs:
   Hive path.
 
 **Now needs:** legacy Hive `CREATE` on target `hive_metastore` + databases,
-target DBFS root enabled + write access, and shared-staging container access.
+target DBFS root enabled + write access, and the **target SQL warehouse's Data
+Access Configuration** set up with storage access (SP/OAuth or account key —
+customer's choice) to the shared-staging container and any external-table
+`LOCATION`s (see the subsection above).
 
 ### 3.5 UC managed tables
 - **Complexity:** MEDIUM–HIGH. Data is in UC-managed storage; the new metastore

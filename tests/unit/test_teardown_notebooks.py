@@ -98,3 +98,35 @@ class TestTeardownHiveTargetCleanup:
         assert "DELETE FROM migration_tracking.cp_migration.migration_status" in src
         assert "DELETE FROM migration_tracking.cp_migration.discovery_inventory" in src
         assert "integration_test_hive" in src
+
+
+def _seed_hive_text() -> str:
+    return (
+        pathlib.Path(__file__).resolve().parents[2] / "tests" / "integration" / "seed_hive_test_data.py"
+    ).read_text()
+
+
+class TestSeedHiveTrackingCleanSlate:
+    """Finding H3: test_hive reads get_latest_migration_status() unscoped by
+    job_run_id, so orphaned rows from a bygone fixture naming (objects this
+    run never re-migrates, and that teardown's ``%integration_test_hive%``
+    delete never matches) linger and poison the coverage assertion. seed_hive
+    must clean-slate ALL hive_* tracking rows at the START of the run so each
+    run's assertions only see its own rows."""
+
+    def test_seed_clears_all_hive_tracking_rows_by_type_at_start(self):
+        src = _seed_hive_text()
+        # Deletes by object_type LIKE 'hive_%' (NOT just the fixture-name
+        # filter teardown uses) so cross-fixture orphans are cleared too.
+        assert "DELETE FROM" in src
+        assert "migration_status" in src
+        assert "object_type LIKE 'hive_%'" in src
+        assert "source_type = 'hive'" in src
+
+    def test_seed_clean_slate_tolerates_missing_tables(self):
+        """Discovery creates the tracking tables AFTER seed, so the first-ever
+        run has no tables yet — the reset must be guarded, not fatal."""
+        src = _seed_hive_text()
+        assert "clean-slate" in src.lower()
+        # Guarded: either a try/except or a non-SUCCEEDED-state skip branch.
+        assert "except" in src

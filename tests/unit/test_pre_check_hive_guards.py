@@ -32,3 +32,58 @@ class TestPreCheckReferencesStagingKey:
         assert "hive_dbfs_target_path" not in src
         assert "check_target_mounts" in src
         assert "check_staging_path_reachable" in src
+
+
+class TestTargetDbfsRootProbeVerdict:
+    """The DBFS-root two-hop creates MANAGED tables in the TARGET's own DBFS
+    root (via ``CREATE DATABASE``/``CREATE TABLE`` in the target hive_metastore).
+    The guard must probe the TARGET — its earlier form wrote via ``dbutils.fs``,
+    which hits the SOURCE (deploy) workspace, giving a false PASS when the
+    target's DBFS root is disabled. ``target_dbfs_root_probe_verdict`` turns a
+    target-warehouse result into a PASS/FAIL decision, keyed off the real
+    DBFS_DISABLED signature the orchestrator hits."""
+
+    def test_succeeded_is_pass(self):
+        from pre_check.pre_check import target_dbfs_root_probe_verdict
+
+        status, _ = target_dbfs_root_probe_verdict({"state": "SUCCEEDED"})
+        assert status == "PASS"
+
+    def test_dbfs_disabled_error_is_fail(self):
+        from pre_check.pre_check import target_dbfs_root_probe_verdict
+
+        res = {
+            "state": "FAILED",
+            "error": "[DBFS_DISABLED] Public DBFS root is disabled. Access is denied "
+            "on path: /user/hive/warehouse/x.db SQLSTATE: 56038",
+        }
+        status, msg = target_dbfs_root_probe_verdict(res)
+        assert status == "FAIL"
+        assert "dbfs" in msg.lower()
+
+    def test_other_failure_is_warn_not_false_pass(self):
+        from pre_check.pre_check import target_dbfs_root_probe_verdict
+
+        # An unrelated failure (e.g. transient warehouse error) must NOT be
+        # reported as PASS — degrade to WARN so it doesn't mask the real state.
+        status, _ = target_dbfs_root_probe_verdict({"state": "FAILED", "error": "boom"})
+        assert status == "WARN"
+
+
+class TestTargetDbfsRootProbesTargetNotSource:
+    def test_check_no_longer_uses_dbutils_fs_for_dbfs_root(self):
+        """Regression for the false-PASS: the guard must NOT probe DBFS-root
+        via dbutils.fs (that runs on the SOURCE/deploy workspace). It must use
+        the target warehouse (execute_and_poll on the target)."""
+        import pathlib
+
+        src = (pathlib.Path(__file__).resolve().parents[2] / "src" / "pre_check" / "pre_check.py").read_text()
+        # Isolate the check_target_dbfs_root block.
+        start = src.index("check_target_dbfs_root")
+        block = src[start : start + 1500]
+        assert "dbutils.fs.put" not in block, (
+            "check_target_dbfs_root must not probe via dbutils.fs (that hits the "
+            "SOURCE workspace) — probe the TARGET via the warehouse."
+        )
+        assert "target_dbfs_root_probe_verdict" in block
+        assert "execute_and_poll" in block
