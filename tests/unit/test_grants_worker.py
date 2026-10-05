@@ -314,3 +314,205 @@ class TestGrantsWorkerSecurableCoverage:
         assert any("GRANT SELECT ON SCHEMA" in s for s in sqls)
         assert any(s == "ALTER SCHEMA `cat`.`sch` OWNER TO `user2`" for s in sqls)
         assert mock_exec.call_count == 2
+
+
+class TestForeignCatalogGrantScope:
+    """Finding #31 — foreign-catalog grants move from migrate_uc to
+    migrate_governance (grant_scope=foreign_catalogs)."""
+
+    _INVENTORY = [
+        MagicMock(catalog_name="cat", schema_name="sch", object_name="`cat`.`sch`.`t`", object_type="managed_table"),
+        MagicMock(catalog_name="fc", schema_name=None, object_name="fc", object_type="foreign_catalog"),
+        # a comment row on the foreign catalog must not pull it into UC scope
+        MagicMock(catalog_name="fc", schema_name=None, object_name="COMMENT_CATALOG_`fc`", object_type="comment"),
+    ]
+
+    def _run(self, scope, *, fc_on_target=True, fc_schemas=("dbo",), list_schemas_error=None):
+        from migrate import grants_worker
+
+        spark = MagicMock()
+        spark.sql.return_value.collect.return_value = self._INVENTORY
+        dbutils = MagicMock()
+        if scope is None:
+            dbutils.widgets.get.side_effect = Exception("no widget")
+        else:
+            dbutils.widgets.get.return_value = scope
+        cfg = MagicMock(dry_run=False, transfer_ownership=True, tracking_catalog="trk", tracking_schema="sch")
+
+        with (
+            patch.object(grants_worker.MigrationConfig, "from_workspace_file", return_value=cfg),
+            patch.object(grants_worker, "AuthManager") as mock_auth,
+            patch.object(grants_worker, "TrackingManager") as mock_tm,
+            patch.object(grants_worker, "find_warehouse", return_value="wh"),
+            patch.object(grants_worker, "CatalogExplorer") as mock_exp,
+            patch.object(grants_worker, "replay_grants", return_value=[]),
+        ):
+            if not fc_on_target:
+                mock_auth.return_value.target_client.catalogs.get.side_effect = Exception("NOT_FOUND")
+            mock_tm.return_value.not_validated_object_names.return_value = set()
+            explorer = mock_exp.return_value
+            explorer.list_grants.return_value = []
+            if list_schemas_error:
+                explorer.list_schemas.side_effect = list_schemas_error
+            else:
+                explorer.list_schemas.return_value = list(fc_schemas)
+            grants_worker.run(dbutils, spark)
+
+        enumerated = [(c.args[0], c.args[1]) for c in explorer.list_grants.call_args_list]
+        recorded = [r for call in mock_tm.return_value.append_migration_status.call_args_list for r in call.args[0]]
+        return enumerated, recorded
+
+    def test_default_scope_is_uc_and_excludes_foreign_catalogs(self):
+        enumerated, _ = self._run(None)
+        assert ("CATALOG", "`cat`") in enumerated
+        assert ("TABLE", "`cat`.`sch`.`t`") in enumerated
+        assert not any("fc" in fqn for _, fqn in enumerated)
+
+    def test_uc_scope_excludes_foreign_catalogs(self):
+        enumerated, _ = self._run("uc")
+        assert not any("fc" in fqn for _, fqn in enumerated)
+
+    def test_foreign_catalog_scope_replays_catalog_and_schema_grants_only(self):
+        enumerated, _ = self._run("foreign_catalogs", fc_schemas=("dbo", "sales"))
+        assert enumerated == [("CATALOG", "`fc`"), ("SCHEMA", "`fc`.`dbo`"), ("SCHEMA", "`fc`.`sales`")]
+
+    def test_foreign_catalog_missing_on_target_is_skipped_not_failed(self):
+        enumerated, recorded = self._run("foreign_catalogs", fc_on_target=False)
+        assert enumerated == []
+        assert [r["status"] for r in recorded] == ["skipped_dependency_not_migrated"]
+        assert "`fc`" in recorded[0]["error_message"]
+
+    def test_schema_listing_failure_records_failed_row_but_keeps_catalog_grants(self):
+        enumerated, recorded = self._run("foreign_catalogs", list_schemas_error=RuntimeError("conn down"))
+        assert enumerated == [("CATALOG", "`fc`")]
+        failed = [r for r in recorded if r["status"] == "failed"]
+        assert len(failed) == 1 and "conn down" in failed[0]["error_message"]
+
+    def test_foreign_catalog_schema_grants_drop_inherited(self):
+        """SHOW GRANTS ON SCHEMA also returns grants inherited from the catalog
+        (ObjectType=CATALOG); only direct SCHEMA grants may be replayed."""
+        from migrate import grants_worker
+
+        direct = {
+            "principal": "account users",
+            "action_type": "SELECT",
+            "securable_type": "SCHEMA",
+            "securable_fqn": "fc.dbo",
+        }
+        inherited = {
+            "principal": "spn",
+            "action_type": "USE SCHEMA",
+            "securable_type": "CATALOG",
+            "securable_fqn": "fc",
+        }
+        spark = MagicMock()
+        spark.sql.return_value.collect.return_value = self._INVENTORY
+        dbutils = MagicMock()
+        dbutils.widgets.get.return_value = "foreign_catalogs"
+        cfg = MagicMock(dry_run=False, transfer_ownership=True, tracking_catalog="trk", tracking_schema="sch")
+        with (
+            patch.object(grants_worker.MigrationConfig, "from_workspace_file", return_value=cfg),
+            patch.object(grants_worker, "AuthManager"),
+            patch.object(grants_worker, "TrackingManager"),
+            patch.object(grants_worker, "find_warehouse", return_value="wh"),
+            patch.object(grants_worker, "CatalogExplorer") as mock_exp,
+            patch.object(grants_worker, "replay_grants", return_value=[]) as mock_replay,
+        ):
+            explorer = mock_exp.return_value
+            explorer.list_schemas.return_value = ["dbo"]
+            explorer.list_grants.side_effect = lambda st, fqn: [inherited] if st == "CATALOG" else [direct, inherited]
+            grants_worker.run(dbutils, spark)
+
+        replayed = {c.args[1]: c.args[2] for c in mock_replay.call_args_list}
+        assert replayed["`fc`"] == [inherited]  # catalog grants untouched
+        assert replayed["`fc`.`dbo`"] == [direct]  # inherited dropped at schema level
+
+    def test_unknown_scope_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError):
+            self._run("bogus")
+
+
+class TestDirectGrantsOnly:
+    """Finding #33 — inherited grants must not be replayed as explicit child grants.
+    Rows mirror live SHOW GRANTS output (ObjectType / ObjectKey)."""
+
+    @staticmethod
+    def _g(principal, action, obj_type, key):
+        return {"principal": principal, "action_type": action, "securable_type": obj_type, "securable_fqn": key}
+
+    def test_table_keeps_direct_drops_schema_and_catalog_inherited(self):
+        from migrate.grants_worker import _direct_grants
+
+        grants = [
+            self._g("spn", "SELECT", "CATALOG", "retail_prod"),
+            self._g("account users", "SELECT", "SCHEMA", "retail_prod.sales"),
+            self._g("account users", "SELECT", "TABLE", "retail_prod.sales.daily_metrics"),
+        ]
+        kept = _direct_grants(grants, "`retail_prod`.`sales`.`daily_metrics`")
+        assert kept == [grants[2]]
+
+    def test_view_direct_grant_reported_as_table_is_kept(self):
+        # Live: a direct grant on a VIEW comes back with ObjectType=TABLE.
+        from migrate.grants_worker import _direct_grants
+
+        direct = self._g("account users", "SELECT", "TABLE", "retail_prod.sales.high_value_orders")
+        inherited = self._g("account users", "SELECT", "SCHEMA", "retail_prod.sales")
+        assert _direct_grants([direct, inherited], "`retail_prod`.`sales`.`high_value_orders`") == [direct]
+
+    def test_catalog_grants_are_all_direct(self):
+        from migrate.grants_worker import _direct_grants
+
+        grants = [self._g("spn", "USE CATALOG", "CATALOG", "retail_prod")]
+        assert _direct_grants(grants, "`retail_prod`") == grants
+
+    def test_key_match_ignores_backticks_and_case(self):
+        from migrate.grants_worker import _direct_grants
+
+        g = self._g("u", "READ VOLUME", "VOLUME", "Retail_Prod.Sales.Landing_Vol")
+        assert _direct_grants([g], "`retail_prod`.`sales`.`landing_vol`") == [g]
+
+    def test_run_replays_only_direct_grants_for_uc_objects(self):
+        from migrate import grants_worker
+
+        inventory = [
+            MagicMock(catalog_name="cat", schema_name="sch", object_name="`cat`.`sch`.`t`", object_type="managed_table")
+        ]
+        rows = {
+            ("CATALOG", "`cat`"): [self._g("spn", "SELECT", "CATALOG", "cat")],
+            ("SCHEMA", "`cat`.`sch`"): [
+                self._g("spn", "SELECT", "CATALOG", "cat"),
+                self._g("users", "SELECT", "SCHEMA", "cat.sch"),
+            ],
+            ("TABLE", "`cat`.`sch`.`t`"): [
+                self._g("spn", "SELECT", "CATALOG", "cat"),
+                self._g("users", "SELECT", "SCHEMA", "cat.sch"),
+                self._g("owner", "MODIFY", "TABLE", "cat.sch.t"),
+            ],
+        }
+        spark = MagicMock()
+        spark.sql.return_value.collect.return_value = inventory
+        dbutils = MagicMock()
+        dbutils.widgets.get.return_value = "uc"
+        cfg = MagicMock(dry_run=False, transfer_ownership=True, tracking_catalog="trk", tracking_schema="sch")
+        with (
+            patch.object(grants_worker.MigrationConfig, "from_workspace_file", return_value=cfg),
+            patch.object(grants_worker, "AuthManager"),
+            patch.object(grants_worker, "TrackingManager") as mock_tm,
+            patch.object(grants_worker, "find_warehouse", return_value="wh"),
+            patch.object(grants_worker, "CatalogExplorer") as mock_exp,
+            patch.object(grants_worker, "replay_grants", return_value=[]) as mock_replay,
+        ):
+            mock_tm.return_value.not_validated_object_names.return_value = set()
+            mock_exp.return_value.list_grants.side_effect = lambda st, fqn: rows[(st, fqn)]
+            grants_worker.run(dbutils, spark)
+
+        replayed = {
+            c.args[1]: [(g["principal"], g["action_type"]) for g in c.args[2]] for c in mock_replay.call_args_list
+        }
+        assert replayed == {
+            "`cat`": [("spn", "SELECT")],
+            "`cat`.`sch`": [("users", "SELECT")],
+            "`cat`.`sch`.`t`": [("owner", "MODIFY")],
+        }

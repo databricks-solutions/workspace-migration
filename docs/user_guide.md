@@ -236,12 +236,12 @@ models):
 
 | Object | How this tool handles it |
 |---|---|
-| Grants (all levels) | `grants_worker` / `hive_grants_worker` — applied after objects exist |
+| Grants (all levels) | `grants_worker` / `hive_grants_worker` — applied after objects exist. Foreign-catalog catalog + schema grants are applied in `migrate_governance` (task `migrate_foreign_catalog_grants`, right after the foreign catalog is created); table-level grants inside a foreign catalog are not replayed |
 | Tags, ABAC policies | `tags_worker`, `policies_worker` |
 | Row filters, column masks | `row_filters_worker`, `column_masks_worker` (DDL replay; see RLS/CM note in README) |
 | Comments, table properties | preserved by `DEEP CLONE` for Delta; DDL replay otherwise |
 | Registered models | `models_worker` — shell + each version (MLflow **download from source → re-register on target**, which ingests the artifacts into target-managed storage) + aliases. Requires `mlflow` on the serverless runtime. |
-| Connections, foreign catalogs | `connections_worker`, `foreign_catalogs_worker` (connection secrets are **not** exported — re-enter) |
+| Connections, foreign catalogs | `connections_worker`, `foreign_catalogs_worker` (connection secrets are **not** exported — recreate the connection on target with credentials, then grant the SPN `USE CONNECTION, CREATE FOREIGN CATALOG` on it — see Step 4 TARGET) |
 | Customer shares, recipients, providers | `sharing_worker` (SPN must own or hold `USE SHARE`/`USE RECIPIENT` — see README) |
 | Lakehouse monitors | `monitors_worker` (metric history does not transfer) |
 
@@ -404,6 +404,11 @@ GRANT CREATE CATALOG         ON METASTORE TO `<spn-application-id>`;
 GRANT CREATE CONNECTION      ON METASTORE TO `<spn-application-id>`;  -- recreate connections
 GRANT USE PROVIDER           ON METASTORE TO `<spn-application-id>`;
 GRANT CREATE EXTERNAL VOLUME ON EXTERNAL LOCATION `<ext-loc>` TO `<spn-application-id>`;  -- external volumes
+-- TARGET, once per CONNECTION <conn> you recreate with credentials (secrets are
+-- not exportable, so password-based connections must be re-created by an operator).
+-- Without this the SPN cannot see the operator-owned connection: migrate_connections
+-- reports validation_failed and migrate_foreign_catalogs fails CREATE FOREIGN CATALOG:
+GRANT USE CONNECTION, CREATE FOREIGN CATALOG ON CONNECTION `<conn>` TO `<spn-application-id>`;
 ```
 
 **Option B — metastore admin (easy setup).** Add the SPN to the group set as

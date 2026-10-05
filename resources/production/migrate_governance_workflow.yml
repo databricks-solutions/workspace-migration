@@ -66,9 +66,11 @@ resources:
           notebook_task:
             notebook_path: ../../src/migrate/policies_worker.py
 
+        # Catalog comments include foreign catalogs, which only exist on
+        # target once migrate_foreign_catalogs has run (finding #32).
         - task_key: migrate_comments
           depends_on:
-            - task_key: orchestrator
+            - task_key: migrate_foreign_catalogs
           environment_key: migration_env
           notebook_task:
             notebook_path: ../../src/migrate/comments_worker.py
@@ -94,6 +96,18 @@ resources:
           notebook_task:
             notebook_path: ../../src/migrate/foreign_catalogs_worker.py
 
+        # Foreign catalogs only exist on target after migrate_foreign_catalogs,
+        # so their catalog + schema grants are replayed here, not in migrate_uc
+        # (finding #31).
+        - task_key: migrate_foreign_catalog_grants
+          depends_on:
+            - task_key: migrate_foreign_catalogs
+          environment_key: migration_env
+          notebook_task:
+            notebook_path: ../../src/migrate/grants_worker.py
+            base_parameters:
+              grant_scope: foreign_catalogs
+
         - task_key: migrate_sharing
           depends_on:
             - task_key: orchestrator
@@ -112,6 +126,7 @@ resources:
             - task_key: migrate_monitors
             - task_key: migrate_connections
             - task_key: migrate_foreign_catalogs
+            - task_key: migrate_foreign_catalog_grants
             - task_key: migrate_sharing
           environment_key: migration_env
           notebook_task:
