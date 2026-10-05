@@ -69,6 +69,59 @@ def _skipped_dependency_grant_row(object_name: str) -> dict:
 
 
 # COMMAND ----------
+# Inherited-grant filter (finding #33)
+
+
+def _normalize_securable_key(key: str) -> str:
+    return (key or "").replace("`", "").strip().lower()
+
+
+def _direct_grants(grants: list[dict], securable_fqn: str) -> list[dict]:
+    """Keep only grants set directly on *securable_fqn*.
+
+    ``SHOW GRANTS ON <child>`` also returns grants inherited from the parent
+    schema/catalog, keyed (``ObjectKey``) by that parent. Replaying those on
+    the child would turn inherited access into explicit child grants on target,
+    which a later parent-level REVOKE no longer removes. Matched on the key, not
+    ``ObjectType`` — a direct VIEW grant reports ``ObjectType=TABLE``."""
+    target = _normalize_securable_key(securable_fqn)
+    return [g for g in grants if _normalize_securable_key(g.get("securable_fqn", "")) == target]
+
+
+# COMMAND ----------
+# Grant scope (finding #31). Foreign catalogs are created by migrate_governance,
+# which runs AFTER migrate_uc — so their grants can't be replayed in migrate_uc.
+# migrate_uc runs this worker with scope "uc" (foreign catalogs excluded);
+# migrate_governance runs it again with scope "foreign_catalogs" right after
+# migrate_foreign_catalogs.
+
+GRANT_SCOPE_UC = "uc"
+GRANT_SCOPE_FOREIGN_CATALOGS = "foreign_catalogs"
+
+
+def _resolve_grant_scope(dbutils) -> str:
+    """``grant_scope`` notebook parameter; defaults to ``uc`` when unset."""
+    try:
+        scope = dbutils.widgets.get("grant_scope")
+    except Exception:  # noqa: BLE001 — widget not defined → default scope
+        scope = ""
+    scope = (scope.strip() if isinstance(scope, str) else "") or GRANT_SCOPE_UC
+    if scope not in (GRANT_SCOPE_UC, GRANT_SCOPE_FOREIGN_CATALOGS):
+        raise ValueError(f"Unknown grant_scope {scope!r}")
+    return scope
+
+
+def _target_catalog_exists(auth: AuthManager, name: str) -> bool:
+    """True when catalog *name* exists on target. Checked directly (not via
+    migration_status) so a foreign catalog's status key prefix doesn't matter."""
+    try:
+        auth.target_client.catalogs.get(name)
+        return True
+    except Exception:  # noqa: BLE001 — NotFound / not visible → treat as absent
+        return False
+
+
+# COMMAND ----------
 # Replay grants
 
 
@@ -235,7 +288,10 @@ def run(dbutils, spark) -> None:
     )
     inventory_rows = inventory_df.collect()
 
+    grant_scope = _resolve_grant_scope(dbutils)
+
     catalogs: set[str] = set()
+    foreign_catalogs: set[str] = set()
     schemas: set[str] = set()  # set of "catalog.schema" FQNs
     tables: set[str] = set()  # managed_table, external_table, mv, st
     views: set[str] = set()
@@ -247,6 +303,9 @@ def run(dbutils, spark) -> None:
         sch = row.schema_name
         obj_name = row.object_name
         obj_type = row.object_type
+        if obj_type == "foreign_catalog":
+            foreign_catalogs.add(cat or obj_name)
+            continue
         if cat:
             catalogs.add(cat)
         if cat and sch:
@@ -261,9 +320,17 @@ def run(dbutils, spark) -> None:
             elif obj_type == "function":
                 functions.add(obj_name)
 
+    # Other inventory rows (e.g. a comment on a foreign catalog) can carry a
+    # foreign catalog's name — keep foreign catalogs out of the UC scope.
+    catalogs -= foreign_catalogs
+    schemas = {s for s in schemas if s.split("`.`")[0].strip("`") not in foreign_catalogs}
+
     logger.info(
-        "Grants scope: %d catalog(s), %d schema(s), %d table(s), %d view(s), %d volume(s), %d function(s)",
+        "Grants scope (%s): %d catalog(s), %d foreign catalog(s), %d schema(s), %d table(s), %d view(s), "
+        "%d volume(s), %d function(s)",
+        grant_scope,
         len(catalogs),
+        len(foreign_catalogs),
         len(schemas),
         len(tables),
         len(views),
@@ -274,9 +341,9 @@ def run(dbutils, spark) -> None:
     wh_id = find_warehouse(auth)
 
     # Object names whose latest migration_status is not 'validated'. A
-    # per-object grant on any of these (a failed/skipped table, or a
-    # foreign catalog migrate_governance hasn't created yet) is
-    # cascade-skipped rather than hard-failing (finding #19).
+    # per-object grant on any of these (a failed/skipped table) is
+    # cascade-skipped rather than hard-failing (finding #19). Foreign
+    # catalogs are handled by the foreign_catalogs scope instead (#31).
     not_migrated_names = tracker.not_validated_object_names(source_type="uc")
 
     all_results: list[dict] = []
@@ -289,13 +356,16 @@ def run(dbutils, spark) -> None:
         For object-level securables (``object_level=True``) whose target
         was not migrated, records ``skipped_dependency_not_migrated`` and
         skips enumeration (finding #19). Catalog/schema grants are never
-        cascade-skipped — they aren't per-migrated-object."""
+        cascade-skipped — they aren't per-migrated-object.
+
+        Only grants set directly on the securable are replayed; inherited ones
+        are replayed once, on the parent they belong to (finding #33)."""
         if object_level and _grant_target_not_migrated(fqn, not_migrated_names):
             logger.info("Skipping grants for not-migrated object %s.", fqn)
             all_results.append(_skipped_dependency_grant_row(fqn))
             return
         try:
-            grants = explorer.list_grants(securable_type, fqn)
+            grants = _direct_grants(explorer.list_grants(securable_type, fqn), fqn)
             grant_results = replay_grants(
                 securable_type,
                 fqn,
@@ -324,29 +394,57 @@ def run(dbutils, spark) -> None:
                 }
             )
 
-    # Process in CATALOG → SCHEMA → object order. UC evaluates grants
-    # at the object level first, falling back to schema then catalog,
-    # so the replay order doesn't affect correctness — this ordering
-    # just keeps logs easy to scan.
-    for catalog_name in sorted(catalogs):
-        logger.info("Processing grants for CATALOG %s", catalog_name)
-        _process("CATALOG", f"`{catalog_name}`")
+    if grant_scope == GRANT_SCOPE_FOREIGN_CATALOGS:
+        # Catalog + schema grants on each foreign catalog (#31). Schemas come
+        # from the source foreign catalog itself — discovery records only the
+        # catalog row, so its schema grants were never replayed before.
+        for fc in sorted(foreign_catalogs):
+            if not _target_catalog_exists(auth, fc):
+                logger.info("Skipping grants for foreign catalog %s — not on target.", fc)
+                all_results.append(_skipped_dependency_grant_row(f"`{fc}`"))
+                continue
+            logger.info("Processing grants for FOREIGN CATALOG %s", fc)
+            _process("CATALOG", f"`{fc}`")
+            try:
+                fc_schemas = explorer.list_schemas(fc)
+            except Exception as exc:  # noqa: BLE001 — e.g. connection unreachable
+                logger.error("Failed to list schemas of foreign catalog %s: %s", fc, exc, exc_info=True)
+                all_results.append(
+                    {
+                        "object_name": f"SCHEMA_GRANTS_`{fc}`",
+                        "object_type": "grant",
+                        "status": "failed",
+                        "error_message": f"could not list schemas of foreign catalog: {exc}",
+                        "duration_seconds": 0.0,
+                    }
+                )
+                fc_schemas = []
+            for sch in sorted(fc_schemas):
+                _process("SCHEMA", f"`{fc}`.`{sch}`")
+    else:
+        # Process in CATALOG → SCHEMA → object order. UC evaluates grants
+        # at the object level first, falling back to schema then catalog,
+        # so the replay order doesn't affect correctness — this ordering
+        # just keeps logs easy to scan.
+        for catalog_name in sorted(catalogs):
+            logger.info("Processing grants for CATALOG %s", catalog_name)
+            _process("CATALOG", f"`{catalog_name}`")
 
-    for schema_fqn in sorted(schemas):
-        logger.info("Processing grants for SCHEMA %s", schema_fqn)
-        _process("SCHEMA", schema_fqn)
+        for schema_fqn in sorted(schemas):
+            logger.info("Processing grants for SCHEMA %s", schema_fqn)
+            _process("SCHEMA", schema_fqn)
 
-    for fqn in sorted(tables):
-        _process("TABLE", fqn, object_level=True)
+        for fqn in sorted(tables):
+            _process("TABLE", fqn, object_level=True)
 
-    for fqn in sorted(views):
-        _process("VIEW", fqn, object_level=True)
+        for fqn in sorted(views):
+            _process("VIEW", fqn, object_level=True)
 
-    for fqn in sorted(volumes):
-        _process("VOLUME", fqn, object_level=True)
+        for fqn in sorted(volumes):
+            _process("VOLUME", fqn, object_level=True)
 
-    for fqn in sorted(functions):
-        _process("FUNCTION", fqn, object_level=True)
+        for fqn in sorted(functions):
+            _process("FUNCTION", fqn, object_level=True)
 
     # Record final statuses
 
